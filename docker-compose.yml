@@ -1,0 +1,23 @@
+services:
+  fundamentus-api:
+    build: .
+    environment:
+      FUNDAMENTUS_API_BIND_HOST: 0.0.0.0
+      FUNDAMENTUS_API_BIND_PORT: 8000
+      FUNDAMENTUS_API_SQLITE_CACHE_PATH: /data/fundamentus_cache.sqlite3
+    command:
+      - python
+      - -m
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - fundamentus-cache:/data
+
+volumes:
+  fundamentus-cache:
