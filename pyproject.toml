@@ -1,0 +1,69 @@
+[project]
+name = "fundamentus-data-api"
+version = "0.1.0"
+description = "Local FastAPI service for Fundamentus asset details and dividends."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "Fundamentus Data API contributors" },
+]
+keywords = ["fastapi", "fundamentus", "b3", "finance", "scraping", "dividends"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+dependencies = [
+    "aiosqlite>=0.20.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "orjson>=3.10.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "selectolax>=0.3.21",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/fundamentus-data-api"
+Repository = "https://github.com/your-org/fundamentus-data-api"
+Issues = "https://github.com/your-org/fundamentus-data-api/issues"
+Documentation = "https://github.com/your-org/fundamentus-data-api#readme"
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10.0",
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+artifacts = ["app/py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["app/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+strict = true
+ignore_missing_imports = true
