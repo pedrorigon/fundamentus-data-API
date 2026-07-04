@@ -1,0 +1,401 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html lang="pt-br">
+<head>
+	<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>FUNDAMENTUS - ITUB4 - Invista consciente - Indicadores Fundamentalistas</title>
+	<link rel="stylesheet" href="css/estilo.css" type="text/css" media="screen, projection">
+	<link rel="stylesheet" href="css/print.css" type="text/css" media="print">
+	<link rel="shortcut icon" href="img/fundamentus.ico" type="image/x-icon">
+	<!--[if lte IE 6]>
+		<link rel="stylesheet" type="text/css" href="css/menu_ie6.css">
+		<script type="text/javascript" src="script/ADxMenu.js"></script>
+	<![endif]-->
+	
+  <!-- <script src="script/mootools.svn.js" type="text/javascript"></script>  -->
+<script src="//ajax.googleapis.com/ajax/libs/mootools/1.11/mootools-yui-compressed.js" type="text/javascript"></script>
+
+<!-- Facebook Pixel Code -->
+<script>
+  !function(f,b,e,v,n,t,s)
+  {if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+  n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+  if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+  n.queue=[];t=b.createElement(e);t.async=!0;
+  t.src=v;s=b.getElementsByTagName(e)[0];
+  s.parentNode.insertBefore(t,s)}(window, document,'script',
+  'https://connect.facebook.net/en_US/fbevents.js');
+  fbq('init', '180895865796070');
+  fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+  src="https://www.facebook.com/tr?id=180895865796070&ev=PageView&noscript=1"
+/></noscript>
+<!-- End Facebook Pixel Code -->	<script type="text/javascript" src="script/Observer.js"></script>
+	<script type="text/javascript" src="script/Autocompleter.js"></script>
+	<script defer type="text/javascript" src="script/cmplte.php" language="JavaScript"></script>
+	<script defer src="script/tip.js" type="text/javascript" language="JavaScript"></script>
+	<script type="text/javascript">
+		function poApple() { }
+	</script>	
+  
+</head>
+<body class="detalhes">
+
+	<div class="center">
+    
+  
+		<?php#  echo $trace_txt;?>	<script>		function validateForm() {			let form = document.createElement('form');			form.action = 'detalhes.php';			form.method = 'GET';			form.innerHTML = '<input name="papel" type="hidden" value="'+document.forms[0]["papel"].value.toUpperCase()+'">';			document.body.append(form);			form.submit();			return false;		}	</script>		
+<style>
+  #menu.institucional li a.fundamentus-mobile { 
+    background-image: url(img/bt_fundamentus_mobile2.png); 
+    width: 97px; 
+  }
+  #menu.institucional li a.fundamentus-mobile:active { 
+    background-position: 0 0 !important;
+  }  
+
+</style>
+<div class="topo">
+   <a href="index.php"><img class="logo" src="img/logo.gif" alt="FUNDAMENTUS - Invista consciente"></a>			
+   <div class="avancada"><span>Busca por <a href="buscaavancada.php">empresa</a> / <a href="fii_buscaavancada.php">fii</a></span></div>
+   <form class="busca" method="get" action="detalhes.php" onsubmit="return validateForm() ">
+      <fieldset>
+         <legend>Procurar por ação/empresa/fii</legend>
+         <input class="texto" autocomplete="off" id="completar" name="papel" type="text" spellcheck="false"><input type="image" src="img/bt_exibir.jpg" class="botao" value="Exibir"><br>				
+      </fieldset>
+   </form>
+   <div class="atual"><p>Você está vendo<strong>ITUB4</strong></p></div>			
+   <div id="containerMenu">
+      <ul id="menu" class="institucional adxm menu">
+         <li><a class="home" href="index.php">Página inicial</a></li>
+         <!--- <li><a class="conheca" href="conheca.php">Conheça o sistema</a></li> --->					
+         <li><a class="consciente" href="consciente.php">Investimento consciente</a></li>
+         <li>
+            <a class="mais-opcoes" onClick="poApple()">Mais Opções</a>
+            <ul>
+               <li><a href="fr.php">Fatos Relevantes</a></li>
+               <li><a href="ultimos-resultados.php">Últimos Resultados</a></li>
+               <li><a href="fii_imoveis.php">FII - Pesquisar Imóveis</a></li>
+            </ul>
+         </li>
+         <li><a class="contato" href="contato.php">Entre em contato</a></li>
+         <li><a class="fundamentus-mobile" href="?papel=ITUB4&h=1&interface=mobile">Fundamentus Mobile</a></li>
+      </ul>
+              <ul id="menu" class="software adxm menu">
+                      <li><a class="detalhes" href="detalhes.php?papel=ITUB4">Detalhes</a></li>
+           <li>
+              <a class="graficos" onClick="poApple()" >Gráficos</a>						
+              <ul>
+                 <li><a href="graficos.php?papel=ITUB4&tipo=1">Balanço patrimonial</a></li>
+                 <li><a href="graficos.php?papel=ITUB4&tipo=2">Demonstrativos de resultados</a></li>
+                 <li><a href="graficos.php?papel=ITUB4&tipo=4">Fluxo de caixa</a></li>
+                 <li><a href="graficos.php?papel=ITUB4&tipo=3">Indicadores fundamentalistas</a></li>
+              </ul>
+           </li>
+           <li>
+              <a class="historicos" onClick="poApple()">Dados Históricos</a>						
+              <ul class="provetos">
+                 <li><a class="dh" href="acionistas.php?papel=ITUB4">Acionistas</a></li>
+                 <li><a class="dh" href="principais_acionistas.php?papel=ITUB4&tipo=1">Principais Acionistas</a></li>
+                 <li><a class="dh" href="administradores.php?papel=ITUB4&tipo=1">Administração</a></li>
+                 <li><a class="dh" href="fatos_relevantes.php?papel=ITUB4">Fatos Relevantes</a></li>
+                 <li><a class="dh" href="apresentacoes.php?papel=ITUB4">Apresentações</a></li>
+                 <li><a class="dh" href="resultados_trimestrais.php?papel=ITUB4&tipo=1">Resultados Trim.</a></li>
+                 <li><a class="dh" href="formularios_referencia.php?papel=ITUB4&tipo=1">Form. Referência</a></li>
+                 <li><a class="dh" href="insiders.php?papel=ITUB4&tipo=1">Insiders</a></li>
+                 <li><a class="dh" href="recompras.php?papel=ITUB4&tipo=1">Recompras de Ações</a></li>
+                 <li><a class="dh" href="balancos.php?papel=ITUB4&tipo=1">Balanços em Excel</a></li>
+                 <li><a class="dh" href="proventos.php?papel=ITUB4&tipo=2">Proventos</a></li>
+              </ul>
+           </li>
+           <li><a class="cotacoes" href="cotacoes.php?papel=ITUB4">Histórico de cotações</a></li>
+           </li>				
+             
+        </ul>
+         </div>
+</div>		<div class="conteudo clearfix">
+		
+  <!--<div style="margin-left: 1px; margin-bottom: 1px;"><span style="color: red;">Novidades: </span>
+</div>-->
+  <div style="float: right; width: 180px;">
+  
+
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3119085269630402" crossorigin="anonymous"></script>
+
+  <!-- anuncioVerticalDireitaParaComparar -->
+  <ins class="adsbygoogle"
+       style="display:inline-block;width:160px;height:600px"
+       data-ad-client="ca-pub-3119085269630402"
+       data-ad-slot="1286134424"></ins>
+  <script>
+       (adsbygoogle = window.adsbygoogle || []).push({});
+  </script>
+  </div>
+
+      <!--<div><span style="color:red;">Novo:</span> <a href="ultimos-resultados.php">Últimos resultados trimestrais</a></div>-->
+			<table class="w728">
+				<tr>
+					<td class="label w15"><span class="help tips" title="Código da ação">?</span><span class="txt">Papel</span></td>
+					<td class="data w35"><span class="txt">ITUB4</span></td>
+					<td class="label destaque w2"><span class="help tips" title="Cotação de fechamento da ação no último pregão">?</span><span class="txt">Cotação</span></td>
+					<td class="data destaque w3"><span class="txt">42,74</span></td>
+				</tr>
+				<tr>
+					<td class="label"><span class="help tips" title="ON = Ordinária, PN = Preferencial, PNA = Pref. tipo A, etc">?</span><span class="txt">Tipo</span></td>
+					<td class="data"><span class="txt">PN N1</span></td>
+					<td class="label"><span class="help tips" title="Data do último pregão em  que o ativo foi negociado">?</span><span class="txt">Data últ cot</span></td>
+					<td class="data"><span class="txt">03/07/2026</span></td>
+				</tr>
+				<tr>
+					<td class="label"><span class="help tips" title="Nome comercial da empresa.">?</span><span class="txt">Empresa</span></td>
+					<td class="data"><span class="txt">ITAUUNIBANCO PN N1</span></td>
+					<td class="label"><span class="help tips" title="Menor cotação da ação nos últimos 12 meses.">?</span><span class="txt">Min 52 sem</span></td>
+					<td class="data"><span class="txt">30,99</span></td>
+				</tr>
+				<tr>
+					<td class="label"><span class="help tips" title="Classificação setorial">?</span><span class="txt">Setor</span></td>
+					<td class="data"><span class="txt"><a href="resultado.php?setor=20">Intermediários Financeiros</a></span></td>
+					<td class="label"><span class="help tips" title="Maior cotação da ação nos últimos 12 meses">?</span><span class="txt">Max 52 sem</span></td>
+					<td class="data"><span class="txt">48,67</span></td>
+				</tr>
+				<tr>
+					<td class="label"><span class="help tips" title="Classificação por segmento de atuação.">?</span><span class="txt">Subsetor</span></td>
+					<td class="data"><span class="txt"><a href="resultado.php?segmento=33">Bancos</a></span></td>
+					<td class="label"><span class="help tips" title="Volume médio de negociação da ação nos últimos 2 meses (R$)">?</span><span class="txt">Vol $ méd (2m)</span></td>
+					<td class="data"><span class="txt">1.268.860.000</span></td>
+				</tr>
+			</table>
+			<table class="w728">
+				<tr>
+					<td class="label w2"><span class="help tips" title="Valor de mercado da empresa, calculado multiplicando o preço da ação pelo número total de ações.">?</span><span class="txt">Valor de mercado</span></td>
+					<td class="data w3"><span class="txt">471.288.000.000</span></td>
+					<td class="label w3"><span class="help tips" title="Data do último balanço divulgado pela empresa que consta no nosso banco de dados. Todos os indicadores são calculados considerando os últimos 12 meses finalizados na data deste balanço.">?</span><span class="txt">Últ balanço processado</span></td>
+					<td class="data w2"><span class="txt">31/03/2026</span></td>
+				</tr>
+				<tr>
+					<td class="label w2"><span class="help tips" title="Valor da firma (Enterprise Value) é calculado somando o valor de mercado da empresa a sua dívida líquida.">?</span><span class="txt">Valor da firma</span></td>
+					<td class="data w3"><span class="txt">-</span></td>
+					<td class="label"><span class="help tips" title="Número total de ações, somadas todas as espécies: ON, PN, etc">?</span><span class="txt">Nro. Ações</span></td>
+					<td class="data"><span class="txt">11.026.900.000</span></td>
+				</tr>
+			</table>
+			<table class="w728">
+				<tr>
+					<td class="nivel1" colspan="2"><span class="txt">Oscilações</span></td>
+					<td class="nivel1" colspan="4"><span class="txt">Indicadores fundamentalistas</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">Dia</span></td>
+					<td class="data w1"><span class="oscil">
+          <font color="#306EFF">0,64%</font></span></td>
+					<td class="label w2"><span class="help tips" title="Preço da ação dividido pelo lucro por ação. O P/L é o número de anos que se levaria para reaver o capital aplicado na compra de uma ação, através do recebimento do lucro gerado pela empresa, considerando que esses lucros permaneçam constantes.">?</span><span class="txt">P/L</span></td>
+					<td class="data w2"><span class="txt">10,15</span></td>
+					<td class="label w2"><span class="help tips" title="Lucro por Ação">?</span><span class="txt">LPA</span></td>
+					<td class="data w2"><span class="txt">4,21</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">Mês</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">0,78%</font></span></td>
+					<td class="label w2"><span class="help tips" title="Preço da ação dividido pelo Valor Patrimonial por ação. Informa quanto o mercado está disposto a pagar sobre o Patrimônio Líquido da empresa">?</span><span class="txt">P/VP</span></td>
+					<td class="data w2"><span class="txt">2,36</span></td>
+					<td class="label w2"><span class="help tips" title="Valor Patrimonial por Ação: Valor do Patrimônio Líquido dividido pelo número total de ações.">?</span><span class="txt">VPA</span></td>
+					<td class="data w2"><span class="txt">18,12</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">30 dias</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">8,85%</font></span></td>
+					<td class="label w2"><span class="help tips" title="Preço da ação dividido pelo EBIT por ação. EBIT é uma aproximação do resultado operacional da empresa. O EBIT é calculado através da seguinte fórmula: Lucro Bruto - Despesas com Vendas - Despesas Administrativas ">?</span><span class="txt">P/EBIT</span></td>
+					<td class="data w2"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="Lucro Bruto dividido pela Receita Líquida: Indica a porcentagem de cada R$1 de venda que sobrou após o custo dos produtos/serviços vendidos">?</span><span class="txt">Marg. Bruta</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">12 meses</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">29,17%</font></span></td>
+					<td class="label"><span class="help tips" title="Price Sales Ratio: Preço da ação dividido pela Receita Líquida por ação">?</span><span class="txt">PSR</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="EBIT dividido pela Receita Líquida: Indica a porcentagem de cada R$1 de venda que sobrou após o pagamento dos custos dos produtos/serviços vendidos, das despesas com vendas, gerais e administrativas">?</span><span class="txt">Marg. EBIT</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">2026</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">10,52%</font></span></td>
+					<td class="label w2"><span class="help tips" title="Preço da ação dividido pelos Ativos totais por ação.">?</span><span class="txt">P/Ativos</span></td>
+					<td class="data w2"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="Lucro Líquido dividido pela Receita Líquida">?</span><span class="txt">Marg. Líquida</span></td>
+					<td class="data"><span class="txt">
+          0,0%</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">2025</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">62,40%</font></span></td>
+					<td class="label w2"><span class="help tips" title="Preço da ação dividido pelo capital de giro por ação. Capital de giro é o Ativo Circulante menos Passivo Circulante">?</span><span class="txt">P/Cap. Giro</span></td>
+					<td class="data w2"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="EBIT dividido por Ativos totais. EBIT é uma aproximação do resultado operacional da empresa. O EBIT é calculado através da seguinte fórmula: Lucro Bruto - Despesas com Vendas - Despesas Administrativas">?</span><span class="txt">EBIT / Ativo</span></td>
+					<td class="data"><span class="txt">0,0%</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">2024</span></td>
+					<td class="data w1"><span class="oscil"><font color="#F75D59">-3,80%</font></span></td>
+					<td class="label w2"><span class="help tips" title="Preço da ação dividido pelos Ativos Circulantes Líquidos por ação. Ativo Circ. Líq. é obtido subtraindo os ativos circulantes pelas dívidas de curto e longo prazo, ou seja, após o pagamento de todas as dívidas, quanto sobraria dos ativos mais líquidos da empresa (caixa, estoque, etc)">?</span><span class="txt">P/Ativ Circ Liq</span></td>
+					<td class="data w2"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="Retorno sobre o Capital Investido: Calculado dividindo-se o EBIT por (Ativos - Fornecedores - Caixa). Informa o retorno que a empresa consegue sobre o capital total aplicado. EBIT é uma aproximação do resultado operacional da empresa. O EBIT é calculado através da seguinte fórmula: Lucro Bruto - Despesas com Vendas - Despesas Administrativas">?</span><span class="txt">ROIC</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">2023</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">41,06%</font></span></td>
+					<td class="label"><span class="help tips" title="Dividend Yield: Dividendo pago por ação dividido pelo preço da ação. É o rendimento gerado para o dono da ação pelo pagamento de dividendos.">?</span><span class="txt">Div. Yield</span></td>
+					<td class="data"><span class="txt">8,1%</span></td>
+					<td class="label"><span class="help tips" title="Retorno sobre o Patrimônio Líquido: Lucro líquido dividido pelo Patrimônio Líquido">?</span><span class="txt">ROE</span></td>
+					<td class="data"><span class="txt">
+          23,2%</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">2022</span></td>
+					<td class="data w1"><span class="oscil"><font color="#306EFF">23,29%</font></span></td>
+					<td class="label"><span class="help tips" title="Valor da Firma (Enterprise Value dividido pelo EBITDA. EBITDA é calculado através da seguinte fórmula: Lucro Bruto - Despesas com Vendas - Despesas Administrativas + Depreciação e Amortização">?</span><span class="txt">EV / EBITDA</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="Ativo Circulante dividido pelo Passivo Circulante: Reflete a capacidade de pagamento da empresa no curto prazo.">?</span><span class="txt">Liquidez Corr</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt">2021</span></td>
+					<td class="data w1"><span class="oscil"><font color="#F75D59">-15,42%</font></span></td>
+					<td class="label"><span class="help tips" title="Valor da Firma (Enterprise Value dividido pelo EBIT. EBIT é uma aproximação do resultado operacional da empresa. O EBIT é calculado através da seguinte fórmula: Lucro Bruto - Despesas com Vendas - Despesas Administrativas">?</span><span class="txt">EV / EBIT</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+					<td class="label"><span class="help tips" title="Dívida Líquida (Dívida+Debêntures - Caixa) dividido pelo Patrimônio Líquido">?</span><span class="txt">Dív Líq / Patrim</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+				</tr>
+				<tr>
+					<td class="label w1"><span class="txt"></span></td>
+					<td class="data w1"><span class="oscil"></span></td>
+					<td class="label"><span class="help tips" title="Crescimento da Receita Líquida nos últimos 5 anos">?</span><span class="txt">Cres. Rec (5a)</span></td>
+					<td class="data"><span class="txt">
+          71,6%</span></td>
+					<td class="label"><span class="help tips" title="Receita Líquida dividido por Ativos Totais. Indica a eficiência com a qual a empresa usa seus ativos para gerar vendas">?</span><span class="txt">Giro Ativos</span></td>
+					<td class="data"><span class="txt">
+          -</span></td>
+				</tr>
+			</table>
+
+              <table class="w728">
+          <tr>
+            <td class="nivel1" colspan="4"><span class="txt">Dados Balanço Patrimonial</span></td>
+          </tr>
+          <tr>
+            <td class="label w2"><span class="help tips" title="Todos os bens, direitos e valores a receber de uma entidade">?</span><span class="txt">Ativo</span></td>
+            <td class="data w3"><span class="txt">479.305.000.000</span></td>
+            <td class="label w2"><span class="help tips" title="Operação financeira em que um banco recebe determinada quantia em dinheiro, comprometendo-se a guardá-la e se obrigando a restituí-la quando solicitado pelo depositante ou em data prefixada.">?</span><span class="txt">Depósitos</span></td>
+            <td class="data w3"><span class="txt">102.809.000.000</span></td>
+          </tr>
+          <tr>
+            <td class="label"><span class="help tips" title="Carteira de crédito">?</span><span class="txt">Cart. de Crédito</span></td>
+            <td class="data"><span class="txt">173.606.000.000</span></td>
+            <td class="label"><span class="help tips" title="O patrimônio líquido representa os valores que os sócios ou acionistas têm na empresa em um determinado momento. No balanço patrimonial, a diferença entre o valor dos ativos e dos passivos e resultado de exercícios futuros representa o PL (Patrimônio Líquido), que é o valor contábil devido pela pessoa jurídica aos sócios ou acionistas.">?</span><span class="txt">Patrim. Líq</span></td>
+            <td class="data"><span class="txt">199.777.000.000</span></td>
+          </tr>
+        </table>
+
+        <table class="w728">
+          <tr>
+            <td class="nivel1" colspan="4"><span class="txt">Dados demonstrativos de resultados</span></td>
+          </tr>
+          <tr>
+            <td class="nivel2 w5" colspan="2"><span class="txt">Últimos 12 meses</span></td>
+            <td class="nivel2 w5" colspan="2"><span class="txt">Últimos 3 meses</span></td>
+          </tr>
+          <tr>
+            <td class="label w2" ><span class="help tips" title="Resultado de Intermediação Financeira = Receita de Intermediação Financeira menos Despesas de Intermediação Financeira.">?</span><span class="txt">Result Int Financ</span></td>
+            <td class="data w3"><span class="txt">11.590.000.000</span></td>
+            <td class="label w2"><span class="help tips" title="Resultado de Intermediação Financeira = Receita de Intermediação Financeira menos Despesas de Intermediação Financeira.">?</span><span class="txt">Result Int Financ</span></td>
+            <td class="data w3"><span class="txt">3.149.000.000</span></td>
+          </tr>
+          <tr>
+            <td class="label"><span class="help tips" title="Receita de Serviços">?</span><span class="txt">Rec Serviços</span></td>
+            <td class="data"><span class="txt">13.582.000.000</span></td>
+            <td class="label"><span class="help tips" title="Receita de Serviços">?</span><span class="txt">Rec Serviços</span></td>
+            <td class="data"><span class="txt">3.399.000.000</span></td>
+          </tr>
+          <tr>
+            <td class="label"><span class="help tips" title="O que sobra das vendas após a dedução de todas as despesas">?</span><span class="txt">Lucro Líquido</span></td>
+            <td class="data"><span class="txt">46.437.000.000</span></td>
+            <td class="label"><span class="help tips" title="O que sobra das vendas após a dedução de todas as despesas.">?</span><span class="txt">Lucro Líquido</span></td>
+            <td class="data"><span class="txt">11.654.000.000</span></td>
+          </tr>
+        </table>
+      
+              
+			<BR>
+<!-- anuncioRodape -->
+
+	<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3119085269630402"
+		 crossorigin="anonymous"></script>
+	<!-- anuncioRodape -->
+	<ins class="adsbygoogle"
+		 style="display:inline-block;width:728px;height:90px"
+		 data-ad-client="ca-pub-3119085269630402"
+		 data-ad-slot="1513786315"></ins>
+	<script>
+		 (adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+<script>
+window.onload = function() {
+//  var req = new XMLHttpRequest();
+//  req.open('POST', 'pv.php', true);
+//  req.send(null);
+};
+</script>
+		</div>
+	</div>
+		<div class="rodape">
+		<div class="center">
+			<ul>
+				<li><strong>Menu institucional:</strong></li>
+				<li><a class="home" href="index.php">Página inicial</a>|</li>
+				<li><a class="consciente" href="consciente.php">Investimento Consciente</a>|</li>
+				<li><a class="contato" href="contato.php">Entre em contato</a>|</li>
+				<li><a class="ultimos-resultados" href="ultimos-resultados.php">Últimos Resultados</a></li>
+			</ul>
+			<ul>
+				<li><strong>Menu software: </strong></li>
+				<li><a class="graficos" href="graficos.php?tipo=1">Gráficos</a>|</li>
+				<li><a class="detalhes" href="detalhes.php">Detalhes</a>|</li>
+				<li><a class="cotacoes" href="cotacoes.php">Histórico de cotações</a>|</li>
+				<li><a class="acionistas" href="acionistas.php">Acionistas</a>|</li>
+				<li><a class="principais-acionistas" href="principais_acionistas.php">Principais Acionistas</a>|</li>
+				<li><a class="administracao" href="administradores.php">Administração</a>|</li>
+				<li><a class="fatos-relevantes" href="fatos_relevantes.php">Fatos Relevantes</a>|</li>
+				<li><a class="apresentacoes" href="apresentacoes.php">Apresentações</a>|</li>
+				<li><a class="proventos" href="proventos.php">Proventos</a>|</li>
+				<li><a class="historicos" href="balancos.php">Balanços Históricos</a></li>
+			</ul>
+		</div>
+	</div>
+	<!-- Google tag (gtag.js) -->
+	<script async src="https://www.googletagmanager.com/gtag/js?id=G-MBRGJ9JF74"></script>
+	<script>
+	  window.dataLayer = window.dataLayer || [];
+	  function gtag(){dataLayer.push(arguments);}
+	  gtag('js', new Date());
+
+	  gtag('config', 'G-MBRGJ9JF74');
+	</script>	
+	
+	<script  type="text/javascript" src="script/pvt.php" language="JavaScript" async></script>
+</body>
+</html>

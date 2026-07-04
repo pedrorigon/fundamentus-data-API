@@ -1,0 +1,1242 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html lang="pt-br">
+<head>
+	<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">
+	<title>FUNDAMENTUS - Invista consciente</title>
+
+	<link rel="stylesheet" href="css/estilo.css" type="text/css" media="screen, projection">
+	<link rel="stylesheet" href="css/print.css" type="text/css" media="print">
+	<link rel="shortcut icon" href="img/fundamentus.ico" type="image/x-icon">
+	<!--[if lte IE 6]>
+		<link rel="stylesheet" type="text/css" href="css/menu_ie6.css">
+		<script type="text/javascript" src="script/ADxMenu.js"></script>
+	<![endif]-->
+<!-- <script src="script/mootools.svn.js" type="text/javascript"></script>  -->
+<script src="//ajax.googleapis.com/ajax/libs/mootools/1.11/mootools-yui-compressed.js" type="text/javascript"></script>
+
+<!-- Facebook Pixel Code -->
+<script>
+  !function(f,b,e,v,n,t,s)
+  {if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+  n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+  if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+  n.queue=[];t=b.createElement(e);t.async=!0;
+  t.src=v;s=b.getElementsByTagName(e)[0];
+  s.parentNode.insertBefore(t,s)}(window, document,'script',
+  'https://connect.facebook.net/en_US/fbevents.js');
+  fbq('init', '180895865796070');
+  fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+  src="https://www.facebook.com/tr?id=180895865796070&ev=PageView&noscript=1"
+/></noscript>
+<!-- End Facebook Pixel Code -->	<script type="text/javascript" src="script/Observer.js"></script>
+	<script type="text/javascript" src="script/Autocompleter.js"></script>
+	<script src="script/cmplte.php" type="text/javascript" language="JavaScript"></script>
+  <script src="script/tablesort.js" type="text/javascript"></script>
+
+	<script src="script/tip.js" type="text/javascript" language="JavaScript"></script>
+
+  <script>
+    function toggleClasse() {
+      if (document.getElementById("chbAgruparAno").checked) {
+        document.getElementById("tabela-completa").style.display = "none";
+        document.getElementById("tabela-anual").style.display = "block";
+      } else {
+        document.getElementById("tabela-completa").style.display = "block";
+        document.getElementById("tabela-anual").style.display = "none";
+      }
+      
+    }
+  </script>
+
+	
+</head>
+<body class="proventos">
+
+	<div class="center">
+		<?php#  echo $trace_txt;?>	<script>		function validateForm() {			let form = document.createElement('form');			form.action = 'detalhes.php';			form.method = 'GET';			form.innerHTML = '<input name="papel" type="hidden" value="'+document.forms[0]["papel"].value.toUpperCase()+'">';			document.body.append(form);			form.submit();			return false;		}	</script>		
+<style>
+  #menu.institucional li a.fundamentus-mobile { 
+    background-image: url(img/bt_fundamentus_mobile2.png); 
+    width: 97px; 
+  }
+  #menu.institucional li a.fundamentus-mobile:active { 
+    background-position: 0 0 !important;
+  }  
+
+</style>
+<div class="topo">
+   <a href="index.php"><img class="logo" src="img/logo.gif" alt="FUNDAMENTUS - Invista consciente"></a>			
+   <div class="avancada"><span>Busca por <a href="buscaavancada.php">empresa</a> / <a href="fii_buscaavancada.php">fii</a></span></div>
+   <form class="busca" method="get" action="detalhes.php" onsubmit="return validateForm() ">
+      <fieldset>
+         <legend>Procurar por ação/empresa/fii</legend>
+         <input class="texto" autocomplete="off" id="completar" name="papel" type="text" spellcheck="false"><input type="image" src="img/bt_exibir.jpg" class="botao" value="Exibir"><br>				
+      </fieldset>
+   </form>
+   <div class="atual"><p>Você está vendo<strong>WEGE3</strong></p></div>			
+   <div id="containerMenu">
+      <ul id="menu" class="institucional adxm menu">
+         <li><a class="home" href="index.php">Página inicial</a></li>
+         <!--- <li><a class="conheca" href="conheca.php">Conheça o sistema</a></li> --->					
+         <li><a class="consciente" href="consciente.php">Investimento consciente</a></li>
+         <li>
+            <a class="mais-opcoes" onClick="poApple()">Mais Opções</a>
+            <ul>
+               <li><a href="fr.php">Fatos Relevantes</a></li>
+               <li><a href="ultimos-resultados.php">Últimos Resultados</a></li>
+               <li><a href="fii_imoveis.php">FII - Pesquisar Imóveis</a></li>
+            </ul>
+         </li>
+         <li><a class="contato" href="contato.php">Entre em contato</a></li>
+         <li><a class="fundamentus-mobile" href="?papel=WEGE3&interface=mobile">Fundamentus Mobile</a></li>
+      </ul>
+              <ul id="menu" class="software adxm menu">
+                      <li><a class="detalhes" href="detalhes.php?papel=WEGE3">Detalhes</a></li>
+           <li>
+              <a class="graficos" onClick="poApple()" >Gráficos</a>						
+              <ul>
+                 <li><a href="graficos.php?papel=WEGE3&tipo=1">Balanço patrimonial</a></li>
+                 <li><a href="graficos.php?papel=WEGE3&tipo=2">Demonstrativos de resultados</a></li>
+                 <li><a href="graficos.php?papel=WEGE3&tipo=4">Fluxo de caixa</a></li>
+                 <li><a href="graficos.php?papel=WEGE3&tipo=3">Indicadores fundamentalistas</a></li>
+              </ul>
+           </li>
+           <li>
+              <a class="historicos" onClick="poApple()">Dados Históricos</a>						
+              <ul class="provetos">
+                 <li><a class="dh" href="acionistas.php?papel=WEGE3">Acionistas</a></li>
+                 <li><a class="dh" href="principais_acionistas.php?papel=WEGE3&tipo=1">Principais Acionistas</a></li>
+                 <li><a class="dh" href="administradores.php?papel=WEGE3&tipo=1">Administração</a></li>
+                 <li><a class="dh" href="fatos_relevantes.php?papel=WEGE3">Fatos Relevantes</a></li>
+                 <li><a class="dh" href="apresentacoes.php?papel=WEGE3">Apresentações</a></li>
+                 <li><a class="dh" href="resultados_trimestrais.php?papel=WEGE3&tipo=1">Resultados Trim.</a></li>
+                 <li><a class="dh" href="formularios_referencia.php?papel=WEGE3&tipo=1">Form. Referência</a></li>
+                 <li><a class="dh" href="insiders.php?papel=WEGE3&tipo=1">Insiders</a></li>
+                 <li><a class="dh" href="recompras.php?papel=WEGE3&tipo=1">Recompras de Ações</a></li>
+                 <li><a class="dh" href="balancos.php?papel=WEGE3&tipo=1">Balanços em Excel</a></li>
+                 <li><a class="dh" href="proventos.php?papel=WEGE3&tipo=2">Proventos</a></li>
+              </ul>
+           </li>
+           <li><a class="cotacoes" href="cotacoes.php?papel=WEGE3">Histórico de cotações</a></li>
+           </li>				
+             
+        </ul>
+         </div>
+</div>		<div class="conteudo clearfix">
+        <div style="height:90px">
+      <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3119085269630402"
+         crossorigin="anonymous"></script>
+    <!-- anuncioTopoGrafico -->
+    <ins class="adsbygoogle"
+         style="display:inline-block;width:728px;height:90px"
+         data-ad-client="ca-pub-3119085269630402"
+         data-ad-slot="8726397494"></ins>
+    <script>
+         (adsbygoogle = window.adsbygoogle || []).push({});
+    </script>
+    </div>
+    <BR><BR>
+    
+        	<div class="center">
+    		<div class="conteudo clearfix">
+    			<h1>Proventos:</h1>
+				    <label><input id="chbAgruparAno" type="checkbox" onchange="toggleClasse()">Agrupar por ano</label>
+					<div id="tabela-completa">
+ 					  <br>
+					  <div style="width: 317px; margin-bottom: 9px">* A data se refere ao "último dia com", ou seja, a data em que o acionista passa a ter o direito de receber o dividendo caso termine o dia com a ação.</div>
+					  <table id="resultado" class="resultado rowstyle-par colstyle-col no-arrow" border="0" cellpadding="0" cellspacing="0">
+								<thead>
+									<tr>
+										<th style="-moz-user-select: none;" class="fd-column-0 sortable-date reverseSort"><a href="#">Data</a></th>
+										<th style="-moz-user-select: none;" class="fd-column-1 sortable-numeric"><a href="#">Valor</a></th>
+										<th style="-moz-user-select: none;" class="fd-column-2 sortable-text"><a href="#">Tipo</a></th>
+										<th style="-moz-user-select: none;" class="fd-column-3 sortable-date"><a href="#">Data de Pagamento</a></th>
+										<th style="-moz-user-select: none;" class="fd-column-4 sortable-numeric"><a href="#">Por quantas ações</a></th>
+									</tr>
+								</thead>
+								<tbody>
+						  									<tr class="">
+									<td>19/06/2026</td>							  <td>0,1044</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>10/03/2027							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>20/03/2026</td>							  <td>0,1001</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>10/03/2027							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>19/12/2025</td>							  <td>0,4128</td>
+							  <td>DIVIDENDO</td>
+							  <td>16/08/2028							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>19/12/2025</td>							  <td>0,4128</td>
+							  <td>DIVIDENDO</td>
+							  <td>11/08/2027							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>19/12/2025</td>							  <td>0,4128</td>
+							  <td>DIVIDENDO</td>
+							  <td>12/08/2026							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>03/12/2025</td>							  <td>0,3417</td>
+							  <td>DIVIDENDO</td>
+							  <td>12/12/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>03/12/2025</td>							  <td>0,1113</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>12/12/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>26/09/2025</td>							  <td>0,1102</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>12/12/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>25/07/2025</td>							  <td>0,1715</td>
+							  <td>DIVIDENDO</td>
+							  <td>13/08/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>20/06/2025</td>							  <td>0,0941</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>13/08/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/03/2025</td>							  <td>0,0807</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>13/08/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>28/02/2025</td>							  <td>0,3027</td>
+							  <td>DIVIDENDO</td>
+							  <td>12/03/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>20/12/2024</td>							  <td>0,0798</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>12/03/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>27/09/2024</td>							  <td>0,0701</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>12/03/2025							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>02/08/2024</td>							  <td>0,1876</td>
+							  <td>DIVIDENDO</td>
+							  <td>14/08/2024							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>28/06/2024</td>							  <td>0,0628</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>14/08/2024							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>22/03/2024</td>							  <td>0,0578</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>14/08/2024							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/02/2024</td>							  <td>0,2979</td>
+							  <td>DIVIDENDO</td>
+							  <td>13/03/2024							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>15/12/2023</td>							  <td>0,0719</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>13/03/2024							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>22/09/2023</td>							  <td>0,0598</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>13/03/2024							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/07/2023</td>							  <td>0,1452</td>
+							  <td>DIVIDENDO</td>
+							  <td>16/08/2023							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/06/2023</td>							  <td>0,0583</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>16/08/2023							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>17/03/2023</td>							  <td>0,0532</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>16/08/2023							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>17/02/2023</td>							  <td>0,2263</td>
+							  <td>DIVIDENDO</td>
+							  <td>15/03/2023							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>16/12/2022</td>							  <td>0,0544</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>15/03/2023							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/09/2022</td>							  <td>0,0441</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>15/03/2023							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>22/07/2022</td>							  <td>0,1319</td>
+							  <td>DIVIDENDO</td>
+							  <td>17/08/2022							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>24/06/2022</td>							  <td>0,0433</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>17/08/2022							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>25/03/2022</td>							  <td>0,0368</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>17/08/2022							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>18/02/2022</td>							  <td>0,2052</td>
+							  <td>DIVIDENDO</td>
+							  <td>16/03/2022							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>17/12/2021</td>							  <td>0,0320</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>16/03/2022							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>24/09/2021</td>							  <td>0,0207</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>16/03/2022							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>30/07/2021</td>							  <td>0,1582</td>
+							  <td>DIVIDENDO</td>
+							  <td>11/08/2021							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>25/06/2021</td>							  <td>0,0205</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>11/08/2021							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>26/03/2021</td>							  <td>0,0338</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>11/08/2021							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>26/02/2021</td>							  <td>0,3494</td>
+							  <td>DIVIDENDO</td>
+							  <td>10/03/2021							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>18/12/2020</td>							  <td>0,0369</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>10/03/2021							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>25/09/2020</td>							  <td>0,0345</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>10/03/2021							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>24/07/2020</td>							  <td>0,1268</td>
+							  <td>DIVIDENDO</td>
+							  <td>12/08/2020							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>26/06/2020</td>							  <td>0,0382</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>12/08/2020							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>20/03/2020</td>							  <td>0,0302</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>12/08/2020							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>21/02/2020</td>							  <td>0,1678</td>
+							  <td>DIVIDENDO</td>
+							  <td>11/03/2020							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>20/12/2019</td>							  <td>0,0382</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>11/03/2020							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>20/09/2019</td>							  <td>0,0409</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>11/03/2020							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>26/07/2019</td>							  <td>0,0891</td>
+							  <td>DIVIDENDO</td>
+							  <td>14/08/2019							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>28/06/2019</td>							  <td>0,0429</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>14/08/2019							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>22/03/2019</td>							  <td>0,0464</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>14/08/2019							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>22/02/2019</td>							  <td>0,0829</td>
+							  <td>DIVIDENDO</td>
+							  <td>13/03/2019							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/12/2018</td>							  <td>0,0514</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>13/03/2019							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>21/09/2018</td>							  <td>0,0393</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>13/03/2019							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>20/07/2018</td>							  <td>0,0824</td>
+							  <td>DIVIDENDO</td>
+							  <td>15/08/2018							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>29/06/2018</td>							  <td>0,0392</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>15/08/2018							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>23/03/2018</td>							  <td>0,0525</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>15/08/2018							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>02/03/2018</td>							  <td>0,0821</td>
+							  <td>DIVIDENDO</td>
+							  <td>14/03/2018							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>15/12/2017</td>							  <td>0,0571</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>29/09/2017</td>							  <td>0,0581</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/07/2017</td>							  <td>0,0530</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>30/06/2017</td>							  <td>0,0606</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>24/03/2017</td>							  <td>0,0653</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>24/02/2017</td>							  <td>0,0637</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>16/12/2016</td>							  <td>0,0787</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/09/2016</td>							  <td>0,0581</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>29/07/2016</td>							  <td>0,0363</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>28/06/2016</td>							  <td>0,0667</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>22/03/2016</td>							  <td>0,0553</td>
+							  <td>JUROS</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/02/2016</td>							  <td>0,0809</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>15/12/2015</td>							  <td>0,0588</td>
+							  <td>JUROS</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>22/09/2015</td>							  <td>0,0541</td>
+							  <td>JUROS</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>28/07/2015</td>							  <td>0,0830</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/06/2015</td>							  <td>0,0488</td>
+							  <td>JUROS</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>24/03/2015</td>							  <td>0,0835</td>
+							  <td>Juros</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>24/02/2015</td>							  <td>0,2076</td>
+							  <td>Dividendo</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>16/12/2014</td>							  <td>0,0765</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/09/2014</td>							  <td>0,0718</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>22/07/2014</td>							  <td>0,1554</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>24/06/2014</td>							  <td>0,0706</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>25/03/2014</td>							  <td>0,0835</td>
+							  <td>JRS CAP PROPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>25/02/2014</td>							  <td>0,2630</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>17/12/2013</td>							  <td>0,0847</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>24/09/2013</td>							  <td>0,0765</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>30/07/2013</td>							  <td>0,1850</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>25/06/2013</td>							  <td>0,0706</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>26/03/2013</td>							  <td>0,0647</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>26/02/2013</td>							  <td>0,2060</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>18/12/2012</td>							  <td>0,0694</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>25/09/2012</td>							  <td>0,0765</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>24/07/2012</td>							  <td>0,1000</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>26/06/2012</td>							  <td>0,0765</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>20/03/2012</td>							  <td>0,0765</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>14/02/2012</td>							  <td>0,1400</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>20/12/2011</td>							  <td>0,0824</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>20/09/2011</td>							  <td>0,0824</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/07/2011</td>							  <td>0,0970</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>21/06/2011</td>							  <td>0,0765</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>22/03/2011</td>							  <td>0,0682</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>22/02/2011</td>							  <td>0,1630</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/12/2010</td>							  <td>0,0588</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>21/09/2010</td>							  <td>0,0553</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>27/07/2010</td>							  <td>0,1070</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>29/06/2010</td>							  <td>0,0588</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>23/03/2010</td>							  <td>0,0506</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/02/2010</td>							  <td>0,2050</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>14/12/2009</td>							  <td>0,0176</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>17/09/2009</td>							  <td>0,0471</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>23/07/2009</td>							  <td>0,1150</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>16/06/2009</td>							  <td>0,0471</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>23/03/2009</td>							  <td>0,0529</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>16/02/2009</td>							  <td>0,1410</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>16/12/2008</td>							  <td>0,0471</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>18/09/2008</td>							  <td>0,0459</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/07/2008</td>							  <td>0,1630</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>17/06/2008</td>							  <td>0,0459</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>18/03/2008</td>							  <td>0,0447</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>19/02/2008</td>							  <td>0,1290</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>13/12/2007</td>							  <td>0,1176</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>14/09/2007</td>							  <td>0,0129</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>19/07/2007</td>							  <td>0,1960</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>18/06/2007</td>							  <td>0,0141</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>15/03/2007</td>							  <td>0,0141</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>13/02/2007</td>							  <td>0,1650</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>14/12/2006</td>							  <td>0,0118</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>14/09/2006</td>							  <td>0,0294</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>28/07/2006</td>							  <td>0,1360</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>20/06/2006</td>							  <td>0,0141</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>16/03/2006</td>							  <td>0,0141</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>16/02/2006</td>							  <td>0,1190</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>15/12/2005</td>							  <td>0,0118</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>15/09/2005</td>							  <td>0,0129</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/07/2005</td>							  <td>0,0960</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>21/06/2005</td>							  <td>0,0165</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>17/03/2005</td>							  <td>0,0118</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>17/02/2005</td>							  <td>0,1290</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>17/12/2004</td>							  <td>0,0129</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/07/2004</td>							  <td>0,1400</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>12/02/2004</td>							  <td>0,1140</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>11/12/2003</td>							  <td>0,0082</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>17/07/2003</td>							  <td>0,0725</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>17/07/2003</td>							  <td>0,0088</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>13/02/2003</td>							  <td>0,0950</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>18/07/2002</td>							  <td>0,0500</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>14/12/2001</td>							  <td>0,0376</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>14/12/2001</td>							  <td>0,0280</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>13/06/2001</td>							  <td>0,0318</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>13/06/2001</td>							  <td>0,0130</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>15/02/2001</td>							  <td>0,0100</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>15/12/2000</td>							  <td>0,0318</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>13/07/2000</td>							  <td>0,0329</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>17/12/1999</td>							  <td>0,0218</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>21/07/1999</td>							  <td>0,0229</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>18/12/1998</td>							  <td>0,0324</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>18/12/1998</td>							  <td>0,0025</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>20/07/1998</td>							  <td>0,0176</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>23/12/1997</td>							  <td>0,0130</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="par">
+									<td>23/12/1997</td>							  <td>0,0120</td>
+							  <td>JRS CAP PRÓPRIO</td>
+							  <td>-							  </td>
+							  <td>1</td>
+									  </tr>
+						  									<tr class="">
+									<td>30/07/1997</td>							  <td>10,0000</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1000</td>
+									  </tr>
+						  									<tr class="par">
+									<td>12/02/1997</td>							  <td>13,3100</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1000</td>
+									  </tr>
+						  									<tr class="">
+									<td>05/08/1996</td>							  <td>4,6700</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1000</td>
+									  </tr>
+						  									<tr class="par">
+									<td>26/02/1996</td>							  <td>2,7700</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1000</td>
+									  </tr>
+						  									<tr class="">
+									<td>26/02/1996</td>							  <td>1,4100</td>
+							  <td>DIVIDENDO</td>
+							  <td>-							  </td>
+							  <td>1000</td>
+									  </tr>
+						  								</tbody>
+							</table>
+					</div>
+					<div id="tabela-anual" style="display:none;">		
+ 					  <br>
+					  <table id="resultado-anual" class="resultado rowstyle-par colstyle-col no-arrow" border="0" cellpadding="0" cellspacing="0">
+								<thead>
+									<tr>
+										<th style="-moz-user-select: none; width: 85px;" class="fd-column-0 sortable-numeric"><a href="#">Ano</a></th>
+										<th style="-moz-user-select: none; width: 85px;" class="fd-column-1 sortable-numeric"><a href="#">Valor</a></th>
+									</tr>
+								</thead>
+								<tbody>
+						  									<tr class="">
+							  <td>2026</td>
+							  <td>0,205</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2025</td>
+							  <td>2,451</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2024</td>
+							  <td>0,756</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2023</td>
+							  <td>0,615</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2022</td>
+							  <td>0,516</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2021</td>
+							  <td>0,615</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2020</td>
+							  <td>0,434</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2019</td>
+							  <td>0,340</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2018</td>
+							  <td>0,347</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2017</td>
+							  <td>0,358</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2016</td>
+							  <td>0,376</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2015</td>
+							  <td>0,536</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2014</td>
+							  <td>0,721</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2013</td>
+							  <td>0,687</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2012</td>
+							  <td>0,539</td>
+									  </tr>
+						  									<tr class="par">
+							  <td>2011</td>
+							  <td>0,569</td>
+									  </tr>
+						  									<tr class="">
+							  <td>2010</td>
+							  <td>0,536</td>
+									  </tr>
+						  								</tbody>
+							</table>
+					
+					
+					</div>
+					 						</div>
+    	</div>
+
+
+  		</div>
+	</div>
+		<div class="rodape">
+		<div class="center">
+			<ul>
+				<li><strong>Menu institucional:</strong></li>
+				<li><a class="home" href="index.php">Página inicial</a>|</li>
+				<li><a class="consciente" href="consciente.php">Investimento Consciente</a>|</li>
+				<li><a class="contato" href="contato.php">Entre em contato</a>|</li>
+				<li><a class="ultimos-resultados" href="ultimos-resultados.php">Últimos Resultados</a></li>
+			</ul>
+			<ul>
+				<li><strong>Menu software: </strong></li>
+				<li><a class="graficos" href="graficos.php?tipo=1">Gráficos</a>|</li>
+				<li><a class="detalhes" href="detalhes.php">Detalhes</a>|</li>
+				<li><a class="cotacoes" href="cotacoes.php">Histórico de cotações</a>|</li>
+				<li><a class="acionistas" href="acionistas.php">Acionistas</a>|</li>
+				<li><a class="principais-acionistas" href="principais_acionistas.php">Principais Acionistas</a>|</li>
+				<li><a class="administracao" href="administradores.php">Administração</a>|</li>
+				<li><a class="fatos-relevantes" href="fatos_relevantes.php">Fatos Relevantes</a>|</li>
+				<li><a class="apresentacoes" href="apresentacoes.php">Apresentações</a>|</li>
+				<li><a class="proventos" href="proventos.php">Proventos</a>|</li>
+				<li><a class="historicos" href="balancos.php">Balanços Históricos</a></li>
+			</ul>
+		</div>
+	</div>
+	<!-- Google tag (gtag.js) -->
+	<script async src="https://www.googletagmanager.com/gtag/js?id=G-MBRGJ9JF74"></script>
+	<script>
+	  window.dataLayer = window.dataLayer || [];
+	  function gtag(){dataLayer.push(arguments);}
+	  gtag('js', new Date());
+
+	  gtag('config', 'G-MBRGJ9JF74');
+	</script>	
+	
+	<script  type="text/javascript" src="script/pvt.php" language="JavaScript" async></script>
+</body>
+</html>
