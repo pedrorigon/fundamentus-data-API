@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app import __version__
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -21,7 +23,7 @@ class Settings(BaseSettings):
 
     fundamentus_base_url: str = "https://www.fundamentus.com.br"
     user_agent: str = (
-        "fundamentus-data-api/0.1 local scraper "
+        f"fundamentus-data-api/{__version__} local scraper "
         "(contact: local-development; purpose: personal local API)"
     )
     request_timeout_seconds: float = 10.0

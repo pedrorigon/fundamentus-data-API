@@ -1,44 +1,52 @@
 # Fundamentus Data API
 
-[![CI](https://github.com/your-org/fundamentus-data-api/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/fundamentus-data-api/actions/workflows/ci.yml)
+[![CI](https://github.com/pedrorigon/fundamentus-data-API/actions/workflows/ci.yml/badge.svg)](https://github.com/pedrorigon/fundamentus-data-API/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pedrorigon/fundamentus-data-API?sort=semver)](https://github.com/pedrorigon/fundamentus-data-API/releases)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Local HTTP API for Fundamentus asset details and dividend events. It uses direct public HTML requests, FastAPI, Pydantic v2, async `httpx`, `selectolax`, in-memory cache and optional SQLite persistence.
+Unofficial local HTTP API for Fundamentus asset details and dividend events. It uses direct public HTML requests, FastAPI, Pydantic v2, async `httpx`, `selectolax`, in-memory cache and optional SQLite persistence.
 
 The service is designed for local consumption by portfolio tools, data pipelines and research scripts. It binds to `127.0.0.1` by default and does not use Selenium, Playwright or a headless browser.
 
-## Features
+Current version: `0.1.0` alpha.
 
-- FastAPI with OpenAPI at `/openapi.json` and Swagger UI at `/docs`
-- Async HTTP client with keep-alive pooling, timeouts, retries and concurrency limits
-- High-performance HTML parsing with `selectolax`
-- Brazilian dates, numbers, percentages and monetary values normalized without floats
-- Raw values preserved beside normalized values
-- Full section preservation for stocks, banks, FIIs, BDRs and other asset classes
-- Dividend filters for `all`, `past`, `future` and `upcoming_ex_date`
-- In-memory cache with optional SQLite persistence
-- Single-flight request coalescing for concurrent cache misses
-- Prometheus-compatible metrics at `/metrics`
-- Consistent JSON error contract
-- Fixture-based test suite that does not require internet access
+## What It Does
 
-## Installation
+- Exposes a typed HTTP API for asset details and dividend events from Fundamentus.
+- Preserves raw table values while also returning normalized Brazilian dates, numbers, percentages and monetary values.
+- Supports stocks, banks, FIIs, BDRs and other asset classes by preserving all parsed detail sections.
+- Filters dividends by `all`, `past`, `future` and `upcoming_ex_date`.
+- Uses local caching to reduce repeated upstream requests.
+- Provides OpenAPI docs, Prometheus-compatible metrics and consistent JSON errors.
+- Ships fixture-based tests that do not require internet access.
 
-Python 3.12+ is required.
+## Project Status
+
+This is an alpha release. The API is usable for local development and research workflows, but Fundamentus HTML can change without notice. Parser behavior, normalized fields and cache semantics may still evolve before a stable `1.0.0` release.
+
+This project is not affiliated with, endorsed by or sponsored by Fundamentus. Data returned by this API is not investment advice.
+
+## Requirements
+
+- Python 3.12+
+- `uv` for local development
+- Docker, optional
+
+## Quick Start
 
 ```bash
+git clone https://github.com/pedrorigon/fundamentus-data-API.git
+cd fundamentus-data-API
 uv sync --python 3.12 --extra dev
 cp .env.example .env
-```
-
-## Run
-
-```bash
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Open:
 
 - Swagger UI: `http://127.0.0.1:8000/docs`
+- ReDoc: `http://127.0.0.1:8000/redoc`
 - Health: `http://127.0.0.1:8000/health`
 - Metrics: `http://127.0.0.1:8000/metrics`
 
@@ -48,7 +56,21 @@ Open:
 docker compose up --build
 ```
 
-The compose file publishes the service only on `127.0.0.1:8000`.
+The compose file publishes the service only on `127.0.0.1:8000` and stores the SQLite cache in a named Docker volume.
+
+## API Overview
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /health` | Runtime status, version and basic configuration checks. |
+| `GET /metrics` | Prometheus-compatible process and application metrics. |
+| `GET /v1/assets/{ticker}` | Combined asset details and dividends. |
+| `GET /v1/assets/{ticker}/details` | Details page fields and preserved sections. |
+| `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
+| `GET /v1/assets` | Batch query for multiple tickers. |
+| `POST /v1/cache/invalidate` | Invalidate one ticker or the full local cache. |
+
+See [docs/API.md](docs/API.md) for the full endpoint reference.
 
 ## Examples
 
@@ -67,7 +89,7 @@ curl 'http://127.0.0.1:8000/v1/assets/WEGE3/details'
 Future dividend payments:
 
 ```bash
-curl 'http://127.0.0.1:8000/v1/assets/ITUB4/dividends?period=future&as_of=2026-07-04'
+curl 'http://127.0.0.1:8000/v1/assets/ITUB4/dividends?period=future&as_of=2026-07-05'
 ```
 
 Upcoming ex-date events:
@@ -107,20 +129,21 @@ curl -X POST 'http://127.0.0.1:8000/v1/cache/invalidate' \
 
 ## Configuration
 
-Every setting uses the `FUNDAMENTUS_API_` prefix. See `.env.example`.
+Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env.example).
 
-Important settings:
-
-- `BIND_HOST`: default `127.0.0.1`
-- `BIND_PORT`: default `8000`
-- `MARKET_DATA_TTL_SECONDS`: short market data TTL
-- `FUNDAMENTALS_TTL_SECONDS`: fundamentals TTL
-- `DIVIDENDS_TTL_SECONDS`: dividend TTL
-- `SQLITE_CACHE_ENABLED`: enables persistent cache
-- `BATCH_LIMIT`: maximum tickers accepted by `/v1/assets`
-- `UPSTREAM_CONCURRENCY`: maximum concurrent Fundamentus requests
-- `UPSTREAM_MIN_INTERVAL_SECONDS`: minimum interval between upstream requests
-- `CACHE_INVALIDATE_TOKEN`: optional token for cache invalidation
+| Setting | Default | Description |
+| --- | --- | --- |
+| `BIND_HOST` | `127.0.0.1` | Interface used by the local server. |
+| `BIND_PORT` | `8000` | Port used by the local server. |
+| `MARKET_DATA_TTL_SECONDS` | `300` | Short TTL for market-sensitive data. |
+| `FUNDAMENTALS_TTL_SECONDS` | `3600` | TTL for fundamentals. |
+| `DIVIDENDS_TTL_SECONDS` | `21600` | TTL for dividend events. |
+| `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
+| `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
+| `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
+| `UPSTREAM_CONCURRENCY` | `4` | Maximum concurrent Fundamentus requests. |
+| `UPSTREAM_MIN_INTERVAL_SECONDS` | `0.15` | Minimum interval between upstream requests. |
+| `CACHE_INVALIDATE_TOKEN` | empty | Optional token for cache invalidation. |
 
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
 
@@ -176,6 +199,12 @@ uv run mypy app
 uv run pytest
 ```
 
+Run the API locally:
+
+```bash
+make run
+```
+
 ## Benchmark
 
 Run the API first, then:
@@ -186,18 +215,32 @@ uv run python scripts/benchmark.py --ticker ITUB4 --hot-runs 10
 
 The script performs one cold request with `force_refresh=true` and then measures hot cached responses.
 
+## Versioning And Releases
+
+Releases follow semantic versioning:
+
+- Patch releases fix bugs without changing the public API contract.
+- Minor releases add backwards-compatible endpoints, fields or configuration.
+- Major releases may include breaking API, parser or cache changes.
+
+Release notes live in [CHANGELOG.md](CHANGELOG.md). The release process is documented in [RELEASING.md](RELEASING.md).
+
 ## Documentation
 
 - [API reference](docs/API.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
 - [Changelog](CHANGELOG.md)
+- [Release process](RELEASING.md)
 
-## Scraping Policy
+## Responsible Scraping
 
-This project does not bypass CAPTCHA, rate limits, authentication walls or other protection mechanisms. If Fundamentus becomes unavailable or returns unexpected HTML, the API fails with a structured error instead of exposing raw HTML, cookies, sensitive headers or stack traces.
+This project performs direct HTTP requests against public HTML. It does not bypass CAPTCHA, rate limits, authentication walls or other protection mechanisms.
+
+If Fundamentus becomes unavailable or returns unexpected HTML, the API fails with a structured error instead of exposing raw HTML, cookies, sensitive headers or stack traces.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app import __version__
 from app.api import router
 from app.cache import CacheStore
 from app.config import get_settings
@@ -34,8 +35,8 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title=settings.app_name,
-        version="0.1.0",
-        description="Local HTTP API for direct Fundamentus HTML scraping.",
+        version=__version__,
+        description="Unofficial local HTTP API for direct Fundamentus HTML scraping.",
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
