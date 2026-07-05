@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject release version
+        run: python scripts/sync_release_version.py "${{ steps.version.outputs.version }}"
+
+      - name: Install dependencies
+        run: uv sync --python 3.12 --extra dev
+
+      - name: Validate
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy app
+          uv run pytest
+
+      - name: Extract release notes
+        run: python scripts/release_notes.py "${{ steps.version.outputs.version }}" --output release-notes.md
+
+      - name: Build Python artifacts
+        run: uv build
+
+      - name: Build Docker artifact
+        run: |
+          docker build -t "fundamentus-data-api:${GITHUB_REF_NAME#v}" .
+          docker save "fundamentus-data-api:${GITHUB_REF_NAME#v}" \
+            -o "dist/fundamentus-data-api-${GITHUB_REF_NAME}.docker.tar"
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: dist/*

@@ -1,15 +1,15 @@
 # Fundamentus Data API
 
 [![CI](https://github.com/pedrorigon/fundamentus-data-API/actions/workflows/ci.yml/badge.svg)](https://github.com/pedrorigon/fundamentus-data-API/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/pedrorigon/fundamentus-data-API?sort=semver)](https://github.com/pedrorigon/fundamentus-data-API/releases)
+[![Release](https://github.com/pedrorigon/fundamentus-data-API/actions/workflows/release.yml/badge.svg)](https://github.com/pedrorigon/fundamentus-data-API/actions/workflows/release.yml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Unofficial local HTTP API for Fundamentus asset details and dividend events. It uses direct public HTML requests, FastAPI, Pydantic v2, async `httpx`, `selectolax`, in-memory cache and optional SQLite persistence.
+Local HTTP API for Fundamentus asset details and dividend events. It uses direct public HTML requests, FastAPI, Pydantic v2, async `httpx`, `selectolax`, in-memory cache and optional SQLite persistence.
 
 The service is designed for local consumption by portfolio tools, data pipelines and research scripts. It binds to `127.0.0.1` by default and does not use Selenium, Playwright or a headless browser.
 
-Current version: `0.1.0` alpha.
+API version is resolved from package metadata at runtime. Release artifacts use the pushed Git tag as the build version.
 
 ## What It Does
 
@@ -224,6 +224,8 @@ Releases follow semantic versioning:
 - Major releases may include breaking API, parser or cache changes.
 
 Release notes live in [CHANGELOG.md](CHANGELOG.md). The release process is documented in [RELEASING.md](RELEASING.md).
+
+Pushing a tag such as `vMAJOR.MINOR.PATCH` runs the release pipeline, injects that tag version into the build, creates a GitHub Release from the matching changelog section and uploads build artifacts.
 
 ## Documentation
 

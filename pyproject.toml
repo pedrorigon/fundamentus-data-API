@@ -1,7 +1,7 @@
 [project]
 name = "fundamentus-data-api"
-version = "0.1.0"
-description = "Unofficial local FastAPI service for Fundamentus asset details and dividends."
+version = "0.1.1"
+description = "Local FastAPI service for Fundamentus asset details and dividends."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"

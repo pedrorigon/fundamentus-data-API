@@ -36,7 +36,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=__version__,
-        description="Unofficial local HTTP API for direct Fundamentus HTML scraping.",
+        description="Local HTTP API for direct Fundamentus HTML scraping.",
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",

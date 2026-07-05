@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 import httpx
 import pytest
 
+from app import __version__
 from app.api.dependencies import get_asset_service
 from app.cache import CacheStore
 from app.config import Settings
@@ -120,6 +121,7 @@ async def test_endpoint_contract() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         health = await client.get("/health")
         assert health.status_code == 200
+        assert health.json()["version"] == __version__
 
         response = await client.get(
             "/v1/assets/ITUB4",
