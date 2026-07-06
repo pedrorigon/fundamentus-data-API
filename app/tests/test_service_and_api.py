@@ -21,6 +21,7 @@ class FakeScraper:
         self.fail = fail
         self.details_calls = 0
         self.dividend_calls = 0
+        self.fii_dividend_calls = 0
 
     def details_url(self, ticker: str) -> str:
         return f"https://example.local/detalhes.php?papel={ticker}&h=1"
@@ -31,15 +32,25 @@ class FakeScraper:
             await asyncio.sleep(self.delay)
         if self.fail:
             raise RuntimeError("upstream failed")
-        name = "itub4_details.html" if ticker == "ITUB4" else "wege3_details.html"
-        return (FIXTURES / name).read_text(encoding="iso-8859-1")
+        fixtures = {"ITUB4": "itub4_details.html", "HGLG11": "hglg11_details.html"}
+        return (FIXTURES / fixtures.get(ticker, "wege3_details.html")).read_text(
+            encoding="iso-8859-1"
+        )
 
     async def fetch_dividends(self, ticker: str) -> str:
         self.dividend_calls += 1
         if self.delay:
             await asyncio.sleep(self.delay)
+        if ticker == "HGLG11":
+            return "<html><body>Proventos: nenhum provento encontrado</body></html>"
         name = "itub4_dividends.html" if ticker == "ITUB4" else "wege3_dividends.html"
         return (FIXTURES / name).read_text(encoding="iso-8859-1")
+
+    async def fetch_fii_dividends(self, ticker: str) -> str:
+        self.fii_dividend_calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return (FIXTURES / "hglg11_dividends.html").read_text(encoding="iso-8859-1")
 
 
 async def make_service(scraper: FakeScraper, *, ttl: int = 60) -> AssetService:
@@ -98,6 +109,24 @@ async def test_cache_and_force_refresh() -> None:
     assert cached2 is True
     assert cached3 is False
     assert scraper.details_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_dividends_fall_back_to_fii_page_when_stock_page_is_empty() -> None:
+    scraper = FakeScraper()
+    service = await make_service(scraper)
+
+    dividends, cached = await service.get_dividends("HGLG11")
+
+    assert cached is False
+    assert scraper.dividend_calls == 1
+    assert scraper.fii_dividend_calls == 1
+    assert dividends
+    assert all(item.type == "Rendimento" for item in dividends[:3])
+
+    _again, cached_again = await service.get_dividends("HGLG11")
+    assert cached_again is True
+    assert scraper.fii_dividend_calls == 1
 
 
 @pytest.mark.asyncio

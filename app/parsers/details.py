@@ -141,7 +141,7 @@ def parse_asset_details(html: str, ticker: str, source_url: str) -> AssetDetails
 
     tree = HTMLParser(html)
     sections = _extract_sections(tree)
-    parsed_ticker = _find_text(sections, "Papel")
+    parsed_ticker = _find_text(sections, "Papel", "FII")
     if not parsed_ticker:
         if "papel não encontrado" in html.lower() or "papel nao encontrado" in html.lower():
             raise AssetNotFoundError(ticker=ticker)
@@ -151,21 +151,22 @@ def parse_asset_details(html: str, ticker: str, source_url: str) -> AssetDetails
     if normalized_ticker != ticker.upper():
         raise AssetNotFoundError(ticker=ticker)
 
+    is_real_estate_fund = _find_text(sections, "FII") is not None
     return AssetDetails(
         ticker=normalized_ticker,
-        company_name=_find_text(sections, "Empresa"),
-        asset_type=_find_text(sections, "Tipo"),
+        company_name=_find_text(sections, "Empresa", "Nome"),
+        asset_type=_find_text(sections, "Tipo") or ("FII" if is_real_estate_fund else None),
         quote=_find_decimal(sections, "Cotação"),
         quote_date=_find_date(sections, "Data últ cot"),
         market_value=_find_decimal(sections, "Valor de mercado"),
         enterprise_value=_find_decimal(sections, "Valor da firma"),
-        shares_count=_find_decimal(sections, "Nro. Ações"),
-        last_balance_date=_find_date(sections, "Últ balanço processado"),
-        sector=_find_text(sections, "Setor"),
-        subsector=_find_text(sections, "Subsetor"),
+        shares_count=_find_decimal(sections, "Nro. Ações", "Nro. Cotas"),
+        last_balance_date=_find_date(sections, "Últ balanço processado", "Últ Info Trimestral"),
+        sector=_find_text(sections, "Setor", "Segmento"),
+        subsector=_find_text(sections, "Subsetor", "Mandato"),
         average_daily_volume_2m=_find_decimal(sections, "Vol $ méd (2m)"),
-        book_value_per_share=_find_decimal(sections, "VPA"),
-        earnings_per_share=_find_decimal(sections, "LPA"),
+        book_value_per_share=_find_decimal(sections, "VPA", "VP/Cota"),
+        earnings_per_share=_find_decimal(sections, "LPA", "FFO/Cota"),
         min_52_weeks=_find_decimal(sections, "Min 52 sem"),
         max_52_weeks=_find_decimal(sections, "Max 52 sem"),
         sections=sections,
