@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 No changes yet.
 
+## [0.1.2] - 2026-07-06
+
+### Added
+
+- Support for real estate fund (FII) pages in details and dividends parsing.
+- FII-specific detail labels (`FII`, `Nome`, `Nro. Cotas`, `Segmento`, `VP/Cota`, `Ult Info Trimestral`) mapped to the existing detail fields.
+- Fallback to the `fii_proventos.php` payout page when the stock page has no dividend events.
+
+### Changed
+
+- Dividend table columns are now resolved from the table header instead of fixed positions.
+
 ## [0.1.1] - 2026-07-05
 
 ### Changed
@@ -29,6 +41,7 @@ No changes yet.
 - Fixture-based parser and endpoint test suite.
 - Public open-source documentation, governance files and release process documentation.
 
-[Unreleased]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/pedrorigon/fundamentus-data-API/releases/tag/v0.1.0
