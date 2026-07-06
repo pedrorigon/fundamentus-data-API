@@ -1,10 +1,57 @@
 from datetime import date
 
-from selectolax.parser import HTMLParser
+from selectolax.parser import HTMLParser, Node
 
 from app.core.errors import UpstreamInvalidResponseError
 from app.models import Dividend, DividendPeriod
-from app.parsers.normalizers import clean_text, parse_br_date, parse_br_decimal
+from app.parsers.normalizers import clean_text, normalize_key, parse_br_date, parse_br_decimal
+
+_HEADER_COLUMNS = {
+    "data": "date",
+    "ultima_data_com": "date",
+    "valor": "value",
+    "tipo": "type",
+    "data_de_pagamento": "payment_date",
+    "por_quantas_acoes": "shares_ratio",
+}
+_DEFAULT_COLUMNS = ("date", "value", "type", "payment_date", "shares_ratio")
+
+
+def _table_columns(table: Node) -> tuple[str, ...]:
+    """Resolve column order from the table header.
+
+    The stock page (proventos.php) and the FII page (fii_proventos.php) list the
+    same data in different column orders, so the header labels are the only
+    reliable mapping. Falls back to the stock layout when headers are missing.
+    """
+    headers = [normalize_key(cell.text(separator=" ")) for cell in table.css("thead th")]
+    columns = tuple(_HEADER_COLUMNS.get(header, "") for header in headers)
+    if "date" in columns and "value" in columns:
+        return columns
+    return _DEFAULT_COLUMNS
+
+
+def _dividend_from_row(columns: tuple[str, ...], cells: list[Node]) -> Dividend:
+    raw: dict[str, str] = {}
+    for column, cell in zip(columns, cells, strict=False):
+        if column:
+            raw[column] = clean_text(cell.text(separator=" "))
+    return Dividend(
+        ex_date=parse_br_date(raw.get("date")),
+        payment_date=parse_br_date(raw.get("payment_date")),
+        value=parse_br_decimal(raw.get("value")),
+        type=raw.get("type") or None,
+        shares_ratio=parse_br_decimal(raw.get("shares_ratio")),
+        is_future_payment=False,
+        is_future_ex_date=False,
+        raw={
+            "date": raw.get("date") or None,
+            "value": raw.get("value") or None,
+            "payment_date": raw.get("payment_date") or None,
+            "type": raw.get("type") or None,
+            "shares_ratio": raw.get("shares_ratio") or None,
+        },
+    )
 
 
 def parse_dividends(html: str, ticker: str) -> list[Dividend]:
@@ -16,35 +63,12 @@ def parse_dividends(html: str, ticker: str) -> list[Dividend]:
     if table is None:
         return []
 
-    dividends: list[Dividend] = []
-    for row in table.css("tbody tr"):
-        cells = row.css("td")
-        if len(cells) < 4:
-            continue
-        raw_date = clean_text(cells[0].text(separator=" "))
-        raw_value = clean_text(cells[1].text(separator=" "))
-        raw_type = clean_text(cells[2].text(separator=" "))
-        raw_payment = clean_text(cells[3].text(separator=" "))
-        raw_ratio = clean_text(cells[4].text(separator=" ")) if len(cells) > 4 else ""
-        dividends.append(
-            Dividend(
-                ex_date=parse_br_date(raw_date),
-                payment_date=parse_br_date(raw_payment),
-                value=parse_br_decimal(raw_value),
-                type=raw_type or None,
-                shares_ratio=parse_br_decimal(raw_ratio),
-                is_future_payment=False,
-                is_future_ex_date=False,
-                raw={
-                    "date": raw_date or None,
-                    "value": raw_value or None,
-                    "payment_date": raw_payment or None,
-                    "type": raw_type or None,
-                    "shares_ratio": raw_ratio or None,
-                },
-            )
-        )
-    return dividends
+    columns = _table_columns(table)
+    return [
+        _dividend_from_row(columns, cells)
+        for row in table.css("tbody tr")
+        if len(cells := row.css("td")) >= 4
+    ]
 
 
 def classify_dividends(dividends: list[Dividend], as_of: date) -> list[Dividend]:

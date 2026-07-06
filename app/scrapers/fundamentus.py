@@ -123,8 +123,15 @@ class FundamentusScraper:
     def dividends_url(self, ticker: str) -> str:
         return f"{self.settings.fundamentus_base_url}/proventos.php?{urlencode({'papel': ticker})}"
 
+    def fii_dividends_url(self, ticker: str) -> str:
+        query = urlencode({"papel": ticker, "tipo": "2"})
+        return f"{self.settings.fundamentus_base_url}/fii_proventos.php?{query}"
+
     async def fetch_details(self, ticker: str) -> str:
         return await self.client.get_html("/detalhes.php", {"papel": ticker, "h": "1"})
 
     async def fetch_dividends(self, ticker: str) -> str:
         return await self.client.get_html("/proventos.php", {"papel": ticker})
+
+    async def fetch_fii_dividends(self, ticker: str) -> str:
+        return await self.client.get_html("/fii_proventos.php", {"papel": ticker, "tipo": "2"})

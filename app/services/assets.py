@@ -21,6 +21,8 @@ class FundamentusSource(Protocol):
 
     def fetch_dividends(self, ticker: str) -> Awaitable[str]: ...
 
+    def fetch_fii_dividends(self, ticker: str) -> Awaitable[str]: ...
+
 
 def _details_from_cache(value: object) -> AssetDetails:
     if isinstance(value, AssetDetails):
@@ -99,6 +101,9 @@ class AssetService:
         async def load() -> list[Dividend]:
             html = await self.scraper.fetch_dividends(normalized)
             dividends = await asyncio.to_thread(parse_dividends, html, normalized)
+            if not dividends:
+                html = await self.scraper.fetch_fii_dividends(normalized)
+                dividends = await asyncio.to_thread(parse_dividends, html, normalized)
             await self.cache.set(cache_key, dividends, self.settings.dividends_ttl_seconds)
             return dividends
 

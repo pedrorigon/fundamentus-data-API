@@ -49,6 +49,43 @@ def test_parse_wege3_details_preserves_industrial_fields(
     assert "Disponibilidades" in labels
 
 
+def test_parse_hglg11_details_maps_fii_specific_labels(
+    fixture_html: Callable[[str], str],
+) -> None:
+    details = parse_asset_details(
+        fixture_html("hglg11_details.html"),
+        "HGLG11",
+        "https://www.fundamentus.com.br/detalhes.php?papel=HGLG11&h=1",
+    )
+
+    assert details.ticker == "HGLG11"
+    assert details.company_name is not None
+    assert details.asset_type == "FII"
+    assert details.quote == Decimal("150.30")
+    assert details.quote_date == date(2026, 7, 3)
+    assert details.shares_count == Decimal("45601745")
+    assert details.last_balance_date == date(2026, 3, 31)
+    assert details.book_value_per_share == Decimal("166.00")
+    assert details.min_52_weeks == Decimal("139.72")
+    assert details.max_52_weeks == Decimal("154.66")
+    labels = {field.label for section in details.sections for field in section.fields}
+    assert "FFO Yield" in labels
+    assert "P/VP" in labels
+
+
+def test_parse_fii_dividends_uses_header_column_order(
+    fixture_html: Callable[[str], str],
+) -> None:
+    dividends = parse_dividends(fixture_html("hglg11_dividends.html"), "HGLG11")
+
+    assert dividends
+    first = dividends[0]
+    assert first.ex_date == date(2026, 6, 30)
+    assert first.payment_date == date(2026, 7, 14)
+    assert first.value == Decimal("1.10")
+    assert first.type == "Rendimento"
+
+
 def test_missing_optional_fields_return_null() -> None:
     html = """
     <html><body class="detalhes"><table class="w728">
