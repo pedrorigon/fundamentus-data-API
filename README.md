@@ -67,6 +67,8 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}` | Combined asset details and dividends. |
 | `GET /v1/assets/{ticker}/details` | Details page fields and preserved sections. |
 | `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
+| `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
+| `GET /v1/instruments/{ticker}` | B3 instrument classification, including funds outside Fundamentus. |
 | `GET /v1/assets` | Batch query for multiple tickers. |
 | `POST /v1/cache/invalidate` | Invalidate one ticker or the full local cache. |
 
@@ -138,6 +140,7 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `MARKET_DATA_TTL_SECONDS` | `300` | Short TTL for market-sensitive data. |
 | `FUNDAMENTALS_TTL_SECONDS` | `3600` | TTL for fundamentals. |
 | `DIVIDENDS_TTL_SECONDS` | `21600` | TTL for dividend events. |
+| `OPPORTUNITY_CACHE_TTL_SECONDS` | `900` | In-memory TTL for B3 and Status Invest complements. |
 | `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
 | `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
 | `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
