@@ -5,6 +5,7 @@ import math
 import unicodedata
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from time import monotonic
 
 import httpx
 from selectolax.parser import HTMLParser
@@ -56,9 +57,13 @@ class B3InstrumentProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
+        self._cache: dict[str, tuple[float, InstrumentMetadata | None]] = {}
 
     async def get(self, ticker: str) -> InstrumentMetadata | None:
         normalized = _normalized_ticker(ticker)
+        cached = self._cache.get(normalized)
+        if cached and cached[0] > monotonic():
+            return cached[1]
         encoded = base64.b64encode(normalized.encode()).decode()
         timeout = httpx.Timeout(self.settings.request_timeout_seconds)
         async with httpx.AsyncClient(
@@ -81,7 +86,15 @@ class B3InstrumentProvider:
                     continue
                 result = _instrument_from_b3(payload, normalized)
                 if result is not None:
+                    self._cache[normalized] = (
+                        monotonic() + self.settings.opportunity_cache_ttl_seconds,
+                        result,
+                    )
                     return result
+        self._cache[normalized] = (
+            monotonic() + self.settings.opportunity_cache_ttl_seconds,
+            None,
+        )
         return None
 
 
@@ -93,6 +106,7 @@ class StatusInvestProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
+        self._cache: dict[tuple[str, InstrumentType | None], tuple[float, dict[str, Decimal]]] = {}
 
     async def get(
         self,
@@ -100,6 +114,10 @@ class StatusInvestProvider:
         instrument_type: InstrumentType | None,
     ) -> dict[str, Decimal]:
         normalized = _normalized_ticker(ticker).lower()
+        cache_key = (normalized, instrument_type)
+        cached = self._cache.get(cache_key)
+        if cached and cached[0] > monotonic():
+            return dict(cached[1])
         paths = _status_paths(instrument_type)
         async with httpx.AsyncClient(
             base_url=self.settings.status_invest_base_url,
@@ -122,7 +140,15 @@ class StatusInvestProvider:
                     continue
                 values = parse_status_invest_snapshot(response.text)
                 if values:
+                    self._cache[cache_key] = (
+                        monotonic() + self.settings.opportunity_cache_ttl_seconds,
+                        values,
+                    )
                     return values
+        self._cache[cache_key] = (
+            monotonic() + self.settings.opportunity_cache_ttl_seconds,
+            {},
+        )
         return {}
 
 

@@ -17,6 +17,7 @@ from app.models import (
 from app.services.opportunity import (
     B3InstrumentProvider,
     OpportunityService,
+    StatusInvestProvider,
     parse_status_invest_snapshot,
 )
 
@@ -164,3 +165,24 @@ async def test_b3_provider_rejects_invalid_ticker_without_network() -> None:
 
     with pytest.raises(Exception, match="Invalid ticker"):
         await provider.get("bad ticker")
+
+
+@pytest.mark.asyncio
+async def test_external_opportunity_providers_cache_successful_responses() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            text='<div title="Valor atual do ativo"><strong class="value">10,00</strong></div>',
+        )
+
+    provider = StatusInvestProvider(Settings(), httpx.MockTransport(handler))
+
+    first = await provider.get("TEST3", InstrumentType.stock)
+    second = await provider.get("TEST3", InstrumentType.stock)
+
+    assert first == second == {"current_price": Decimal("10.00")}
+    assert calls == 1
