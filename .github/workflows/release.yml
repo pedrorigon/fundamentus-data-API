@@ -39,7 +39,9 @@ jobs:
         run: uvx git-cliff@2.13.1 --latest --strip all --output release-notes.md
 
       - name: Build Python artifacts
-        run: uv build
+        run: |
+          uv build
+          rm -f dist/.gitignore
 
       - name: Build Docker artifact
         run: |
