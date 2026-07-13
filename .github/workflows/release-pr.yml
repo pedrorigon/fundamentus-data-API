@@ -1,0 +1,64 @@
+name: Release PR
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install dependencies
+        run: uv sync --python 3.12 --extra dev
+
+      - name: Validate
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy app
+          uv run pytest
+
+      - name: Regenerate changelog
+        run: uvx git-cliff@2.13.1 --output CHANGELOG.md
+
+      - name: Generate release notes preview
+        run: uvx git-cliff@2.13.1 --latest --strip all --output release-notes.md
+
+      - name: Open release pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "Changelog already covers ${GITHUB_REF_NAME}; nothing to propose."
+            echo "If the release was not published, run the Release workflow manually."
+            exit 0
+          fi
+          BRANCH="release/${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): add ${GITHUB_REF_NAME#v} section"
+          git push -f origin "$BRANCH"
+          {
+            echo "Merging this PR moves tag \`${GITHUB_REF_NAME}\` to the merge commit and publishes the GitHub release."
+            echo
+            echo "## Release notes preview"
+            echo
+            cat release-notes.md
+          } > pr-body.md
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore: release ${GITHUB_REF_NAME}" \
+            --body-file pr-body.md \
+            || gh pr edit "$BRANCH" --body-file pr-body.md

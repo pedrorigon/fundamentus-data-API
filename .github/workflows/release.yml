@@ -1,29 +1,55 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish without the v prefix, for example 0.1.4."
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   release:
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: main
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
       - name: Resolve version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${HEAD_REF#release/v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Move release tag to merged commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "v$VERSION" -m "v$VERSION"
+          git push -f origin "refs/tags/v$VERSION"
 
       - name: Inject release version
-        run: python scripts/sync_release_version.py "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python scripts/sync_release_version.py "$VERSION"
 
       - name: Install dependencies
         run: uv sync --python 3.12 --extra dev
@@ -44,10 +70,12 @@ jobs:
           rm -f dist/.gitignore
 
       - name: Build Docker artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          docker build -t "fundamentus-data-api:${GITHUB_REF_NAME#v}" .
-          docker save "fundamentus-data-api:${GITHUB_REF_NAME#v}" \
-            -o "dist/fundamentus-data-api-${GITHUB_REF_NAME}.docker.tar"
+          docker build -t "fundamentus-data-api:$VERSION" .
+          docker save "fundamentus-data-api:$VERSION" \
+            -o "dist/fundamentus-data-api-v$VERSION.docker.tar"
 
       - name: Generate checksums
         run: |
@@ -63,20 +91,12 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
           body_path: release-notes.md
           files: dist/*
 
-      - name: Sync changelog to main
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout -f -B main origin/main
-          uvx git-cliff@2.13.1 --output CHANGELOG.md
-          if git diff --quiet -- CHANGELOG.md; then
-            echo "Changelog on main already covers this release."
-            exit 0
-          fi
-          git add CHANGELOG.md
-          git commit -m "docs(changelog): add ${GITHUB_REF_NAME#v} section [skip ci]"
-          git push origin main
+      - name: Delete release branch
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: git push origin --delete "$HEAD_REF" || true
