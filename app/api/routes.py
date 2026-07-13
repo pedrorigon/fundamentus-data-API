@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Header, Query, Response, status
 from fastapi.responses import PlainTextResponse
 
 from app import __version__
-from app.api.dependencies import get_asset_service
+from app.api.dependencies import get_asset_service, get_opportunity_service
 from app.config import get_settings
 from app.core.errors import UnauthorizedCacheInvalidationError
 from app.core.metrics import metrics
@@ -18,12 +18,15 @@ from app.models import (
     Dividend,
     DividendPeriod,
     HealthResponse,
+    InstrumentMetadata,
+    OpportunityResponse,
 )
-from app.services import AssetService
+from app.services import AssetService, OpportunityService
 
 router = APIRouter()
 
 AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
+OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
 ForceRefreshQuery = Annotated[bool, Query()]
 AsOfQuery = Annotated[date | None, Query()]
 DividendPeriodQuery = Annotated[DividendPeriod, Query()]
@@ -31,6 +34,22 @@ IncludeDetailsQuery = Annotated[bool, Query()]
 IncludeDividendsQuery = Annotated[bool, Query()]
 TickersQuery = Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")]
 CacheTokenHeader = Annotated[str | None, Header(alias="X-Cache-Token")]
+
+
+@router.get("/v1/instruments/{ticker}")
+async def get_instrument(
+    ticker: str,
+    service: OpportunityServiceDep,
+) -> InstrumentMetadata | None:
+    return await service.instrument(ticker)
+
+
+@router.get("/v1/assets/{ticker}/opportunity")
+async def get_opportunity(
+    ticker: str,
+    service: OpportunityServiceDep,
+) -> OpportunityResponse:
+    return await service.opportunity(ticker)
 
 
 def _cache_headers(response: Response, *, force_refresh: bool = False) -> None:

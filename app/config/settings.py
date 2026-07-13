@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
@@ -22,6 +23,9 @@ class Settings(BaseSettings):
     timezone: str = "America/Sao_Paulo"
 
     fundamentus_base_url: str = "https://www.fundamentus.com.br"
+    b3_bdi_base_url: str = "https://arquivos.b3.com.br/bdi"
+    status_invest_base_url: str = "https://statusinvest.com.br"
+    bazin_minimum_yield_percent: Decimal = Decimal("6")
     user_agent: str = (
         f"fundamentus-data-api/{__version__} local scraper "
         "(contact: local-development; purpose: personal local API)"
