@@ -73,6 +73,57 @@ class AssetResponse(APIModel):
     cached: dict[str, bool] = Field(default_factory=dict)
 
 
+class InstrumentType(StrEnum):
+    stock = "stock"
+    unit = "unit"
+    bdr = "bdr"
+    fii = "fii"
+    fi_infra = "fi_infra"
+    fiagro = "fiagro"
+    etf = "etf"
+    fund = "fund"
+    unknown = "unknown"
+
+
+class InstrumentMetadata(APIModel):
+    ticker: str
+    name: str | None = None
+    instrument_type: InstrumentType
+    category: str | None = None
+    cfi_code: str | None = None
+    isin: str | None = None
+    currency: str | None = None
+    reference_date: date | None = None
+    source: str = "b3"
+    confidence: str = "high"
+
+
+class OpportunityMetric(APIModel):
+    value: Decimal | None = None
+    as_of: date | None = None
+    sources: list[str] = Field(default_factory=list)
+    unavailable_reason: str | None = None
+
+
+class OpportunityMetrics(APIModel):
+    current_price: OpportunityMetric
+    price_to_book: OpportunityMetric
+    price_to_earnings: OpportunityMetric
+    dividend_yield_12m: OpportunityMetric
+    dividends_12m: OpportunityMetric
+    graham_price: OpportunityMetric
+    bazin_price: OpportunityMetric
+    min_52_weeks: OpportunityMetric
+    max_52_weeks: OpportunityMetric
+
+
+class OpportunityResponse(APIModel):
+    ticker: str
+    instrument: InstrumentMetadata | None = None
+    metrics: OpportunityMetrics
+    refreshed_at: datetime
+
+
 class BatchAssetResponse(APIModel):
     count: int
     results: list[AssetResponse]

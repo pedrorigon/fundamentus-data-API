@@ -9,6 +9,11 @@ from app.models.assets import (
     DividendPeriod,
     FieldData,
     HealthResponse,
+    InstrumentMetadata,
+    InstrumentType,
+    OpportunityMetric,
+    OpportunityMetrics,
+    OpportunityResponse,
 )
 
 __all__ = [
@@ -22,4 +27,9 @@ __all__ = [
     "DividendPeriod",
     "FieldData",
     "HealthResponse",
+    "InstrumentMetadata",
+    "InstrumentType",
+    "OpportunityMetric",
+    "OpportunityMetrics",
+    "OpportunityResponse",
 ]

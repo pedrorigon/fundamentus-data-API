@@ -9,7 +9,7 @@ from app.cache import CacheStore
 from app.config import get_settings
 from app.core.errors import register_error_handlers
 from app.scrapers import FundamentusClient, FundamentusScraper
-from app.services import AssetService
+from app.services import AssetService, OpportunityService
 
 
 @asynccontextmanager
@@ -23,7 +23,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await cache.startup()
     await client.startup()
     scraper = FundamentusScraper(client, settings)
-    app.state.asset_service = AssetService(scraper, cache, settings)
+    asset_service = AssetService(scraper, cache, settings)
+    app.state.asset_service = asset_service
+    app.state.opportunity_service = OpportunityService(asset_service, settings)
     try:
         yield
     finally:
