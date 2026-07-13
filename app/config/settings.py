@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     fundamentals_ttl_seconds: int = 3600
     dividends_ttl_seconds: int = 21600
     cache_headers_max_age_seconds: int = 60
+    opportunity_cache_ttl_seconds: int = 900
 
     sqlite_cache_enabled: bool = True
     sqlite_cache_path: Path = Field(default=Path(".cache/fundamentus_cache.sqlite3"))
