@@ -131,16 +131,18 @@ async def test_b3_provider_classifies_juro11_as_infrastructure_fund() -> None:
                 {"name": "ISIN"},
                 {"name": "TradgCcy"},
             ],
-            "values": [[
-                "2026-07-10T00:00:00",
-                "JURO11",
-                "CASH",
-                "FUNDS",
-                "SPARTA INFRA FIC FI INFRA RENDA FIXA CP",
-                "CFCGIU",
-                "BRJUROCTF002",
-                "BRL",
-            ]],
+            "values": [
+                [
+                    "2026-07-10T00:00:00",
+                    "JURO11",
+                    "CASH",
+                    "FUNDS",
+                    "SPARTA INFRA FIC FI INFRA RENDA FIXA CP",
+                    "CFCGIU",
+                    "BRJUROCTF002",
+                    "BRL",
+                ]
+            ],
         }
     }
 
