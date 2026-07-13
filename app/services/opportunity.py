@@ -127,6 +127,7 @@ class StatusInvestProvider:
             headers={
                 "Accept": "text/html",
                 "Accept-Language": "pt-BR,pt;q=0.9",
+                "Referer": f"{self.settings.status_invest_base_url.rstrip('/')}/",
                 "User-Agent": "Mozilla/5.0",
             },
         ) as client:
@@ -292,6 +293,19 @@ def parse_status_invest_snapshot(html: str) -> dict[str, Decimal]:
         value = parse_br_decimal(value_node.text() if value_node else None)
         if value is not None:
             values[key] = value
+    indicator_keys = {
+        "p_l": "price_to_earnings",
+        "p_vp": "price_to_book",
+        "lpa": "earnings_per_share",
+        "vpa": "book_value_per_share",
+    }
+    for node in tree.css("[data-key]"):
+        key = indicator_keys.get((node.attributes.get("data-key") or "").lower())
+        container = node.parent.parent if node.parent is not None else None
+        value_node = container.css_first("strong.value") if container is not None else None
+        value = parse_br_decimal(value_node.text() if value_node else None)
+        if key is not None and value is not None:
+            values.setdefault(key, value)
     return values
 
 
@@ -307,9 +321,18 @@ def _opportunity_metrics(
         details.quote if details else None,
         status.get("current_price"),
     )
-    book_value = details.book_value_per_share if details else None
-    earnings = details.earnings_per_share if details else None
-    price_to_book = fields.get("p_vp")
+    book_value, book_value_source = _prefer(
+        details.book_value_per_share if details else None,
+        status.get("book_value_per_share"),
+    )
+    earnings, earnings_source = _prefer(
+        details.earnings_per_share if details else None,
+        status.get("earnings_per_share"),
+    )
+    price_to_book, price_to_book_source = _prefer(
+        fields.get("p_vp"),
+        status.get("price_to_book"),
+    )
     if (
         price_to_book is None
         and current_price is not None
@@ -317,7 +340,11 @@ def _opportunity_metrics(
         and book_value != 0
     ):
         price_to_book = current_price / book_value
-    price_to_earnings = fields.get("p_l")
+        price_to_book_source = price_source or book_value_source
+    price_to_earnings, price_to_earnings_source = _prefer(
+        fields.get("p_l"),
+        status.get("price_to_earnings"),
+    )
     if (
         price_to_earnings is None
         and current_price is not None
@@ -325,6 +352,7 @@ def _opportunity_metrics(
         and earnings != 0
     ):
         price_to_earnings = current_price / earnings
+        price_to_earnings_source = price_source or earnings_source
 
     cutoff = as_of - timedelta(days=365)
     dividend_total = Decimal("0")
@@ -369,13 +397,13 @@ def _opportunity_metrics(
         price_to_book=_metric(
             price_to_book,
             as_of=as_of,
-            sources=fundamental_source,
+            sources=[price_to_book_source] if price_to_book_source else [],
             reason="Book value per share unavailable",
         ),
         price_to_earnings=_metric(
             price_to_earnings,
             as_of=as_of,
-            sources=fundamental_source,
+            sources=[price_to_earnings_source] if price_to_earnings_source else [],
             reason="Earnings per share unavailable",
         ),
         dividend_yield_12m=_metric(

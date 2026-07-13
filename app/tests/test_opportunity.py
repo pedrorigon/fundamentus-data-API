@@ -106,6 +106,15 @@ def test_status_invest_parser_reads_visible_opportunity_values() -> None:
     <div title="Soma total de proventos distribuídos nos últimos 12 meses">
       <span class="sub-value">R$ 10,25</span>
     </div>
+    <div class="item"><div><div><strong class="value">4,00</strong>
+      <div><button data-key="p_l"></button></div></div></div></div>
+    <div class="item"><div><div><strong class="value">1,25</strong>
+      <div><button data-key="p_vp"></button></div></div></div></div>
+    <div class="item"><div><div><strong class="value">2,50</strong>
+      <div><button data-key="lpa"></button></div></div></div></div>
+    <div class="item"><div><div><strong class="value">8,00</strong>
+      <div><button data-key="vpa"></button></div></div></div></div>
+    <button data-key></button>
     """
 
     assert parse_status_invest_snapshot(html) == {
@@ -114,7 +123,25 @@ def test_status_invest_parser_reads_visible_opportunity_values() -> None:
         "max_52_weeks": Decimal("104.30"),
         "dividend_yield_12m": Decimal("10.47"),
         "dividends_12m": Decimal("10.25"),
+        "price_to_earnings": Decimal("4.00"),
+        "price_to_book": Decimal("1.25"),
+        "earnings_per_share": Decimal("2.50"),
+        "book_value_per_share": Decimal("8.00"),
     }
+
+
+@pytest.mark.asyncio
+async def test_status_invest_provider_sends_navigation_referer() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["referer"] == "https://statusinvest.com.br/"
+        return httpx.Response(
+            200,
+            text='<div title="Valor atual do ativo"><strong class="value">10,00</strong></div>',
+        )
+
+    provider = StatusInvestProvider(Settings(), httpx.MockTransport(handler))
+
+    assert await provider.get("TEST3", InstrumentType.stock) == {"current_price": Decimal("10.00")}
 
 
 @pytest.mark.asyncio
