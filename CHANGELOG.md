@@ -4,44 +4,37 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.3] - 2026-07-13
 
-No changes yet.
+### Added
+
+- Add instrument classification and valuation metrics.
+
+### Changed
+
+- Cache upstream classification data.
 
 ## [0.1.2] - 2026-07-06
 
 ### Added
 
-- Support for real estate fund (FII) pages in details and dividends parsing.
-- FII-specific detail labels (`FII`, `Nome`, `Nro. Cotas`, `Segmento`, `VP/Cota`, `Ult Info Trimestral`) mapped to the existing detail fields.
-- Fallback to the `fii_proventos.php` payout page when the stock page has no dividend events.
-
-### Changed
-
-- Dividend table columns are now resolved from the table header instead of fixed positions.
+- Support real estate fund (FII) pages in details and dividends parsing.
 
 ## [0.1.1] - 2026-07-05
 
-### Changed
+### Added
 
-- Runtime API version now resolves from package metadata or `FUNDAMENTUS_API_VERSION`.
-- Release workflow injects the pushed tag version into build artifacts automatically.
-- README release badge no longer depends on a pre-existing GitHub Release.
+- Release v0.1.1 with version resolution and automated release workflow.
 
 ## [0.1.0] - 2026-07-05
 
 ### Added
 
-- Initial local FastAPI service for Fundamentus asset details and dividends.
-- Async HTTP scraping through direct public HTML requests.
-- In-memory and optional SQLite cache with request coalescing.
-- Optional SQLite persistence for cache reuse across restarts.
-- Prometheus-compatible metrics endpoint.
-- Structured JSON error responses.
-- Fixture-based parser and endpoint test suite.
-- Public open-source documentation, governance files and release process documentation.
+- Parse Fundamentus asset pages.
+- Expose local asset data endpoints.
+- Update versioning and documentation for v0.1.0 release.
 
-[Unreleased]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.2...HEAD
+[0.1.3]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/pedrorigon/fundamentus-data-API/releases/tag/v0.1.0

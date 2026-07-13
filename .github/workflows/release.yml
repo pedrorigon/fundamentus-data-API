@@ -35,8 +35,8 @@ jobs:
           uv run mypy app
           uv run pytest
 
-      - name: Extract release notes
-        run: python scripts/release_notes.py "${{ steps.version.outputs.version }}" --output release-notes.md
+      - name: Generate release notes
+        run: uvx git-cliff@2.13.1 --latest --strip all --output release-notes.md
 
       - name: Build Python artifacts
         run: uv build
@@ -63,3 +63,18 @@ jobs:
         with:
           body_path: release-notes.md
           files: dist/*
+
+      - name: Sync changelog to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -f -B main origin/main
+          uvx git-cliff@2.13.1 --output CHANGELOG.md
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "Changelog on main already covers this release."
+            exit 0
+          fi
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): add ${GITHUB_REF_NAME#v} section [skip ci]"
+          git push origin main
