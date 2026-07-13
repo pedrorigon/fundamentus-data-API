@@ -2,25 +2,31 @@
 # CHANGELOG.md is generated from conventional commit messages; do not edit it by hand.
 
 [changelog]
-header = """
-# Changelog
+header = """# Changelog
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-"""
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)."""
 body = """
 {%- if version %}
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {%- else %}
 ## [Unreleased]
 {%- endif %}
-{% for group, commits in commits | group_by(attribute="group") %}
+{%- set internal = commits | filter(attribute="group", value="Internal") | length %}
+{%- if internal == commits | length %}
+
+No user-facing changes.
+{%- endif %}
+{%- for group, commits in commits | group_by(attribute="group") %}
+{%- if group != "Internal" %}
+
 ### {{ group }}
 {% for commit in commits %}
 - {% if commit.breaking %}**Breaking:** {% endif %}{{ commit.message | upper_first }}.
 {%- endfor %}
-{% endfor %}
+{%- endif %}
+{%- endfor %}
 """
 footer = """
 {%- for release in releases %}
@@ -33,9 +39,9 @@ footer = """
 {%- else %}
 [Unreleased]: https://github.com/pedrorigon/fundamentus-data-API/compare/{{ release.previous.version }}...HEAD
 {%- endif %}
-{%- endfor %}
-"""
-trim = true
+{%- endfor %}"""
+trim = false
+render_always = true
 
 [git]
 conventional_commits = true
@@ -50,12 +56,12 @@ commit_parsers = [
   { message = "^perf", group = "Changed" },
   { message = "^refactor", group = "Changed" },
   { message = "^revert", group = "Changed" },
-  { message = "^docs", skip = true },
-  { message = "^style", skip = true },
-  { message = "^test", skip = true },
-  { message = "^chore", skip = true },
-  { message = "^ci", skip = true },
-  { message = "^build", skip = true },
-  { message = "^Initial commit", skip = true },
+  { message = "^docs", group = "Internal" },
+  { message = "^style", group = "Internal" },
+  { message = "^test", group = "Internal" },
+  { message = "^chore", group = "Internal" },
+  { message = "^ci", group = "Internal" },
+  { message = "^build", group = "Internal" },
+  { message = "^Initial commit", group = "Internal" },
   { message = ".*", group = "Changed" },
 ]
