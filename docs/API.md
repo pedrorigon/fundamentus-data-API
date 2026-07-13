@@ -36,6 +36,20 @@ Returns normalized fields and all parsed sections from the Fundamentus details p
 
 Returns all parsed dividends after applying the requested period filter.
 
+### `GET /v1/assets/{ticker}/opportunity`
+
+Returns current price, P/L, P/VP, trailing dividend yield, Graham price,
+Bazin price and the 52-week range. Each metric includes its source,
+reference date and an explicit reason when unavailable. Fundamentus is the
+primary source and Status Invest fills market-sensitive gaps.
+
+### `GET /v1/instruments/{ticker}`
+
+Classifies the ticker using official B3 instrument data. The response includes
+the normalized instrument type, confidence, source and reference date. This
+also covers listed instruments that Fundamentus does not expose, such as
+FI-Infra and Fiagro funds.
+
 ### `GET /v1/assets`
 
 Batch endpoint.
