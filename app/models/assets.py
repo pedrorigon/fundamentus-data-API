@@ -98,6 +98,63 @@ class InstrumentMetadata(APIModel):
     confidence: str = "high"
 
 
+class FundAllocation(APIModel):
+    name: str
+    weight: Decimal
+
+
+class FundHolding(APIModel):
+    symbol: str
+    description: str | None = None
+    weight: Decimal
+
+
+class FundProfile(APIModel):
+    net_assets: Decimal | None = None
+    net_expense_ratio: Decimal | None = None
+    portfolio_turnover: Decimal | None = None
+    dividend_yield: Decimal | None = None
+    nav: Decimal | None = None
+    inception_date: date | None = None
+    description: str | None = None
+    sectors: list[FundAllocation] = Field(default_factory=list)
+    asset_types: list[FundAllocation] = Field(default_factory=list)
+    holdings: list[FundHolding] = Field(default_factory=list)
+    source: str
+
+
+class InternationalFundamentals(APIModel):
+    description: str | None = None
+    country: str | None = None
+    sector: str | None = None
+    industry: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    market_capitalization: Decimal | None = None
+    price_to_earnings: Decimal | None = None
+    price_to_book: Decimal | None = None
+    earnings_per_share: Decimal | None = None
+    dividend_yield: Decimal | None = None
+    source: str
+
+
+class MarketQuote(APIModel):
+    price: Decimal
+    currency: str
+    exchange: str | None = None
+    quoted_at: datetime | None = None
+    source: str
+
+
+class InstrumentDataResponse(APIModel):
+    ticker: str
+    instrument: InstrumentMetadata | None = None
+    quote: MarketQuote | None = None
+    fund_profile: FundProfile | None = None
+    fundamentals: InternationalFundamentals | None = None
+    refreshed_at: datetime
+
+
 class OpportunityMetric(APIModel):
     value: Decimal | None = None
     as_of: date | None = None

@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     fundamentus_base_url: str = "https://www.fundamentus.com.br"
     b3_bdi_base_url: str = "https://arquivos.b3.com.br/bdi"
     status_invest_base_url: str = "https://statusinvest.com.br"
+    brapi_base_url: str = "https://brapi.dev"
+    brapi_token: SecretStr | None = None
+    alpha_vantage_base_url: str = "https://www.alphavantage.co"
+    alpha_vantage_api_key: SecretStr | None = None
     bazin_minimum_yield_percent: Decimal = Decimal("6")
     user_agent: str = (
         f"fundamentus-data-api/{__version__} local scraper "
@@ -46,6 +50,7 @@ class Settings(BaseSettings):
     dividends_ttl_seconds: int = 21600
     cache_headers_max_age_seconds: int = 60
     opportunity_cache_ttl_seconds: int = 900
+    instrument_data_ttl_seconds: int = 86400
 
     sqlite_cache_enabled: bool = True
     sqlite_cache_path: Path = Field(default=Path(".cache/fundamentus_cache.sqlite3"))

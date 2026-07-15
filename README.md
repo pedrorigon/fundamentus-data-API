@@ -16,6 +16,8 @@ API version is resolved from package metadata at runtime. Release artifacts use 
 - Exposes a typed HTTP API for asset details and dividend events from Fundamentus.
 - Preserves raw table values while also returning normalized Brazilian dates, numbers, percentages and monetary values.
 - Supports stocks, banks, FIIs, BDRs and other asset classes by preserving all parsed detail sections.
+- Classifies B3 ETFs and exposes quotes and market data through brapi.
+- Exposes profiles, holdings and fundamentals for international ETFs and stocks through Alpha Vantage.
 - Filters dividends by `all`, `past`, `future` and `upcoming_ex_date`.
 - Uses local caching to reduce repeated upstream requests.
 - Provides OpenAPI docs, Prometheus-compatible metrics and consistent JSON errors.
@@ -69,6 +71,7 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
 | `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
 | `GET /v1/instruments/{ticker}` | B3 instrument classification, including funds outside Fundamentus. |
+| `GET /v2/instruments/{ticker}` | ETF and stock data from B3, brapi and Alpha Vantage. |
 | `GET /v1/assets` | Batch query for multiple tickers. |
 | `POST /v1/cache/invalidate` | Invalidate one ticker or the full local cache. |
 
@@ -106,6 +109,18 @@ Batch query:
 curl 'http://127.0.0.1:8000/v1/assets?tickers=WEGE3,ITUB4&include_dividends=false'
 ```
 
+Domestic ETF data:
+
+```bash
+curl 'http://127.0.0.1:8000/v2/instruments/BOVA11?instrument_type=etf'
+```
+
+International ETF data:
+
+```bash
+curl 'http://127.0.0.1:8000/v2/instruments/VOO?instrument_type=etf'
+```
+
 Force refresh:
 
 ```bash
@@ -141,6 +156,9 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `FUNDAMENTALS_TTL_SECONDS` | `3600` | TTL for fundamentals. |
 | `DIVIDENDS_TTL_SECONDS` | `21600` | TTL for dividend events. |
 | `OPPORTUNITY_CACHE_TTL_SECONDS` | `900` | In-memory TTL for B3 and Status Invest complements. |
+| `INSTRUMENT_DATA_TTL_SECONDS` | `86400` | In-memory TTL for ETF and international instrument data. |
+| `BRAPI_TOKEN` | empty | brapi backend token required for production coverage of B3 symbols. |
+| `ALPHA_VANTAGE_API_KEY` | empty | Alpha Vantage key for international ETF profiles and stock fundamentals. |
 | `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
 | `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
 | `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
@@ -149,6 +167,8 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `CACHE_INVALIDATE_TOKEN` | empty | Optional token for cache invalidation. |
 
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
+
+The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. Keep provider keys on the server and review their terms before production use.
 
 ## Data Shape
 

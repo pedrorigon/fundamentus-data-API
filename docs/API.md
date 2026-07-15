@@ -50,6 +50,16 @@ the normalized instrument type, confidence, source and reference date. This
 also covers listed instruments that Fundamentus does not expose, such as
 FI-Infra and Fiagro funds.
 
+### `GET /v2/instruments/{ticker}`
+
+Returns normalized data for domestic and international stocks and ETFs.
+
+Query parameters:
+
+- `instrument_type`: optional `stock` or `etf` hint for international symbols
+
+Domestic instruments are classified from B3 files and enriched with brapi quotes. International ETFs use the Alpha Vantage ETF profile, including holdings and allocations. International stocks use the Alpha Vantage company overview. Provider failures leave the affected optional section empty without changing the response schema.
+
 ### `GET /v1/assets`
 
 Batch endpoint.

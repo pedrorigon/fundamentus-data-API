@@ -9,7 +9,7 @@ from app.cache import CacheStore
 from app.config import get_settings
 from app.core.errors import register_error_handlers
 from app.scrapers import FundamentusClient, FundamentusScraper
-from app.services import AssetService, OpportunityService
+from app.services import AssetService, InstrumentDataService, OpportunityService
 
 
 @asynccontextmanager
@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     asset_service = AssetService(scraper, cache, settings)
     app.state.asset_service = asset_service
     app.state.opportunity_service = OpportunityService(asset_service, settings)
+    app.state.instrument_data_service = InstrumentDataService(settings)
     try:
         yield
     finally:
@@ -38,7 +39,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=__version__,
-        description="Local HTTP API for direct Fundamentus HTML scraping.",
+        description="Local HTTP API for Brazilian and international market data.",
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
