@@ -5,7 +5,11 @@ from fastapi import APIRouter, Depends, Header, Query, Response, status
 from fastapi.responses import PlainTextResponse
 
 from app import __version__
-from app.api.dependencies import get_asset_service, get_opportunity_service
+from app.api.dependencies import (
+    get_asset_service,
+    get_instrument_data_service,
+    get_opportunity_service,
+)
 from app.config import get_settings
 from app.core.errors import UnauthorizedCacheInvalidationError
 from app.core.metrics import metrics
@@ -18,15 +22,18 @@ from app.models import (
     Dividend,
     DividendPeriod,
     HealthResponse,
+    InstrumentDataResponse,
     InstrumentMetadata,
+    InstrumentType,
     OpportunityResponse,
 )
-from app.services import AssetService, OpportunityService
+from app.services import AssetService, InstrumentDataService, OpportunityService
 
 router = APIRouter()
 
 AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
+InstrumentDataServiceDep = Annotated[InstrumentDataService, Depends(get_instrument_data_service)]
 ForceRefreshQuery = Annotated[bool, Query()]
 AsOfQuery = Annotated[date | None, Query()]
 DividendPeriodQuery = Annotated[DividendPeriod, Query()]
@@ -42,6 +49,15 @@ async def get_instrument(
     service: OpportunityServiceDep,
 ) -> InstrumentMetadata | None:
     return await service.instrument(ticker)
+
+
+@router.get("/v2/instruments/{ticker}", tags=["instruments"])
+async def get_instrument_data(
+    ticker: str,
+    service: InstrumentDataServiceDep,
+    instrument_type: InstrumentType | None = None,
+) -> InstrumentDataResponse:
+    return await service.get(ticker, instrument_type)
 
 
 @router.get("/v1/assets/{ticker}/opportunity")

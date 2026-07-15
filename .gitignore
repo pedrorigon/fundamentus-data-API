@@ -1,4 +1,5 @@
 .cache/
+.coverage
 .env
 .mypy_cache/
 .pytest_cache/
@@ -7,3 +8,4 @@
 __pycache__/
 *.pyc
 dist/
+coverage.xml
