@@ -102,6 +102,7 @@ async def test_service_uses_previous_business_day_and_caches_files() -> None:
     second = await service.resolve(request)
 
     valuation = first.valuations["AALM12"][0]
+    assert valuation.requested_date == sunday
     assert valuation.reference_date == friday
     assert valuation.unit_price == Decimal("1064.25")
     assert valuation.source == "anbima"
@@ -167,6 +168,7 @@ async def test_fixed_income_endpoint_returns_resolved_values() -> None:
     assert response.status_code == 200
     assert response.json()["valuations"]["AALM12"][0] == {
         "identifier": "AALM12",
+        "requested_date": "2026-07-17",
         "reference_date": "2026-07-17",
         "unit_price": "1064.25",
         "currency": "BRL",

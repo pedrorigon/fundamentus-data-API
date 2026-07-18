@@ -11,6 +11,7 @@ class ValuationMethod(StrEnum):
 
 class FixedIncomeValuation(BaseModel):
     identifier: str
+    requested_date: date
     reference_date: date
     unit_price: Decimal
     currency: str = "BRL"
