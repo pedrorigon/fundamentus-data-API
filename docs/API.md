@@ -100,3 +100,20 @@ If `FUNDAMENTUS_API_CACHE_INVALIDATE_TOKEN` is set, callers must provide the tok
   }
 }
 ```
+# Fixed-income valuations
+
+`POST /v1/fixed-income/valuations/resolve` resolves public indicative unit prices for a
+bounded list of instrument identifiers and valuation dates. The service currently uses the
+official ANBIMA daily debenture publication, caches immutable historical files, and returns
+unavailable identifiers explicitly instead of inventing a price.
+
+```json
+{
+  "identifiers": ["AALM12", "CDB925623O7"],
+  "dates": ["2026-07-17"]
+}
+```
+
+The response preserves an empty list for instruments that no public source can value, allowing
+callers to retain the instrument and its transactions while calculating performance from the
+measurable part of a portfolio.

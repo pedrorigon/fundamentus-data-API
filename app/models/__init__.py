@@ -21,6 +21,12 @@ from app.models.assets import (
     OpportunityMetrics,
     OpportunityResponse,
 )
+from app.models.fixed_income import (
+    FixedIncomeValuation,
+    FixedIncomeValuationRequest,
+    FixedIncomeValuationResponse,
+    ValuationMethod,
+)
 
 __all__ = [
     "AssetDetails",
@@ -44,4 +50,8 @@ __all__ = [
     "OpportunityMetric",
     "OpportunityMetrics",
     "OpportunityResponse",
+    "FixedIncomeValuation",
+    "FixedIncomeValuationRequest",
+    "FixedIncomeValuationResponse",
+    "ValuationMethod",
 ]

@@ -7,6 +7,7 @@ from fastapi.responses import PlainTextResponse
 from app import __version__
 from app.api.dependencies import (
     get_asset_service,
+    get_fixed_income_valuation_service,
     get_instrument_data_service,
     get_opportunity_service,
 )
@@ -21,19 +22,30 @@ from app.models import (
     CacheInvalidationResponse,
     Dividend,
     DividendPeriod,
+    FixedIncomeValuationRequest,
+    FixedIncomeValuationResponse,
     HealthResponse,
     InstrumentDataResponse,
     InstrumentMetadata,
     InstrumentType,
     OpportunityResponse,
 )
-from app.services import AssetService, InstrumentDataService, OpportunityService
+from app.services import (
+    AssetService,
+    FixedIncomeValuationService,
+    InstrumentDataService,
+    OpportunityService,
+)
 
 router = APIRouter()
 
 AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
 InstrumentDataServiceDep = Annotated[InstrumentDataService, Depends(get_instrument_data_service)]
+FixedIncomeServiceDep = Annotated[
+    FixedIncomeValuationService,
+    Depends(get_fixed_income_valuation_service),
+]
 ForceRefreshQuery = Annotated[bool, Query()]
 AsOfQuery = Annotated[date | None, Query()]
 DividendPeriodQuery = Annotated[DividendPeriod, Query()]
@@ -41,6 +53,18 @@ IncludeDetailsQuery = Annotated[bool, Query()]
 IncludeDividendsQuery = Annotated[bool, Query()]
 TickersQuery = Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")]
 CacheTokenHeader = Annotated[str | None, Header(alias="X-Cache-Token")]
+
+
+@router.post(
+    "/v1/fixed-income/valuations/resolve",
+    response_model=FixedIncomeValuationResponse,
+    tags=["fixed-income"],
+)
+async def resolve_fixed_income_valuations(
+    payload: FixedIncomeValuationRequest,
+    service: FixedIncomeServiceDep,
+) -> FixedIncomeValuationResponse:
+    return await service.resolve(payload)
 
 
 @router.get("/v1/instruments/{ticker}")
