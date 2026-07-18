@@ -2,7 +2,12 @@ from typing import cast
 
 from fastapi import Request
 
-from app.services import AssetService, InstrumentDataService, OpportunityService
+from app.services import (
+    AssetService,
+    FixedIncomeValuationService,
+    InstrumentDataService,
+    OpportunityService,
+)
 
 
 def get_asset_service(request: Request) -> AssetService:
@@ -15,3 +20,7 @@ def get_opportunity_service(request: Request) -> OpportunityService:
 
 def get_instrument_data_service(request: Request) -> InstrumentDataService:
     return cast(InstrumentDataService, request.app.state.instrument_data_service)
+
+
+def get_fixed_income_valuation_service(request: Request) -> FixedIncomeValuationService:
+    return cast(FixedIncomeValuationService, request.app.state.fixed_income_valuation_service)
