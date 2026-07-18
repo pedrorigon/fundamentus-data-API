@@ -44,6 +44,7 @@ class FixedIncomeValuationService:
                     resolved[identifier].append(
                         FixedIncomeValuation(
                             identifier=identifier,
+                            requested_date=target,
                             reference_date=reference,
                             unit_price=unit_price,
                             source=SOURCE_ANBIMA,
