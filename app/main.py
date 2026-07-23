@@ -12,6 +12,7 @@ from app.scrapers import FundamentusClient, FundamentusScraper
 from app.services import (
     AssetService,
     FixedIncomeValuationService,
+    HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
 )
@@ -33,6 +34,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.opportunity_service = OpportunityService(asset_service, settings)
     app.state.instrument_data_service = InstrumentDataService(settings)
     app.state.fixed_income_valuation_service = FixedIncomeValuationService(settings, cache)
+    app.state.historical_quote_service = HistoricalQuoteService(settings, cache)
     try:
         yield
     finally:

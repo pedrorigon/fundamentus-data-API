@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 
     fundamentus_base_url: str = "https://www.fundamentus.com.br"
     b3_bdi_base_url: str = "https://arquivos.b3.com.br/bdi"
+    b3_historical_quote_base_url: str = "https://bvmf.bmfbovespa.com.br/InstDados/SerHist"
     anbima_debenture_base_url: str = (
         "https://www.anbima.com.br/informacoes/merc-sec-debentures/arqs"
     )
@@ -56,6 +57,7 @@ class Settings(BaseSettings):
     instrument_data_ttl_seconds: int = 86400
     fixed_income_current_ttl_seconds: int = 3600
     fixed_income_history_ttl_seconds: int = 2592000
+    equity_history_ttl_seconds: int = 315360000
 
     sqlite_cache_enabled: bool = True
     sqlite_cache_path: Path = Field(default=Path(".cache/fundamentus_cache.sqlite3"))
