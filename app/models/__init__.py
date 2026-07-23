@@ -27,6 +27,11 @@ from app.models.fixed_income import (
     FixedIncomeValuationResponse,
     ValuationMethod,
 )
+from app.models.historical_quotes import (
+    HistoricalQuote,
+    HistoricalQuoteRequest,
+    HistoricalQuoteResponse,
+)
 
 __all__ = [
     "AssetDetails",
@@ -54,4 +59,7 @@ __all__ = [
     "FixedIncomeValuationRequest",
     "FixedIncomeValuationResponse",
     "ValuationMethod",
+    "HistoricalQuote",
+    "HistoricalQuoteRequest",
+    "HistoricalQuoteResponse",
 ]

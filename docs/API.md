@@ -50,6 +50,13 @@ the normalized instrument type, confidence, source and reference date. This
 also covers listed instruments that Fundamentus does not expose, such as
 FI-Infra and Fiagro funds.
 
+### `POST /v1/equities/historical-quotes/resolve`
+
+Resolves public B3 COTAHIST closing prices for Brazilian equities on or before
+each requested date. The response preserves the requested date, the effective
+trading date and unavailable tickers. COTAHIST prices are historical trade
+prices and are not adjusted for corporate actions.
+
 ### `GET /v2/instruments/{ticker}`
 
 Returns normalized data for domestic and international stocks and ETFs.

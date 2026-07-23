@@ -8,6 +8,7 @@ from app import __version__
 from app.api.dependencies import (
     get_asset_service,
     get_fixed_income_valuation_service,
+    get_historical_quote_service,
     get_instrument_data_service,
     get_opportunity_service,
 )
@@ -25,6 +26,8 @@ from app.models import (
     FixedIncomeValuationRequest,
     FixedIncomeValuationResponse,
     HealthResponse,
+    HistoricalQuoteRequest,
+    HistoricalQuoteResponse,
     InstrumentDataResponse,
     InstrumentMetadata,
     InstrumentType,
@@ -33,6 +36,7 @@ from app.models import (
 from app.services import (
     AssetService,
     FixedIncomeValuationService,
+    HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
 )
@@ -46,6 +50,7 @@ FixedIncomeServiceDep = Annotated[
     FixedIncomeValuationService,
     Depends(get_fixed_income_valuation_service),
 ]
+HistoricalQuoteServiceDep = Annotated[HistoricalQuoteService, Depends(get_historical_quote_service)]
 ForceRefreshQuery = Annotated[bool, Query()]
 AsOfQuery = Annotated[date | None, Query()]
 DividendPeriodQuery = Annotated[DividendPeriod, Query()]
@@ -64,6 +69,18 @@ async def resolve_fixed_income_valuations(
     payload: FixedIncomeValuationRequest,
     service: FixedIncomeServiceDep,
 ) -> FixedIncomeValuationResponse:
+    return await service.resolve(payload)
+
+
+@router.post(
+    "/v1/equities/historical-quotes/resolve",
+    response_model=HistoricalQuoteResponse,
+    tags=["equities"],
+)
+async def resolve_historical_quotes(
+    payload: HistoricalQuoteRequest,
+    service: HistoricalQuoteServiceDep,
+) -> HistoricalQuoteResponse:
     return await service.resolve(payload)
 
 
