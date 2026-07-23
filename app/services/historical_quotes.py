@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from bisect import bisect_right
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -43,26 +45,41 @@ class HistoricalQuoteService:
         years: set[int],
     ) -> dict[str, dict[date, Decimal]]:
         result: dict[str, dict[date, Decimal]] = {ticker: {} for ticker in tickers}
-        for year in sorted(years):
-            cached, missing = await self._cached_year(tickers, year)
-            for ticker, values in cached.items():
+        concurrency = max(1, self.settings.upstream_concurrency)
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def load(year: int) -> dict[str, dict[date, Decimal]]:
+            async with semaphore:
+                return await self._year_series(tickers, year)
+
+        loaded_years = await asyncio.gather(*(load(year) for year in sorted(years)))
+        for loaded in loaded_years:
+            for ticker, values in loaded.items():
                 result[ticker].update(values)
-            if not missing:
-                continue
-            try:
-                loaded = await self.provider.prices(year, set(missing))
-            except (httpx.HTTPError, ValueError):
-                loaded = {}
-            for ticker in missing:
-                values = loaded.get(ticker, {})
-                await self.cache.set(
-                    _cache_key(year, ticker),
-                    {day.isoformat(): str(price) for day, price in values.items()},
-                    self.settings.equity_history_ttl_seconds
-                    if values
-                    else self.settings.market_data_ttl_seconds,
-                )
-                result[ticker].update(values)
+        return result
+
+    async def _year_series(
+        self,
+        tickers: list[str],
+        year: int,
+    ) -> dict[str, dict[date, Decimal]]:
+        result, missing = await self._cached_year(tickers, year)
+        if not missing:
+            return result
+        try:
+            loaded = await self.provider.prices(year, set(missing))
+        except (httpx.HTTPError, ValueError):
+            loaded = {}
+        for ticker in missing:
+            values = loaded.get(ticker, {})
+            await self.cache.set(
+                _cache_key(year, ticker),
+                {day.isoformat(): str(price) for day, price in values.items()},
+                self.settings.equity_history_ttl_seconds
+                if values
+                else self.settings.market_data_ttl_seconds,
+            )
+            result[ticker] = values
         return result
 
     async def _cached_year(
@@ -88,11 +105,12 @@ class HistoricalQuoteService:
     ) -> list[HistoricalQuote]:
         values: list[HistoricalQuote] = []
         ordered = sorted(series.items())
+        ordered_dates = [reference for reference, _price in ordered]
         for target in targets:
-            candidates = [item for item in ordered if item[0] <= target]
-            if not candidates:
+            index = bisect_right(ordered_dates, target) - 1
+            if index < 0:
                 continue
-            reference, price = candidates[-1]
+            reference, price = ordered[index]
             values.append(
                 HistoricalQuote(
                     ticker=ticker,
