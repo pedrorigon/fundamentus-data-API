@@ -152,8 +152,7 @@ def test_request_rejects_unsafe_ticker() -> None:
 
 def test_request_supports_a_complete_multi_year_daily_history() -> None:
     dates = [
-        date(2020, 1, 1) + timedelta(days=index)
-        for index in range(MAX_HISTORICAL_QUOTE_DATES)
+        date(2020, 1, 1) + timedelta(days=index) for index in range(MAX_HISTORICAL_QUOTE_DATES)
     ]
 
     assert len(HistoricalQuoteRequest(tickers=["BBAS3"], dates=dates).dates) == len(dates)
