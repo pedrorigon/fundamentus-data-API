@@ -93,9 +93,7 @@ class _Provider:
 
 @pytest.mark.asyncio
 async def test_service_uses_previous_trading_day_and_caches_annual_series() -> None:
-    provider = _Provider(
-        {2020: {"AZUL4": {date(2020, 5, 29): Decimal("12.34")}}}
-    )
+    provider = _Provider({2020: {"AZUL4": {date(2020, 5, 29): Decimal("12.34")}}})
     service = HistoricalQuoteService(Settings(), _cache(), provider=provider)  # type: ignore[arg-type]
     request = HistoricalQuoteRequest(tickers=["azul4", "MISSING3"], dates=[date(2020, 5, 31)])
 
