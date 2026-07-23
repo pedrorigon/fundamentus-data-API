@@ -1,4 +1,5 @@
-from datetime import date
+import asyncio
+from datetime import date, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -13,7 +14,10 @@ from app.api.dependencies import get_historical_quote_service
 from app.cache import CacheStore
 from app.config import Settings
 from app.main import create_app, lifespan
-from app.models.historical_quotes import HistoricalQuoteRequest
+from app.models.historical_quotes import (
+    MAX_HISTORICAL_QUOTE_DATES,
+    HistoricalQuoteRequest,
+)
 from app.scrapers.b3_historical_quotes import (
     B3HistoricalQuoteProvider,
     parse_b3_historical_quotes,
@@ -91,6 +95,21 @@ class _Provider:
         return {ticker: self.data.get(year, {}).get(ticker, {}) for ticker in tickers}
 
 
+class _ConcurrentProvider(_Provider):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.active = 0
+        self.max_active = 0
+
+    async def prices(self, year: int, tickers: set[str]) -> dict[str, dict[date, Decimal]]:
+        self.calls.append((year, tickers))
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0)
+        self.active -= 1
+        return {}
+
+
 @pytest.mark.asyncio
 async def test_service_uses_previous_trading_day_and_caches_annual_series() -> None:
     provider = _Provider({2020: {"AZUL4": {date(2020, 5, 29): Decimal("12.34")}}})
@@ -109,9 +128,40 @@ async def test_service_uses_previous_trading_day_and_caches_annual_series() -> N
     assert provider.calls == [(2019, {"AZUL4", "MISSING3"}), (2020, {"AZUL4", "MISSING3"})]
 
 
+@pytest.mark.asyncio
+async def test_service_loads_missing_annual_archives_concurrently() -> None:
+    provider = _ConcurrentProvider()
+    settings = Settings(upstream_concurrency=2)
+    service = HistoricalQuoteService(settings, _cache(), provider=provider)  # type: ignore[arg-type]
+
+    await service.resolve(
+        HistoricalQuoteRequest(
+            tickers=["BBAS3"],
+            dates=[date(2020, 1, 1), date(2021, 1, 1)],
+        )
+    )
+
+    assert provider.max_active == 2
+    assert {year for year, _tickers in provider.calls} == {2019, 2020, 2021}
+
+
 def test_request_rejects_unsafe_ticker() -> None:
     with pytest.raises(ValidationError):
         HistoricalQuoteRequest(tickers=["../../secret"], dates=[date(2020, 5, 29)])
+
+
+def test_request_supports_a_complete_multi_year_daily_history() -> None:
+    dates = [
+        date(2020, 1, 1) + timedelta(days=index)
+        for index in range(MAX_HISTORICAL_QUOTE_DATES)
+    ]
+
+    assert len(HistoricalQuoteRequest(tickers=["BBAS3"], dates=dates).dates) == len(dates)
+    with pytest.raises(ValidationError):
+        HistoricalQuoteRequest(
+            tickers=["BBAS3"],
+            dates=[*dates, date(2030, 1, 1)],
+        )
 
 
 @pytest.mark.asyncio

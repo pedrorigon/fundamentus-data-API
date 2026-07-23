@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field, field_validator
 
+MAX_HISTORICAL_QUOTE_DATES = 2500
+
 
 class HistoricalQuote(BaseModel):
     ticker: str
@@ -15,7 +17,7 @@ class HistoricalQuote(BaseModel):
 
 class HistoricalQuoteRequest(BaseModel):
     tickers: list[str] = Field(min_length=1, max_length=50)
-    dates: list[date] = Field(min_length=1, max_length=100)
+    dates: list[date] = Field(min_length=1, max_length=MAX_HISTORICAL_QUOTE_DATES)
 
     @field_validator("tickers")
     @classmethod
