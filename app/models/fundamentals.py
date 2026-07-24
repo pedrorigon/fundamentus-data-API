@@ -26,6 +26,7 @@ class FinancialPeriod(BaseModel):
     """Derived financial figures for one reported period."""
 
     period_end: date
+    published_at: date | None = None
     consolidated: bool
     annual: bool
     revenue: Decimal | None = None

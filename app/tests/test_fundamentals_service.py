@@ -440,7 +440,7 @@ async def test_periods_carry_the_share_count_of_their_own_year(tmp_path: Path) -
     assert by_year[2024] == Decimal("900")
 
 
-async def test_periods_fall_back_to_the_latest_share_count(tmp_path: Path) -> None:
+async def test_periods_do_not_invent_a_historical_share_count(tmp_path: Path) -> None:
     provider = StubProvider(
         {("dfp", 2024): archive(2024, [period(date(2020, 12, 31))], shares="900")}
     )
@@ -451,5 +451,4 @@ async def test_periods_fall_back_to_the_latest_share_count(tmp_path: Path) -> No
 
     snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
 
-    # No count was reported for 2020, so the most recent one is used.
-    assert snapshot.periods[0].shares_outstanding == Decimal("900")
+    assert snapshot.periods[0].shares_outstanding is None

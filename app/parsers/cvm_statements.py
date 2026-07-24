@@ -58,6 +58,7 @@ class StatementPeriod:
     consolidated: bool
     accounts: dict[str, Decimal] = field(default_factory=dict)
     depreciation: Decimal | None = None
+    published_at: date | None = None
 
     def account(self, code: str) -> Decimal | None:
         return self.accounts.get(code)
@@ -215,6 +216,7 @@ def _add_account(
             period_start=_iso_date(row.get("DT_INI_EXERC")),
             period_end=period_end,
             consolidated=consolidated,
+            published_at=_iso_date(row.get("DT_RECEB")),
         )
         accumulators[key] = accumulator
     accumulator.add(code, value * scale, row.get("DS_CONTA"))
@@ -287,6 +289,7 @@ class _PeriodAccumulator:
     consolidated: bool
     accounts: dict[str, Decimal] = field(default_factory=dict)
     depreciation: Decimal | None = None
+    published_at: date | None = None
 
     def add(self, code: str, value: Decimal, label: str | None) -> None:
         self.accounts.setdefault(code, value)
@@ -304,6 +307,7 @@ class _PeriodAccumulator:
             consolidated=self.consolidated,
             accounts=dict(self.accounts),
             depreciation=self.depreciation,
+            published_at=self.published_at,
         )
 
 

@@ -31,7 +31,7 @@ SOURCE_CVM = "cvm"
 STATUS_VALID = "valid"
 STATUS_MISSING = "missing_data"
 
-_CACHE_PREFIX = "fundamentals"
+_CACHE_PREFIX = "fundamentals:v2"
 _MINIMUM_PEERS = 3
 
 
@@ -85,7 +85,7 @@ class FundamentalsService:
                 statement,
                 # Each period carries the count reported for its own year, so a
                 # change in shares outstanding stays visible across the series.
-                shares_outstanding=shares_by_year.get(statement.period_end.year, shares),
+                shares_outstanding=shares_by_year.get(statement.period_end.year),
             )
             for statement in statements
         )
@@ -318,6 +318,7 @@ def _encode_periods(
                 "reference_date": item.reference_date.isoformat(),
                 "period_start": item.period_start.isoformat() if item.period_start else None,
                 "period_end": item.period_end.isoformat(),
+                "published_at": item.published_at.isoformat() if item.published_at else None,
                 "consolidated": item.consolidated,
                 "accounts": {code: str(value) for code, value in item.accounts.items()},
                 "depreciation": str(item.depreciation) if item.depreciation is not None else None,
@@ -351,6 +352,11 @@ def _decode_periods(payload: object) -> dict[str, list[StatementPeriod]] | None:
                 },
                 depreciation=(
                     Decimal(str(item["depreciation"])) if item["depreciation"] is not None else None
+                ),
+                published_at=(
+                    date.fromisoformat(str(item["published_at"]))
+                    if item.get("published_at")
+                    else None
                 ),
             )
             for item in values

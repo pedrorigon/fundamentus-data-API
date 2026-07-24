@@ -5,7 +5,9 @@ Kept free of I/O so the accounting rules stay independently testable.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
+from typing import cast
 
 from app.models.fundamentals import FinancialPeriod
 from app.parsers.cvm_statements import (
@@ -23,7 +25,6 @@ from app.parsers.cvm_statements import (
     StatementPeriod,
 )
 
-_QUARTERS_PER_YEAR = 4
 _ANNUAL_MINIMUM_DAYS = 300
 
 
@@ -42,6 +43,7 @@ def build_period(
 
     return FinancialPeriod(
         period_end=statement.period_end,
+        published_at=statement.published_at,
         consolidated=statement.consolidated,
         annual=_is_annual(statement),
         revenue=statement.account(ACCOUNT_REVENUE),
@@ -64,9 +66,10 @@ def build_period(
 def trailing_twelve_months(periods: list[FinancialPeriod]) -> FinancialPeriod | None:
     """Aggregate flow accounts over the last twelve months.
 
-    Annual periods already cover twelve months. Quarterly periods are summed over
-    the four most recent quarters, and stock accounts are taken from the latest
-    period rather than summed.
+    CVM interim statements report year-to-date flows, not isolated quarters.
+    The trailing value is therefore the latest year-to-date amount plus the
+    previous annual amount minus the comparable prior-year interim amount.
+    Stock accounts are taken from the latest period.
     """
     if not periods:
         return None
@@ -75,27 +78,57 @@ def trailing_twelve_months(periods: list[FinancialPeriod]) -> FinancialPeriod | 
     if latest.annual:
         return latest
 
-    quarters = [period for period in ordered if not period.annual][:_QUARTERS_PER_YEAR]
-    if len(quarters) < _QUARTERS_PER_YEAR:
+    previous_annual = next(
+        (period for period in ordered if period.annual and period.period_end < latest.period_end),
+        None,
+    )
+    comparable = next(
+        (
+            period
+            for period in ordered
+            if not period.annual
+            and period.period_end.year == latest.period_end.year - 1
+            and (period.period_end.month, period.period_end.day)
+            == (latest.period_end.month, latest.period_end.day)
+        ),
+        None,
+    )
+    if previous_annual is None or comparable is None:
         return None
 
     return FinancialPeriod(
         period_end=latest.period_end,
+        published_at=_latest_publication(latest, previous_annual, comparable),
         consolidated=latest.consolidated,
         annual=True,
-        revenue=_sum_series(quarters, "revenue"),
-        ebit=_sum_series(quarters, "ebit"),
-        ebitda=_sum_series(quarters, "ebitda"),
-        net_income=_sum_series(quarters, "net_income"),
+        revenue=_trailing_value(latest, previous_annual, comparable, "revenue"),
+        ebit=_trailing_value(latest, previous_annual, comparable, "ebit"),
+        ebitda=_trailing_value(latest, previous_annual, comparable, "ebitda"),
+        net_income=_trailing_value(latest, previous_annual, comparable, "net_income"),
         equity=latest.equity,
         total_assets=latest.total_assets,
         cash_and_equivalents=latest.cash_and_equivalents,
         gross_debt=latest.gross_debt,
         net_debt=latest.net_debt,
-        operating_cash_flow=_sum_series(quarters, "operating_cash_flow"),
-        capex=_sum_series(quarters, "capex"),
-        free_cash_flow=_sum_series(quarters, "free_cash_flow"),
-        depreciation=_sum_series(quarters, "depreciation"),
+        operating_cash_flow=_trailing_value(
+            latest,
+            previous_annual,
+            comparable,
+            "operating_cash_flow",
+        ),
+        capex=_trailing_value(latest, previous_annual, comparable, "capex"),
+        free_cash_flow=_trailing_value(
+            latest,
+            previous_annual,
+            comparable,
+            "free_cash_flow",
+        ),
+        depreciation=_trailing_value(
+            latest,
+            previous_annual,
+            comparable,
+            "depreciation",
+        ),
         shares_outstanding=latest.shares_outstanding,
         source=latest.source,
     )
@@ -176,9 +209,28 @@ def _sum_optional(first: Decimal | None, second: Decimal | None) -> Decimal | No
     return (first or Decimal("0")) + (second or Decimal("0"))
 
 
-def _sum_series(periods: list[FinancialPeriod], attribute: str) -> Decimal | None:
-    values = [getattr(period, attribute) for period in periods]
-    available = [value for value in values if value is not None]
-    if len(available) != len(values):
+def _trailing_value(
+    latest: FinancialPeriod,
+    previous_annual: FinancialPeriod,
+    comparable: FinancialPeriod,
+    attribute: str,
+) -> Decimal | None:
+    values = (
+        getattr(latest, attribute),
+        getattr(previous_annual, attribute),
+        getattr(comparable, attribute),
+    )
+    if any(value is None for value in values):
         return None
-    return sum(available, Decimal("0"))
+    latest_value, annual_value, comparable_value = values
+    assert latest_value is not None
+    assert annual_value is not None
+    assert comparable_value is not None
+    return cast(Decimal, latest_value + annual_value - comparable_value)
+
+
+def _latest_publication(*periods: FinancialPeriod) -> date | None:
+    dates = [period.published_at for period in periods]
+    if any(value is None for value in dates):
+        return None
+    return max(value for value in dates if value is not None)

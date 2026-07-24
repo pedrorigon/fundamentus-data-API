@@ -20,7 +20,7 @@ from app.parsers.cvm_statements import (
 )
 
 STATEMENT_HEADER = (
-    "CNPJ_CIA;DT_REFER;VERSAO;DENOM_CIA;CD_CVM;GRUPO_DFP;MOEDA;ESCALA_MOEDA;"
+    "CNPJ_CIA;DT_REFER;DT_RECEB;VERSAO;DENOM_CIA;CD_CVM;GRUPO_DFP;MOEDA;ESCALA_MOEDA;"
     "ORDEM_EXERC;DT_INI_EXERC;DT_FIM_EXERC;CD_CONTA;DS_CONTA;VL_CONTA;ST_CONTA_FIXA"
 )
 CNPJ = "11.111.111/0001-11"
@@ -38,9 +38,10 @@ def statement_row(
     end: str = "2024-12-31",
     cnpj: str = CNPJ,
     name: str = "EMPRESA TESTE S.A.",
+    received: str = "2025-03-26",
 ) -> str:
     return (
-        f"{cnpj};2024-12-31;1;{name};001;DF Consolidado;REAL;{scale};"
+        f"{cnpj};2024-12-31;{received};1;{name};001;DF Consolidado;REAL;{scale};"
         f"{order};{start};{end};{code};{label};{value};S"
     )
 
@@ -77,6 +78,7 @@ def test_parses_accounts_and_applies_thousand_scale() -> None:
     assert period.account(ACCOUNT_REVENUE) == Decimal("1000000")
     assert period.account(ACCOUNT_EBIT) == Decimal("250000")
     assert period.period_end == date(2024, 12, 31)
+    assert period.published_at == date(2025, 3, 26)
     assert period.consolidated is True
 
 
