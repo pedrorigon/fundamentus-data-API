@@ -38,7 +38,6 @@ _NOISE_TOKENS = frozenset(
         "HOLDING",
         "HOLDINGS",
         "GRUPO",
-        "BRASIL",
         "BRASILEIRA",
         "BRASILEIRO",
         "NACIONAL",

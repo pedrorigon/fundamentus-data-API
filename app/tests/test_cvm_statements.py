@@ -82,6 +82,40 @@ def test_parses_accounts_and_applies_thousand_scale() -> None:
     assert period.consolidated is True
 
 
+def test_joins_publication_date_from_document_metadata() -> None:
+    metadata_header = "CNPJ_CIA;DT_REFER;VERSAO;DENOM_CIA;CD_CVM;DT_RECEB"
+    payload = build_archive(
+        [statement_row(ACCOUNT_REVENUE, "1000", received="")],
+        extra={
+            "dfp_cia_aberta_2024.csv": [
+                metadata_header,
+                f"{CNPJ};2024-12-31;1;EMPRESA TESTE S.A.;001;2025-03-28",
+            ]
+        },
+    )
+
+    period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
+
+    assert period.published_at == date(2025, 3, 28)
+
+
+def test_period_start_is_completed_by_flow_statement_rows() -> None:
+    payload = build_archive(
+        [statement_row(ACCOUNT_EQUITY, "900", start="", end="2024-03-31")],
+        filename="itr_cia_aberta_BPA_con_2024.csv",
+        extra={
+            "itr_cia_aberta_DRE_con_2024.csv": [
+                STATEMENT_HEADER,
+                statement_row(ACCOUNT_REVENUE, "250", start="2024-01-01", end="2024-03-31"),
+            ]
+        },
+    )
+
+    period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
+
+    assert period.period_start == date(2024, 1, 1)
+
+
 def test_unit_scale_is_not_multiplied() -> None:
     payload = build_archive([statement_row(ACCOUNT_REVENUE, "1500.00", scale="UNIDADE")])
 
@@ -210,6 +244,27 @@ def test_parses_share_capital_and_excludes_treasury_shares() -> None:
 
     assert shares[CNPJ_DIGITS].total_shares == Decimal("1000")
     assert shares[CNPJ_DIGITS].outstanding_shares == Decimal("900")
+
+
+def test_share_capital_uses_reported_total_when_classes_are_absent() -> None:
+    header = (
+        "CNPJ_CIA;DT_REFER;VERSAO;DENOM_CIA;QT_ACAO_ORDIN_CAP_INTEGR;"
+        "QT_ACAO_PREF_CAP_INTEGR;QT_ACAO_TOTAL_CAP_INTEGR;QT_ACAO_TOTAL_TESOURO"
+    )
+    payload = build_archive(
+        [],
+        extra={
+            "dfp_cia_aberta_composicao_capital_2019.csv": [
+                header,
+                f"{CNPJ};2019-12-31;1;EMPRESA TESTE S.A.;;;1250;50",
+            ]
+        },
+    )
+
+    shares = parse_share_capital(payload)[CNPJ_DIGITS]
+
+    assert shares.total_shares == Decimal("1250")
+    assert shares.outstanding_shares == Decimal("1200")
 
 
 def test_share_capital_keeps_most_recent_reference() -> None:
