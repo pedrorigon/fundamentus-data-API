@@ -29,6 +29,7 @@ class Settings(BaseSettings):
         "https://www.anbima.com.br/informacoes/merc-sec-debentures/arqs"
     )
     status_invest_base_url: str = "https://statusinvest.com.br"
+    cvm_open_data_base_url: str = "https://dados.cvm.gov.br"
     brapi_base_url: str = "https://brapi.dev"
     brapi_token: SecretStr | None = None
     alpha_vantage_base_url: str = "https://www.alphavantage.co"
@@ -39,6 +40,9 @@ class Settings(BaseSettings):
         "(contact: local-development; purpose: personal local API)"
     )
     request_timeout_seconds: float = 10.0
+    # CVM archives are tens of megabytes, so they need a longer budget than
+    # the HTML scrapers.
+    cvm_request_timeout_seconds: float = 120.0
     max_connections: int = 8
     max_keepalive_connections: int = 4
     upstream_concurrency: int = 4
@@ -58,6 +62,11 @@ class Settings(BaseSettings):
     fixed_income_current_ttl_seconds: int = 3600
     fixed_income_history_ttl_seconds: int = 2592000
     equity_history_ttl_seconds: int = 315360000
+    # Statements only change when a new filing is published.
+    fundamentals_statements_ttl_seconds: int = 86400
+    company_registry_ttl_seconds: int = 604800
+    peer_group_ttl_seconds: int = 86400
+    fundamentals_history_years: int = 10
 
     sqlite_cache_enabled: bool = True
     sqlite_cache_path: Path = Field(default=Path(".cache/fundamentus_cache.sqlite3"))

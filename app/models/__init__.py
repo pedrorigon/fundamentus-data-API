@@ -27,6 +27,13 @@ from app.models.fixed_income import (
     FixedIncomeValuationResponse,
     ValuationMethod,
 )
+from app.models.fundamentals import (
+    FieldProvenance,
+    FinancialPeriod,
+    FundamentalsResponse,
+    FundamentalsSnapshot,
+    PeerGroup,
+)
 from app.models.historical_quotes import (
     HistoricalQuote,
     HistoricalQuoteRequest,
@@ -55,6 +62,11 @@ __all__ = [
     "OpportunityMetric",
     "OpportunityMetrics",
     "OpportunityResponse",
+    "FieldProvenance",
+    "FinancialPeriod",
+    "FundamentalsResponse",
+    "FundamentalsSnapshot",
+    "PeerGroup",
     "FixedIncomeValuation",
     "FixedIncomeValuationRequest",
     "FixedIncomeValuationResponse",
