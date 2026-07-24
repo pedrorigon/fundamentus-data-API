@@ -32,6 +32,7 @@ def statement(
     start: date | None = date(2024, 1, 1),
     end: date = date(2024, 12, 31),
     depreciation: Decimal | None = None,
+    published_at: date | None = date(2025, 3, 26),
 ) -> StatementPeriod:
     return StatementPeriod(
         cnpj="11111111000111",
@@ -43,6 +44,7 @@ def statement(
         consolidated=True,
         accounts=accounts,
         depreciation=depreciation,
+        published_at=published_at,
     )
 
 
@@ -124,9 +126,10 @@ def test_missing_start_date_is_treated_as_annual() -> None:
     assert build_period(statement({}, start=None)).annual is True
 
 
-def quarter(end: date, revenue: str, equity: str = "1000") -> FinancialPeriod:
+def interim(end: date, revenue: str, equity: str = "1000") -> FinancialPeriod:
     return FinancialPeriod(
         period_end=end,
+        published_at=end,
         consolidated=True,
         annual=False,
         revenue=Decimal(revenue),
@@ -135,25 +138,32 @@ def quarter(end: date, revenue: str, equity: str = "1000") -> FinancialPeriod:
     )
 
 
-def test_trailing_twelve_months_sums_four_quarters() -> None:
+def test_trailing_twelve_months_adjusts_cumulative_interim_flows() -> None:
     periods = [
-        quarter(date(2024, 3, 31), "100"),
-        quarter(date(2024, 6, 30), "110"),
-        quarter(date(2024, 9, 30), "120"),
-        quarter(date(2024, 12, 31), "130", equity="1500"),
+        interim(date(2023, 9, 30), "900"),
+        FinancialPeriod(
+            period_end=date(2023, 12, 31),
+            published_at=date(2024, 3, 20),
+            consolidated=True,
+            annual=True,
+            revenue=Decimal("1300"),
+            net_income=Decimal("130"),
+        ),
+        interim(date(2024, 9, 30), "1200", equity="1500"),
     ]
 
     ttm = trailing_twelve_months(periods)
 
     assert ttm is not None
-    assert ttm.revenue == Decimal("460")
+    assert ttm.revenue == Decimal("1600")
+    assert ttm.net_income == Decimal("160")
     # Stock accounts come from the latest period rather than being summed.
     assert ttm.equity == Decimal("1500")
     assert ttm.annual is True
 
 
-def test_trailing_twelve_months_needs_four_quarters() -> None:
-    periods = [quarter(date(2024, 3, 31), "100"), quarter(date(2024, 6, 30), "110")]
+def test_trailing_twelve_months_needs_prior_annual_and_comparable_interim() -> None:
+    periods = [interim(date(2024, 3, 31), "100"), interim(date(2024, 6, 30), "110")]
 
     assert trailing_twelve_months(periods) is None
 
@@ -175,10 +185,18 @@ def test_trailing_twelve_months_returns_none_without_periods() -> None:
 
 def test_partial_quarter_data_does_not_produce_partial_sum() -> None:
     periods = [
-        quarter(date(2024, 3, 31), "100"),
-        quarter(date(2024, 6, 30), "110"),
-        quarter(date(2024, 9, 30), "120"),
-        FinancialPeriod(period_end=date(2024, 12, 31), consolidated=True, annual=False),
+        interim(date(2023, 9, 30), "900"),
+        FinancialPeriod(
+            period_end=date(2023, 12, 31),
+            consolidated=True,
+            annual=True,
+            revenue=Decimal("1300"),
+        ),
+        FinancialPeriod(
+            period_end=date(2024, 9, 30),
+            consolidated=True,
+            annual=False,
+        ),
     ]
 
     ttm = trailing_twelve_months(periods)
