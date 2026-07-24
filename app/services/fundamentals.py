@@ -45,6 +45,10 @@ class FundamentalsService:
         self.settings = settings
         self.cache = cache
         self.provider = provider or CvmOpenDataProvider(settings)
+        self._decoded_archives: dict[
+            tuple[StatementKind, int],
+            dict[str, list[StatementPeriod]] | None,
+        ] = {}
 
     async def snapshot(
         self,
@@ -158,25 +162,39 @@ class FundamentalsService:
     async def _archive(
         self, kind: StatementKind, year: int
     ) -> dict[str, list[StatementPeriod]] | None:
+        archive_key = (kind, year)
+        if archive_key in self._decoded_archives:
+            return self._decoded_archives[archive_key]
+
         key = f"{_CACHE_PREFIX}:archive:{kind.value}:{year}"
-        cached, hit = await self.cache.get(key)
+        cached, hit = await self.cache.get(key, memory=False)
         if hit:
-            return _decode_periods(cached)
+            decoded = _decode_periods(cached)
+            self._decoded_archives[archive_key] = decoded
+            return decoded
 
         archive = await self.provider.statements(kind, year)
         if archive is None:
-            await self.cache.set(key, {}, self.settings.market_data_ttl_seconds)
+            await self.cache.set(
+                key,
+                {},
+                self.settings.market_data_ttl_seconds,
+                memory=False,
+            )
+            self._decoded_archives[archive_key] = None
             return None
         await self.cache.set(
             key,
             _encode_periods(archive.periods),
             self.settings.fundamentals_statements_ttl_seconds,
+            memory=False,
         )
         await self.cache.set(
             f"{_CACHE_PREFIX}:shares:{year}",
             {cnpj: str(value.outstanding_shares) for cnpj, value in archive.share_capital.items()},
             self.settings.fundamentals_statements_ttl_seconds,
         )
+        self._decoded_archives[archive_key] = archive.periods
         return archive.periods
 
     async def _shares_by_year(self, cnpj: str, reference: date) -> dict[int, Decimal]:

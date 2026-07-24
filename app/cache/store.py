@@ -49,14 +49,15 @@ class CacheStore:
             await self._db.close()
             self._db = None
 
-    async def get(self, key: str) -> tuple[Any | None, bool]:
+    async def get(self, key: str, *, memory: bool = True) -> tuple[Any | None, bool]:
         now = time.time()
-        async with self._lock:
-            entry = self._memory.get(key)
-            if entry and entry[0] > now:
-                return entry[1], True
-            if entry:
-                self._memory.pop(key, None)
+        if memory:
+            async with self._lock:
+                entry = self._memory.get(key)
+                if entry and entry[0] > now:
+                    return entry[1], True
+                if entry:
+                    self._memory.pop(key, None)
 
         if self._db is None:
             return None, False
@@ -75,19 +76,28 @@ class CacheStore:
             return None, False
 
         value = orjson.loads(payload)
-        async with self._lock:
-            self._memory[key] = (float(expires_at), value)
+        if memory:
+            async with self._lock:
+                self._memory[key] = (float(expires_at), value)
         return value, True
 
-    async def set(self, key: str, value: Any, ttl_seconds: int) -> None:
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        ttl_seconds: int,
+        *,
+        memory: bool = True,
+    ) -> None:
         expires_at = time.time() + ttl_seconds
-        payload = _to_jsonable(value)
-        async with self._lock:
-            self._memory[key] = (expires_at, value)
+        if memory:
+            async with self._lock:
+                self._memory[key] = (expires_at, value)
 
         if self._db is None:
             return
 
+        payload = _to_jsonable(value)
         await self._db.execute(
             """
             INSERT INTO cache_entries (cache_key, expires_at, payload)
