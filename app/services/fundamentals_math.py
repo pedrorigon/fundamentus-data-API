@@ -5,6 +5,7 @@ Kept free of I/O so the accounting rules stay independently testable.
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import date
 from decimal import Decimal
 from typing import cast
@@ -26,21 +27,51 @@ from app.parsers.cvm_statements import (
 )
 
 _ANNUAL_MINIMUM_DAYS = 300
+_FINANCIAL_SECTOR_TOKENS = (
+    "BANCO",
+    "INTERMEDIAR",
+    "FINANCEIR",
+    "SEGUR",
+    "PREVIDEN",
+)
+_EQUITY_LABELS = (
+    "Patrimônio Líquido Consolidado",
+    "Patrimônio Líquido",
+)
+_NONCONTROLLING_EQUITY_LABELS = (
+    "Participação dos Acionistas Não Controladores",
+    "Participação dos Sócios Não Controladores",
+)
+_NET_INCOME_LABELS = (
+    "Atribuído a Sócios da Empresa Controladora",
+    "Atribuído aos Sócios da Empresa Controladora",
+    "Lucro ou Prejuízo Líquido Consolidado do Período",
+    "Lucro/Prejuízo Consolidado do Período",
+    "Lucro ou Prejuízo Líquido do Período",
+    "Lucro/Prejuízo do Período",
+)
+_BASIC_EARNINGS_PER_SHARE_CODES = ("3.99.01.01", "3.99.01.02")
 
 
 def build_period(
     statement: StatementPeriod,
     *,
     shares_outstanding: Decimal | None = None,
+    sector: str | None = None,
 ) -> FinancialPeriod:
     """Convert a raw statement period into derived financial figures."""
-    ebit = statement.account(ACCOUNT_EBIT)
-    depreciation = statement.depreciation
-    operating_cash_flow = statement.account(ACCOUNT_OPERATING_CASH_FLOW)
-    capex = _capex(statement)
-    cash = _cash_position(statement)
-    gross_debt = _gross_debt(statement)
+    financial_institution = is_financial_sector(sector)
+    ebit = None if financial_institution else statement.account(ACCOUNT_EBIT)
+    depreciation = None if financial_institution else statement.depreciation
+    operating_cash_flow = (
+        None if financial_institution else statement.account(ACCOUNT_OPERATING_CASH_FLOW)
+    )
+    capex = None if financial_institution else _capex(statement)
+    cash = None if financial_institution else _cash_position(statement)
+    gross_debt = None if financial_institution else _gross_debt(statement)
 
+    net_income = _semantic_account(statement, ACCOUNT_NET_INCOME, _NET_INCOME_LABELS)
+    resolved_shares = shares_outstanding or _shares_from_earnings(statement, net_income)
     return FinancialPeriod(
         period_end=statement.period_end,
         published_at=statement.published_at,
@@ -49,8 +80,8 @@ def build_period(
         revenue=statement.account(ACCOUNT_REVENUE),
         ebit=ebit,
         ebitda=_sum_optional(ebit, depreciation),
-        net_income=statement.account(ACCOUNT_NET_INCOME),
-        equity=statement.account(ACCOUNT_EQUITY),
+        net_income=net_income,
+        equity=_shareholder_equity(statement),
         total_assets=statement.account(ACCOUNT_TOTAL_ASSETS),
         cash_and_equivalents=cash,
         gross_debt=gross_debt,
@@ -59,8 +90,56 @@ def build_period(
         capex=capex,
         free_cash_flow=_free_cash_flow(operating_cash_flow, capex),
         depreciation=depreciation,
-        shares_outstanding=shares_outstanding,
+        shares_outstanding=resolved_shares,
     )
+
+
+def is_financial_sector(sector: str | None) -> bool:
+    """Whether industrial cash-flow and enterprise-value models are unsuitable."""
+    if not sector:
+        return False
+    normalized = unicodedata.normalize("NFKD", sector)
+    folded = normalized.encode("ascii", "ignore").decode("ascii").upper()
+    return any(token in folded for token in _FINANCIAL_SECTOR_TOKENS)
+
+
+def _semantic_account(
+    statement: StatementPeriod,
+    standard_code: str,
+    labels: tuple[str, ...],
+) -> Decimal | None:
+    """Prefer semantic labels because CVM account codes vary by issuer chart."""
+    by_label = statement.account_by_label(*labels)
+    return by_label if by_label is not None else statement.account(standard_code)
+
+
+def _shareholder_equity(statement: StatementPeriod) -> Decimal | None:
+    equity = _semantic_account(statement, ACCOUNT_EQUITY, _EQUITY_LABELS)
+    noncontrolling = statement.account_by_label(*_NONCONTROLLING_EQUITY_LABELS)
+    if equity is None or noncontrolling is None:
+        return equity
+    attributable = equity - noncontrolling
+    return attributable if attributable > 0 else equity
+
+
+def _shares_from_earnings(
+    statement: StatementPeriod,
+    net_income: Decimal | None,
+) -> Decimal | None:
+    """Derive period shares from the filing's own basic earnings per share."""
+    if net_income is None or net_income <= 0:
+        return None
+    earnings_per_share = next(
+        (
+            value
+            for code in _BASIC_EARNINGS_PER_SHARE_CODES
+            if (value := statement.account(code)) is not None and value > 0
+        ),
+        None,
+    )
+    if earnings_per_share is None:
+        return None
+    return net_income / earnings_per_share
 
 
 def trailing_twelve_months(periods: list[FinancialPeriod]) -> FinancialPeriod | None:

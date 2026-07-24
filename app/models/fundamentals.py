@@ -57,6 +57,9 @@ class FundamentalsSnapshot(BaseModel):
     periods: list[FinancialPeriod] = Field(default_factory=list)
     trailing_twelve_months: FinancialPeriod | None = None
     shares_outstanding: Decimal | None = None
+    earnings_per_share: Decimal | None = None
+    book_value_per_share: Decimal | None = None
+    recurring_dividends_per_share: Decimal | None = None
     provenance: list[FieldProvenance] = Field(default_factory=list)
     unavailable_reason: str | None = None
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -136,6 +138,52 @@ async def test_resolves_snapshot_from_primary_source(tmp_path: Path) -> None:
     assert snapshot.unavailable_reason is None
     assert ("itr", 2024) in provider.statement_calls
     assert ("itr", 2023) in provider.statement_calls
+
+
+async def test_reconciles_cvm_share_units_with_market_reference(tmp_path: Path) -> None:
+    provider = StubProvider(
+        {("dfp", 2024): archive(2024, [period(date(2024, 12, 31))], shares="11021")}
+    )
+    service = await build(tmp_path, provider)
+
+    snapshot = await service.snapshot(
+        "TEST4",
+        COMPANY,
+        reference=date(2024, 12, 31),
+        reference_shares=Decimal("11026000"),
+    )
+
+    assert snapshot.shares_outstanding == Decimal("11026000")
+    assert snapshot.periods[0].shares_outstanding == Decimal("11021000")
+    shares_provenance = next(
+        item for item in snapshot.provenance if item.field_name == "shares_outstanding"
+    )
+    assert shares_provenance.selected_source == "fundamentus"
+
+
+async def test_reconciles_share_units_from_independent_per_share_values(
+    tmp_path: Path,
+) -> None:
+    provider = StubProvider(
+        {("dfp", 2024): archive(2024, [period(date(2024, 12, 31))], shares="11")}
+    )
+    service = await build(tmp_path, provider)
+
+    snapshot = await service.snapshot(
+        "TEST4",
+        COMPANY,
+        reference=date(2024, 12, 31),
+        earnings_per_share=Decimal("0.013636363636363636"),
+        book_value_per_share=Decimal("0.081818181818181818"),
+    )
+
+    assert snapshot.shares_outstanding is not None
+    assert abs(snapshot.shares_outstanding - Decimal("11000")) < Decimal("0.001")
+    assert snapshot.periods[0].shares_outstanding == Decimal("11000")
+    shares_provenance = next(
+        item for item in snapshot.provenance if item.field_name == "shares_outstanding"
+    )
+    assert shares_provenance.selected_source == "derived_public_indicators"
 
 
 async def test_reports_reason_when_every_archive_is_unavailable(tmp_path: Path) -> None:
@@ -369,8 +417,8 @@ async def test_endpoint_returns_snapshot(tmp_path: Path) -> None:
     service = await build(tmp_path, provider)
 
     class StubOpportunity:
-        async def instrument(self, ticker: str) -> InstrumentMetadata:
-            return InstrumentMetadata(
+        async def opportunity(self, ticker: str) -> SimpleNamespace:
+            instrument = InstrumentMetadata(
                 ticker=ticker,
                 name=COMPANY,
                 instrument_type=InstrumentType.stock,
@@ -379,6 +427,19 @@ async def test_endpoint_returns_snapshot(tmp_path: Path) -> None:
                 isin=None,
                 currency="BRL",
                 reference_date=None,
+            )
+
+            def metric(value: Decimal) -> SimpleNamespace:
+                return SimpleNamespace(value=value, sources=["fundamentus"])
+
+            return SimpleNamespace(
+                instrument=instrument,
+                metrics=SimpleNamespace(
+                    shares_outstanding=metric(Decimal("1000")),
+                    earnings_per_share=metric(Decimal("4")),
+                    book_value_per_share=metric(Decimal("9")),
+                    dividends_12m=metric(Decimal("2")),
+                ),
             )
 
     app = create_app()
@@ -395,6 +456,9 @@ async def test_endpoint_returns_snapshot(tmp_path: Path) -> None:
     assert payload["ticker"] == "TEST4"
     assert payload["snapshot"]["cnpj"] == CNPJ
     assert payload["snapshot"]["trailing_twelve_months"]["ebitda"] == "300"
+    assert payload["snapshot"]["earnings_per_share"] == "4"
+    assert payload["snapshot"]["book_value_per_share"] == "9"
+    assert payload["snapshot"]["recurring_dividends_per_share"] == "2"
 
 
 async def test_endpoint_reports_unavailable_without_instrument(tmp_path: Path) -> None:
@@ -404,8 +468,17 @@ async def test_endpoint_reports_unavailable_without_instrument(tmp_path: Path) -
     service = await build(tmp_path, StubProvider())
 
     class StubOpportunity:
-        async def instrument(self, ticker: str) -> None:
-            return None
+        async def opportunity(self, ticker: str) -> SimpleNamespace:
+            metric = SimpleNamespace(value=None, sources=[])
+            return SimpleNamespace(
+                instrument=None,
+                metrics=SimpleNamespace(
+                    shares_outstanding=metric,
+                    earnings_per_share=metric,
+                    book_value_per_share=metric,
+                    dividends_12m=metric,
+                ),
+            )
 
     app = create_app()
     app.dependency_overrides[get_fundamentals_service] = lambda: service
@@ -440,6 +513,50 @@ async def test_periods_carry_the_share_count_of_their_own_year(tmp_path: Path) -
     by_year = {item.period_end.year: item.shares_outstanding for item in snapshot.periods}
     assert by_year[2023] == Decimal("1000")
     assert by_year[2024] == Decimal("900")
+
+
+async def test_stock_splits_do_not_look_like_shareholder_dilution(tmp_path: Path) -> None:
+    provider = StubProvider(
+        {
+            ("dfp", 2024): archive(2024, [period(date(2024, 12, 31))], shares="2000"),
+            ("dfp", 2023): archive(2023, [period(date(2023, 12, 31))], shares="1000"),
+        }
+    )
+    service = await build(tmp_path, provider)
+
+    snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+    by_year = {item.period_end.year: item.shares_outstanding for item in snapshot.periods}
+    assert by_year[2023] == Decimal("2000")
+    assert by_year[2024] == Decimal("2000")
+
+
+async def test_uses_filing_eps_when_historical_share_capital_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    old_period = period(date(2023, 12, 31))
+    old_period = replace(
+        old_period,
+        accounts={**old_period.accounts, "3.99.01.01": Decimal("3")},
+    )
+    provider = StubProvider(
+        {
+            ("dfp", 2024): archive(2024, [period(date(2024, 12, 31))], shares="100"),
+            ("dfp", 2023): StatementArchive(
+                kind=StatementKind.ANNUAL,
+                year=2023,
+                periods={CNPJ: [old_period]},
+                share_capital={},
+            ),
+        }
+    )
+    service = await build(tmp_path, provider)
+
+    snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+    by_year = {item.period_end.year: item.shares_outstanding for item in snapshot.periods}
+    assert by_year[2023] == Decimal("100")
+    assert by_year[2024] == Decimal("100")
 
 
 async def test_periods_do_not_invent_a_historical_share_count(tmp_path: Path) -> None:

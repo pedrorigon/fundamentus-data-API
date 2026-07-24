@@ -164,6 +164,9 @@ class OpportunityMetric(APIModel):
 
 class OpportunityMetrics(APIModel):
     current_price: OpportunityMetric
+    shares_outstanding: OpportunityMetric
+    earnings_per_share: OpportunityMetric
+    book_value_per_share: OpportunityMetric
     price_to_book: OpportunityMetric
     price_to_earnings: OpportunityMetric
     dividend_yield_12m: OpportunityMetric

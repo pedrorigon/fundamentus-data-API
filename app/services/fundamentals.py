@@ -31,7 +31,7 @@ SOURCE_CVM = "cvm"
 STATUS_VALID = "valid"
 STATUS_MISSING = "missing_data"
 
-_CACHE_PREFIX = "fundamentals:v3"
+_CACHE_PREFIX = "fundamentals:v6"
 _MINIMUM_PEERS = 3
 
 
@@ -56,6 +56,11 @@ class FundamentalsService:
         corporate_name: str | None = None,
         *,
         reference: date | None = None,
+        reference_shares: Decimal | None = None,
+        earnings_per_share: Decimal | None = None,
+        book_value_per_share: Decimal | None = None,
+        recurring_dividends_per_share: Decimal | None = None,
+        supplemental_sources: dict[str, str] | None = None,
     ) -> FundamentalsSnapshot:
         normalized = self._normalized(ticker)
         if not corporate_name:
@@ -82,27 +87,79 @@ class FundamentalsService:
         if not statements:
             return _empty(normalized, "No statement periods available for this company")
 
+        sector = await self._sector(match.cnpj)
         shares = await self._shares(match.cnpj, today)
         shares_by_year = await self._shares_by_year(match.cnpj, today)
-        periods = _unique_periods(
+        raw_periods = _unique_periods(
             build_period(
                 statement,
-                # Each period carries the count reported for its own year, so a
-                # change in shares outstanding stays visible across the series.
                 shares_outstanding=shares_by_year.get(statement.period_end.year),
+                sector=sector,
             )
             for statement in statements
         )
+        raw_ttm = trailing_twelve_months(raw_periods)
+        implied_shares = _implied_share_reference(
+            raw_ttm,
+            earnings_per_share,
+            book_value_per_share,
+        )
+        market_reference = reference_shares or implied_shares
+        share_factor = _share_scale_factor(shares, market_reference)
+        normalized_shares = market_reference or _scaled(shares, share_factor)
+        share_history = {
+            period.period_end.year: period.shares_outstanding
+            for period in raw_periods
+            if period.shares_outstanding is not None
+        }
+        share_history.update(
+            {
+                year: scaled
+                for year, value in shares_by_year.items()
+                if (scaled := _scaled(value, share_factor)) is not None
+            }
+        )
+        normalized_shares_by_year = _normalize_share_history(share_history)
+        periods = [
+            period.model_copy(
+                update={
+                    "shares_outstanding": normalized_shares_by_year.get(
+                        period.period_end.year,
+                        period.shares_outstanding,
+                    )
+                }
+            )
+            for period in raw_periods
+        ]
         ttm = trailing_twelve_months(periods)
+        shares_source = SOURCE_CVM
+        if implied_shares:
+            shares_source = "derived_public_indicators"
+        if reference_shares:
+            shares_source = "fundamentus"
         return FundamentalsSnapshot(
             ticker=normalized,
             cnpj=match.cnpj,
             company_name=match.company_name,
-            sector=await self._sector(match.cnpj),
+            sector=sector,
             periods=periods,
             trailing_twelve_months=ttm,
-            shares_outstanding=shares,
-            provenance=_provenance(ttm, shares, confidence=match.confidence),
+            shares_outstanding=normalized_shares,
+            earnings_per_share=earnings_per_share,
+            book_value_per_share=book_value_per_share,
+            recurring_dividends_per_share=recurring_dividends_per_share,
+            provenance=_provenance(
+                ttm,
+                normalized_shares,
+                confidence=match.confidence,
+                shares_source=shares_source,
+                supplemental={
+                    "earnings_per_share": earnings_per_share,
+                    "book_value_per_share": book_value_per_share,
+                    "recurring_dividends_per_share": recurring_dividends_per_share,
+                },
+                supplemental_sources=supplemental_sources or {},
+            ),
         )
 
     async def peer_group(
@@ -294,6 +351,9 @@ def _provenance(
     shares: Decimal | None,
     *,
     confidence: str,
+    shares_source: str = SOURCE_CVM,
+    supplemental: dict[str, Decimal | None] | None = None,
+    supplemental_sources: dict[str, str] | None = None,
 ) -> list[FieldProvenance]:
     weight = Decimal("0.95") if confidence == "high" else Decimal("0.8")
     fields = {
@@ -305,14 +365,20 @@ def _provenance(
         "net_debt": period.net_debt if period else None,
         "free_cash_flow_ttm": period.free_cash_flow if period else None,
         "shares_outstanding": shares,
+        **(supplemental or {}),
     }
+    sources = supplemental_sources or {}
     reference = period.period_end if period else None
     retrieved = datetime.now(UTC).date()
     return [
         FieldProvenance(
             field_name=name,
             value=value,
-            selected_source=SOURCE_CVM if value is not None else None,
+            selected_source=(
+                shares_source if name == "shares_outstanding" else sources.get(name, SOURCE_CVM)
+            )
+            if value is not None
+            else None,
             reference_date=reference,
             retrieved_at=retrieved,
             confidence=weight if value is not None else Decimal("0"),
@@ -320,6 +386,80 @@ def _provenance(
         )
         for name, value in fields.items()
     ]
+
+
+def _share_scale_factor(
+    reported: Decimal | None,
+    reference: Decimal | None,
+) -> Decimal:
+    """Reconcile issuer-specific CVM share units against a market reference."""
+    if reported is None or reported <= 0 or reference is None or reference <= 0:
+        return Decimal("1")
+    candidates = (Decimal("0.001"), Decimal("1"), Decimal("1000"))
+    factor = min(candidates, key=lambda candidate: abs(reported * candidate - reference))
+    relative_error = abs(reported * factor - reference) / reference
+    return factor if relative_error <= Decimal("0.1") else Decimal("1")
+
+
+def _implied_share_reference(
+    period: FinancialPeriod | None,
+    earnings_per_share: Decimal | None,
+    book_value_per_share: Decimal | None,
+) -> Decimal | None:
+    """Derive a corroborating share count from independently sourced ratios."""
+    if period is None:
+        return None
+    candidates = [
+        implied
+        for total, per_share_value in (
+            (period.net_income, earnings_per_share),
+            (period.equity, book_value_per_share),
+        )
+        if total is not None
+        and total > 0
+        and per_share_value is not None
+        and per_share_value > 0
+        and (implied := total / per_share_value) > 0
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if max(candidates) / min(candidates) > Decimal("1.2"):
+        return candidates[0]
+    return _median(candidates)
+
+
+def _scaled(value: Decimal | None, factor: Decimal) -> Decimal | None:
+    return value * factor if value is not None else None
+
+
+def _normalize_share_history(series: dict[int, Decimal]) -> dict[int, Decimal]:
+    """Express historical counts on the latest split-adjusted share basis."""
+    normalized = dict(series)
+    years = sorted(normalized)
+    split_factors = (
+        Decimal("1.5"),
+        Decimal("2"),
+        Decimal("3"),
+        Decimal("4"),
+        Decimal("5"),
+        Decimal("10"),
+    )
+    for previous_year, current_year in zip(years, years[1:], strict=False):
+        previous = normalized[previous_year]
+        current = normalized[current_year]
+        if previous <= 0 or current <= 0:
+            continue
+        ratio = current / previous
+        candidates = (*split_factors, *(Decimal("1") / factor for factor in split_factors))
+        split = min(candidates, key=lambda candidate: abs(ratio - candidate))
+        if abs(ratio - split) / split > Decimal("0.06"):
+            continue
+        for year in years:
+            if year <= previous_year:
+                normalized[year] *= split
+    return normalized
 
 
 def _empty(ticker: str, reason: str) -> FundamentalsSnapshot:
@@ -341,6 +481,7 @@ def _encode_periods(
                 "published_at": item.published_at.isoformat() if item.published_at else None,
                 "consolidated": item.consolidated,
                 "accounts": {code: str(value) for code, value in item.accounts.items()},
+                "account_labels": dict(item.account_labels),
                 "depreciation": str(item.depreciation) if item.depreciation is not None else None,
             }
             for item in values
@@ -369,6 +510,10 @@ def _decode_periods(payload: object) -> dict[str, list[StatementPeriod]] | None:
                 consolidated=bool(item["consolidated"]),
                 accounts={
                     str(code): Decimal(str(value)) for code, value in dict(item["accounts"]).items()
+                },
+                account_labels={
+                    str(code): str(label)
+                    for code, label in dict(item.get("account_labels") or {}).items()
                 },
                 depreciation=(
                     Decimal(str(item["depreciation"])) if item["depreciation"] is not None else None

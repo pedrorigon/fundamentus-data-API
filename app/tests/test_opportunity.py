@@ -30,6 +30,7 @@ class FakeAssetService:
             quote_date=date(2026, 7, 10),
             book_value_per_share=Decimal("20"),
             earnings_per_share=Decimal("2"),
+            shares_count=Decimal("1000"),
             min_52_weeks=Decimal("22"),
             max_52_weeks=Decimal("35"),
             sections=[
@@ -76,6 +77,15 @@ class FakeStatusProvider:
         return {"dividend_yield_12m": Decimal("10")}
 
 
+class FakeEmptyStatusProvider:
+    async def get(
+        self,
+        ticker: str,
+        instrument_type: InstrumentType | None,
+    ) -> dict[str, Decimal]:
+        return {}
+
+
 @pytest.mark.asyncio
 async def test_opportunity_service_calculates_valuation_metrics() -> None:
     service = OpportunityService(
@@ -90,9 +100,33 @@ async def test_opportunity_service_calculates_valuation_metrics() -> None:
     assert result.instrument is not None
     assert result.metrics.price_to_book.value == Decimal("1.5")
     assert result.metrics.price_to_earnings.value == Decimal("15")
+    assert result.metrics.shares_outstanding.value == Decimal("1000")
+    assert result.metrics.earnings_per_share.value == Decimal("2")
+    assert result.metrics.book_value_per_share.value == Decimal("20")
     assert result.metrics.dividend_yield_12m.value == Decimal("10")
     assert result.metrics.bazin_price.value == Decimal("50")
     assert result.metrics.graham_price.value is not None
+
+
+@pytest.mark.asyncio
+async def test_opportunity_reports_zero_for_a_confirmed_non_dividend_payer() -> None:
+    class NoDividendAssetService(FakeAssetService):
+        async def get_asset(self, ticker: str) -> AssetResponse:
+            asset = await super().get_asset(ticker)
+            return asset.model_copy(update={"dividends": []})
+
+    service = OpportunityService(
+        NoDividendAssetService(),  # type: ignore[arg-type]
+        Settings(),
+        b3_provider=FakeB3Provider(),  # type: ignore[arg-type]
+        status_provider=FakeEmptyStatusProvider(),  # type: ignore[arg-type]
+    )
+
+    result = await service.opportunity("TEST3")
+
+    assert result.metrics.dividends_12m.value == Decimal("0")
+    assert result.metrics.dividend_yield_12m.value == Decimal("0")
+    assert result.metrics.bazin_price.value == Decimal("0")
 
 
 def test_status_invest_parser_reads_visible_opportunity_values() -> None:

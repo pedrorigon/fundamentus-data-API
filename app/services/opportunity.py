@@ -360,10 +360,17 @@ def _opportunity_metrics(
         event_date = item.ex_date or item.payment_date
         if event_date is not None and event_date >= cutoff:
             dividend_total += item.value or Decimal("0")
-    dividend_source = SOURCE_FUNDAMENTUS if dividend_total > 0 else SOURCE_STATUS_INVEST
+    dividend_source = SOURCE_FUNDAMENTUS
     if dividend_total <= 0:
-        dividend_total = status.get("dividends_12m") or Decimal("0")
-    dividend_total_value = dividend_total if dividend_total > 0 else None
+        status_dividends = status.get("dividends_12m")
+        if status_dividends is not None:
+            dividend_total = status_dividends
+            dividend_source = SOURCE_STATUS_INVEST
+    dividend_total_value = (
+        dividend_total
+        if dividend_total > 0 or details is not None or "dividends_12m" in status
+        else None
+    )
     dividend_yield = fields.get("div_yield")
     if dividend_yield is None:
         dividend_yield = status.get("dividend_yield_12m")
@@ -393,6 +400,24 @@ def _opportunity_metrics(
             as_of=as_of,
             sources=[price_source] if price_source else [],
             reason="Current price unavailable",
+        ),
+        shares_outstanding=_metric(
+            details.shares_count if details else None,
+            as_of=as_of,
+            sources=[SOURCE_FUNDAMENTUS],
+            reason="Outstanding shares unavailable",
+        ),
+        earnings_per_share=_metric(
+            earnings,
+            as_of=as_of,
+            sources=[earnings_source] if earnings_source else [],
+            reason="Earnings per share unavailable",
+        ),
+        book_value_per_share=_metric(
+            book_value,
+            as_of=as_of,
+            sources=[book_value_source] if book_value_source else [],
+            reason="Book value per share unavailable",
         ),
         price_to_book=_metric(
             price_to_book,
