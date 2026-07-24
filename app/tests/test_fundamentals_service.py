@@ -418,3 +418,38 @@ async def test_endpoint_reports_unavailable_without_instrument(tmp_path: Path) -
     assert response.json()["snapshot"]["unavailable_reason"] == (
         "Corporate name is required to resolve CVM filings"
     )
+
+
+async def test_periods_carry_the_share_count_of_their_own_year(tmp_path: Path) -> None:
+    """A change in shares outstanding must stay visible across the series."""
+    provider = StubProvider(
+        {
+            ("dfp", 2024): archive(2024, [period(date(2024, 12, 31))], shares="900"),
+            ("dfp", 2023): archive(2023, [period(date(2023, 12, 31))], shares="1000"),
+        }
+    )
+    config = settings(tmp_path)
+    cache = CacheStore(sqlite_enabled=False, sqlite_path=config.sqlite_cache_path)
+    await cache.startup()
+    service = FundamentalsService(config, cache, provider)
+
+    snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+    by_year = {item.period_end.year: item.shares_outstanding for item in snapshot.periods}
+    assert by_year[2023] == Decimal("1000")
+    assert by_year[2024] == Decimal("900")
+
+
+async def test_periods_fall_back_to_the_latest_share_count(tmp_path: Path) -> None:
+    provider = StubProvider(
+        {("dfp", 2024): archive(2024, [period(date(2020, 12, 31))], shares="900")}
+    )
+    config = settings(tmp_path)
+    cache = CacheStore(sqlite_enabled=False, sqlite_path=config.sqlite_cache_path)
+    await cache.startup()
+    service = FundamentalsService(config, cache, provider)
+
+    snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+    # No count was reported for 2020, so the most recent one is used.
+    assert snapshot.periods[0].shares_outstanding == Decimal("900")
