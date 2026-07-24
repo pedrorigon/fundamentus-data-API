@@ -79,8 +79,15 @@ class FundamentalsService:
             return _empty(normalized, "No statement periods available for this company")
 
         shares = await self._shares(match.cnpj, today)
+        shares_by_year = await self._shares_by_year(match.cnpj, today)
         periods = _unique_periods(
-            build_period(statement, shares_outstanding=shares) for statement in statements
+            build_period(
+                statement,
+                # Each period carries the count reported for its own year, so a
+                # change in shares outstanding stays visible across the series.
+                shares_outstanding=shares_by_year.get(statement.period_end.year, shares),
+            )
+            for statement in statements
         )
         ttm = trailing_twelve_months(periods)
         return FundamentalsSnapshot(
@@ -169,6 +176,25 @@ class FundamentalsService:
             self.settings.fundamentals_statements_ttl_seconds,
         )
         return archive.periods
+
+    async def _shares_by_year(self, cnpj: str, reference: date) -> dict[int, Decimal]:
+        """Share counts reported for each cached year."""
+        series: dict[int, Decimal] = {}
+        for year in range(
+            reference.year,
+            reference.year - self.settings.fundamentals_history_years,
+            -1,
+        ):
+            cached, hit = await self.cache.get(f"{_CACHE_PREFIX}:shares:{year}")
+            if not hit or not isinstance(cached, dict) or cnpj not in cached:
+                continue
+            try:
+                value = Decimal(str(cached[cnpj]))
+            except (ArithmeticError, ValueError):
+                continue
+            if value > 0:
+                series[year] = value
+        return series
 
     async def _shares(self, cnpj: str, reference: date) -> Decimal | None:
         for year in range(reference.year, reference.year - 3, -1):
