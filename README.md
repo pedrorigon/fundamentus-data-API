@@ -17,6 +17,7 @@ API version is resolved from package metadata at runtime. Release artifacts use 
 - Preserves raw table values while also returning normalized Brazilian dates, numbers, percentages and monetary values.
 - Supports stocks, banks, FIIs, BDRs and other asset classes by preserving all parsed detail sections.
 - Classifies B3 ETFs and exposes quotes and market data through brapi.
+- Resolves multi-year fundamentals (EBITDA, EBIT, free cash flow, net debt and share counts) from CVM open data.
 - Exposes profiles, holdings and fundamentals for international ETFs and stocks through Alpha Vantage.
 - Filters dividends by `all`, `past`, `future` and `upcoming_ex_date`.
 - Uses local caching to reduce repeated upstream requests.
@@ -70,6 +71,7 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}/details` | Details page fields and preserved sections. |
 | `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
 | `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
+| `GET /v1/assets/{ticker}/fundamentals` | Multi-year financial statements resolved from CVM open data. |
 | `GET /v1/instruments/{ticker}` | B3 instrument classification, including funds outside Fundamentus. |
 | `GET /v2/instruments/{ticker}` | ETF and stock data from B3, brapi and Alpha Vantage. |
 | `GET /v1/assets` | Batch query for multiple tickers. |
