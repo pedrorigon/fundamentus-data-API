@@ -5,6 +5,7 @@ from fastapi import Request
 from app.services import (
     AssetService,
     FixedIncomeValuationService,
+    FundamentalsService,
     HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
@@ -29,3 +30,7 @@ def get_fixed_income_valuation_service(request: Request) -> FixedIncomeValuation
 
 def get_historical_quote_service(request: Request) -> HistoricalQuoteService:
     return cast(HistoricalQuoteService, request.app.state.historical_quote_service)
+
+
+def get_fundamentals_service(request: Request) -> FundamentalsService:
+    return cast(FundamentalsService, request.app.state.fundamentals_service)

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Response, status
@@ -8,6 +8,7 @@ from app import __version__
 from app.api.dependencies import (
     get_asset_service,
     get_fixed_income_valuation_service,
+    get_fundamentals_service,
     get_historical_quote_service,
     get_instrument_data_service,
     get_opportunity_service,
@@ -25,6 +26,7 @@ from app.models import (
     DividendPeriod,
     FixedIncomeValuationRequest,
     FixedIncomeValuationResponse,
+    FundamentalsResponse,
     HealthResponse,
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
@@ -36,6 +38,7 @@ from app.models import (
 from app.services import (
     AssetService,
     FixedIncomeValuationService,
+    FundamentalsService,
     HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
@@ -46,6 +49,7 @@ router = APIRouter()
 AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
 InstrumentDataServiceDep = Annotated[InstrumentDataService, Depends(get_instrument_data_service)]
+FundamentalsServiceDep = Annotated[FundamentalsService, Depends(get_fundamentals_service)]
 FixedIncomeServiceDep = Annotated[
     FixedIncomeValuationService,
     Depends(get_fixed_income_valuation_service),
@@ -107,6 +111,31 @@ async def get_opportunity(
     service: OpportunityServiceDep,
 ) -> OpportunityResponse:
     return await service.opportunity(ticker)
+
+
+@router.get(
+    "/v1/assets/{ticker}/fundamentals",
+    response_model=FundamentalsResponse,
+    tags=["assets"],
+)
+async def get_fundamentals(
+    ticker: str,
+    fundamentals: FundamentalsServiceDep,
+    opportunity: OpportunityServiceDep,
+    response: Response,
+) -> FundamentalsResponse:
+    """Return multi-year fundamentals resolved from CVM filings."""
+    _cache_headers(response)
+    instrument = await opportunity.instrument(ticker)
+    snapshot = await fundamentals.snapshot(
+        ticker,
+        instrument.name if instrument else None,
+    )
+    return FundamentalsResponse(
+        ticker=snapshot.ticker,
+        snapshot=snapshot,
+        refreshed_at=datetime.now(UTC).date(),
+    )
 
 
 def _cache_headers(response: Response, *, force_refresh: bool = False) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -353,3 +353,68 @@ async def test_provider_parses_downloaded_registry(tmp_path: Path) -> None:
     registry = await provider.registry()
 
     assert registry[CNPJ].sector == "Comércio"
+
+
+async def test_endpoint_returns_snapshot(tmp_path: Path) -> None:
+    from app.api.dependencies import get_fundamentals_service, get_opportunity_service
+    from app.main import create_app
+    from app.models import InstrumentMetadata, InstrumentType
+
+    # The endpoint resolves against the current year, so the fixture follows it
+    # instead of a fixed year that would age out.
+    year = datetime.now(UTC).date().year
+    provider = StubProvider({("dfp", year): archive(year, [period(date(year, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    class StubOpportunity:
+        async def instrument(self, ticker: str) -> InstrumentMetadata:
+            return InstrumentMetadata(
+                ticker=ticker,
+                name=COMPANY,
+                instrument_type=InstrumentType.stock,
+                category=None,
+                cfi_code=None,
+                isin=None,
+                currency="BRL",
+                reference_date=None,
+            )
+
+    app = create_app()
+    app.dependency_overrides[get_fundamentals_service] = lambda: service
+    app.dependency_overrides[get_opportunity_service] = StubOpportunity
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/v1/assets/TEST4/fundamentals")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ticker"] == "TEST4"
+    assert payload["snapshot"]["cnpj"] == CNPJ
+    assert payload["snapshot"]["trailing_twelve_months"]["ebitda"] == "300"
+
+
+async def test_endpoint_reports_unavailable_without_instrument(tmp_path: Path) -> None:
+    from app.api.dependencies import get_fundamentals_service, get_opportunity_service
+    from app.main import create_app
+
+    service = await build(tmp_path, StubProvider())
+
+    class StubOpportunity:
+        async def instrument(self, ticker: str) -> None:
+            return None
+
+    app = create_app()
+    app.dependency_overrides[get_fundamentals_service] = lambda: service
+    app.dependency_overrides[get_opportunity_service] = StubOpportunity
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/v1/assets/TEST4/fundamentals")
+
+    assert response.status_code == 200
+    assert response.json()["snapshot"]["unavailable_reason"] == (
+        "Corporate name is required to resolve CVM filings"
+    )
