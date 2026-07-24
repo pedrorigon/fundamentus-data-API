@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
@@ -20,6 +21,7 @@ from app.parsers.cvm_statements import (
 from app.services.fundamentals_math import (
     build_period,
     enterprise_value,
+    is_financial_sector,
     per_share,
     ratio,
     trailing_twelve_months,
@@ -240,3 +242,52 @@ def test_build_period_maps_core_accounts() -> None:
     assert period.net_income == Decimal("150")
     assert period.equity == Decimal("900")
     assert period.shares_outstanding == Decimal("100")
+
+
+def test_build_period_derives_historical_shares_from_filing_eps() -> None:
+    period = build_period(
+        statement(
+            {
+                ACCOUNT_NET_INCOME: Decimal("150"),
+                "3.99.01.01": Decimal("3"),
+            }
+        )
+    )
+
+    assert period.shares_outstanding == Decimal("50")
+
+
+def test_build_period_uses_semantic_accounts_for_a_bank() -> None:
+    source = statement(
+        {
+            ACCOUNT_EBIT: Decimal("500"),
+            ACCOUNT_EQUITY: Decimal("2400"),
+            "2.08": Decimal("220"),
+            "2.08.09": Decimal("10"),
+            "3.09.01": Decimal("42"),
+        }
+    )
+    source = replace(
+        source,
+        account_labels={
+            ACCOUNT_EQUITY: "Passivos Financeiros ao Custo Amortizado",
+            "2.08": "Patrimônio Líquido Consolidado",
+            "2.08.09": "Participação dos Acionistas Não Controladores",
+            "3.09.01": "Atribuído a Sócios da Empresa Controladora",
+        },
+    )
+
+    period = build_period(source, sector="Bancos")
+
+    assert period.net_income == Decimal("42")
+    assert period.equity == Decimal("210")
+    assert period.ebit is None
+    assert period.ebitda is None
+    assert period.free_cash_flow is None
+    assert period.net_debt is None
+
+
+def test_financial_sector_detection_is_accent_insensitive() -> None:
+    assert is_financial_sector("Intermediários Financeiros") is True
+    assert is_financial_sector("Seguros e Previdência") is True
+    assert is_financial_sector("Bens Industriais") is False

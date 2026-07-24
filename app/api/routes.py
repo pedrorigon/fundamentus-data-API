@@ -126,10 +126,21 @@ async def get_fundamentals(
 ) -> FundamentalsResponse:
     """Return multi-year fundamentals resolved from CVM filings."""
     _cache_headers(response)
-    instrument = await opportunity.instrument(ticker)
+    opportunity_data = await opportunity.opportunity(ticker)
+    instrument = opportunity_data.instrument
+    metrics = opportunity_data.metrics
     snapshot = await fundamentals.snapshot(
         ticker,
         instrument.name if instrument else None,
+        reference_shares=metrics.shares_outstanding.value,
+        earnings_per_share=metrics.earnings_per_share.value,
+        book_value_per_share=metrics.book_value_per_share.value,
+        recurring_dividends_per_share=metrics.dividends_12m.value,
+        supplemental_sources={
+            "earnings_per_share": ",".join(metrics.earnings_per_share.sources),
+            "book_value_per_share": ",".join(metrics.book_value_per_share.sources),
+            "recurring_dividends_per_share": ",".join(metrics.dividends_12m.sources),
+        },
     )
     return FundamentalsResponse(
         ticker=snapshot.ticker,

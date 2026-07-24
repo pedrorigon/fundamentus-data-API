@@ -57,11 +57,24 @@ class StatementPeriod:
     period_end: date
     consolidated: bool
     accounts: dict[str, Decimal] = field(default_factory=dict)
+    account_labels: dict[str, str] = field(default_factory=dict)
     depreciation: Decimal | None = None
     published_at: date | None = None
 
     def account(self, code: str) -> Decimal | None:
         return self.accounts.get(code)
+
+    def account_by_label(self, *labels: str) -> Decimal | None:
+        """Return the first account whose normalized label matches exactly."""
+        wanted = {_fold(label) for label in labels}
+        return next(
+            (
+                self.accounts[code]
+                for code, label in self.account_labels.items()
+                if _fold(label) in wanted and code in self.accounts
+            ),
+            None,
+        )
 
 
 @dataclass(frozen=True)
@@ -238,10 +251,10 @@ def _add_account(
     value = _decimal(row.get("VL_CONTA"))
     if value is None:
         return
-    scale = _SCALES.get((row.get("ESCALA_MOEDA") or "").strip().upper(), Decimal("1"))
     code = (row.get("CD_CONTA") or "").strip()
     if not code:
         return
+    scale = _account_scale(code, value, row.get("ESCALA_MOEDA"))
 
     version = (row.get("VERSAO") or "").strip()
     key = (cnpj, period_end, consolidated, version)
@@ -348,11 +361,14 @@ class _PeriodAccumulator:
     consolidated: bool
     version: str = ""
     accounts: dict[str, Decimal] = field(default_factory=dict)
+    account_labels: dict[str, str] = field(default_factory=dict)
     depreciation: Decimal | None = None
     published_at: date | None = None
 
     def add(self, code: str, value: Decimal, label: str | None) -> None:
         self.accounts.setdefault(code, value)
+        if label:
+            self.account_labels.setdefault(code, label)
         if self.depreciation is None and _is_depreciation(code, label):
             self.depreciation = abs(value)
 
@@ -366,6 +382,7 @@ class _PeriodAccumulator:
             period_end=self.period_end,
             consolidated=self.consolidated,
             accounts=dict(self.accounts),
+            account_labels=dict(self.account_labels),
             depreciation=self.depreciation,
             published_at=self.published_at,
         )
@@ -376,6 +393,19 @@ def _is_depreciation(code: str, label: str | None) -> bool:
         return False
     folded = _fold(label)
     return any(token in folded for token in _DEPRECIATION_TOKENS)
+
+
+def _account_scale(
+    code: str,
+    value: Decimal,
+    reported_scale: str | None,
+) -> Decimal:
+    scale_name = (reported_scale or "").strip().upper()
+    if code.startswith(("3.99.01.", "3.99.02.")) and scale_name == "MIL":
+        # Some CVM filings encode R$ 2.78 as 2780 while older ones encode it
+        # directly as 2.78, despite both declaring the archive scale as MIL.
+        return Decimal("0.001") if abs(value) >= Decimal("100") else Decimal("1")
+    return _SCALES.get(scale_name, Decimal("1"))
 
 
 def _fold(value: str) -> str:

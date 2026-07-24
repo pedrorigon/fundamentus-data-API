@@ -66,7 +66,7 @@ def build_archive(
 def test_parses_accounts_and_applies_thousand_scale() -> None:
     payload = build_archive(
         [
-            statement_row(ACCOUNT_REVENUE, "1000.0000000000"),
+            statement_row(ACCOUNT_REVENUE, "1000.0000000000", label="Receita Líquida"),
             statement_row(ACCOUNT_EBIT, "250.0000000000"),
         ]
     )
@@ -76,6 +76,7 @@ def test_parses_accounts_and_applies_thousand_scale() -> None:
     assert list(periods) == [CNPJ_DIGITS]
     period = periods[CNPJ_DIGITS][0]
     assert period.account(ACCOUNT_REVENUE) == Decimal("1000000")
+    assert period.account_by_label("Receita Líquida") == Decimal("1000000")
     assert period.account(ACCOUNT_EBIT) == Decimal("250000")
     assert period.period_end == date(2024, 12, 31)
     assert period.published_at == date(2025, 3, 26)
@@ -122,6 +123,20 @@ def test_unit_scale_is_not_multiplied() -> None:
     period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
 
     assert period.account(ACCOUNT_REVENUE) == Decimal("1500.00")
+
+
+def test_per_share_accounts_use_the_cvm_thousandths_convention() -> None:
+    payload = build_archive(
+        [
+            statement_row("3.99.01.01", "2780.0000000000", label="ON"),
+            statement_row("3.99.01.02", "2.7800000000", label="PN"),
+        ]
+    )
+
+    period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
+
+    assert period.account("3.99.01.01") == Decimal("2.7800000000")
+    assert period.account("3.99.01.02") == Decimal("2.7800000000")
 
 
 def test_ignores_previous_period_rows() -> None:
