@@ -3,6 +3,8 @@ from collections.abc import Awaitable
 from datetime import date
 from typing import Protocol
 
+import httpx
+
 from app.cache import CacheStore
 from app.config import Settings
 from app.core.errors import InvalidTickerError, LocalRateLimitError
@@ -173,7 +175,7 @@ class AssetService:
         normalized = [self.normalize_ticker(ticker) for ticker in tickers]
         return await asyncio.gather(
             *[
-                self.get_asset(
+                self._get_batch_asset(
                     ticker,
                     include_details=include_details,
                     include_dividends=include_dividends,
@@ -184,3 +186,26 @@ class AssetService:
                 for ticker in normalized
             ]
         )
+
+    async def _get_batch_asset(
+        self,
+        ticker: str,
+        *,
+        include_details: bool,
+        include_dividends: bool,
+        period: DividendPeriod,
+        as_of: date | None,
+        force_refresh: bool,
+    ) -> AssetResponse:
+        """Isolate an upstream failure so one ticker cannot fail a whole batch."""
+        try:
+            return await self.get_asset(
+                ticker,
+                include_details=include_details,
+                include_dividends=include_dividends,
+                period=period,
+                as_of=as_of,
+                force_refresh=force_refresh,
+            )
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError):
+            return AssetResponse(ticker=ticker)
