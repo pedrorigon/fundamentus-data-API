@@ -31,7 +31,7 @@ SOURCE_CVM = "cvm"
 STATUS_VALID = "valid"
 STATUS_MISSING = "missing_data"
 
-_CACHE_PREFIX = "fundamentals:v2"
+_CACHE_PREFIX = "fundamentals:v3"
 _MINIMUM_PEERS = 3
 
 
@@ -147,10 +147,12 @@ class FundamentalsService:
     async def _archives(self, reference: date) -> list[dict[str, list[StatementPeriod]]]:
         years = range(reference.year, reference.year - self.settings.fundamentals_history_years, -1)
         annual = await asyncio.gather(*(self._archive(StatementKind.ANNUAL, y) for y in years))
-        quarterly = await self._archive(StatementKind.QUARTERLY, reference.year)
+        quarterly = await asyncio.gather(
+            self._archive(StatementKind.QUARTERLY, reference.year),
+            self._archive(StatementKind.QUARTERLY, reference.year - 1),
+        )
         archives = [archive for archive in annual if archive]
-        if quarterly:
-            archives.append(quarterly)
+        archives.extend(archive for archive in quarterly if archive)
         return archives
 
     async def _archive(

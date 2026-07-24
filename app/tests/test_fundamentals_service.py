@@ -134,6 +134,8 @@ async def test_resolves_snapshot_from_primary_source(tmp_path: Path) -> None:
     assert snapshot.trailing_twelve_months is not None
     assert snapshot.trailing_twelve_months.ebitda == Decimal("300")
     assert snapshot.unavailable_reason is None
+    assert ("itr", 2024) in provider.statement_calls
+    assert ("itr", 2023) in provider.statement_calls
 
 
 async def test_reports_reason_when_every_archive_is_unavailable(tmp_path: Path) -> None:

@@ -167,8 +167,9 @@ def _collect_periods(
     archive: ZipFile,
     names: list[str],
     wanted: set[str] | None,
-) -> dict[tuple[str, date, bool], _PeriodAccumulator]:
-    accumulators: dict[tuple[str, date, bool], _PeriodAccumulator] = {}
+) -> dict[tuple[str, date, bool, str], _PeriodAccumulator]:
+    publications = _collect_publications(archive, names, wanted)
+    accumulators: dict[tuple[str, date, bool, str], _PeriodAccumulator] = {}
     for name in names:
         lowered = name.lower()
         if "composicao_capital" in lowered or "parecer" in lowered:
@@ -177,16 +178,53 @@ def _collect_periods(
         if not consolidated and "_ind_" not in lowered:
             continue
         for row in _iter_rows(archive, name):
-            _add_account(accumulators, row, wanted, consolidated=consolidated)
+            _add_account(
+                accumulators,
+                row,
+                wanted,
+                consolidated=consolidated,
+                publications=publications,
+            )
     return accumulators
 
 
+def _collect_publications(
+    archive: ZipFile,
+    names: list[str],
+    wanted: set[str] | None,
+) -> dict[tuple[str, date, str], date]:
+    """Read filing receipt dates from the archive's document metadata CSV."""
+    publications: dict[tuple[str, date, str], date] = {}
+    for name in names:
+        lowered = name.lower()
+        if "_con_" in lowered or "_ind_" in lowered or "composicao_capital" in lowered:
+            continue
+        for row in _iter_rows(archive, name):
+            cnpj = _digits(row.get("CNPJ_CIA"))
+            reference = _iso_date(row.get("DT_REFER"))
+            received = _iso_date(row.get("DT_RECEB"))
+            if (
+                not cnpj
+                or reference is None
+                or received is None
+                or (wanted is not None and cnpj not in wanted)
+            ):
+                continue
+            version = (row.get("VERSAO") or "").strip()
+            key = (cnpj, reference, version)
+            previous = publications.get(key)
+            if previous is None or received > previous:
+                publications[key] = received
+    return publications
+
+
 def _add_account(
-    accumulators: dict[tuple[str, date, bool], _PeriodAccumulator],
+    accumulators: dict[tuple[str, date, bool, str], _PeriodAccumulator],
     row: dict[str, str],
     wanted: set[str] | None,
     *,
     consolidated: bool,
+    publications: dict[tuple[str, date, str], date],
 ) -> None:
     if (row.get("ORDEM_EXERC") or "").strip().upper() != _LAST_PERIOD:
         return
@@ -205,7 +243,8 @@ def _add_account(
     if not code:
         return
 
-    key = (cnpj, period_end, consolidated)
+    version = (row.get("VERSAO") or "").strip()
+    key = (cnpj, period_end, consolidated, version)
     accumulator = accumulators.get(key)
     if accumulator is None:
         accumulator = _PeriodAccumulator(
@@ -216,14 +255,21 @@ def _add_account(
             period_start=_iso_date(row.get("DT_INI_EXERC")),
             period_end=period_end,
             consolidated=consolidated,
-            published_at=_iso_date(row.get("DT_RECEB")),
+            version=version,
+            published_at=_iso_date(row.get("DT_RECEB"))
+            or publications.get((cnpj, reference, version)),
         )
         accumulators[key] = accumulator
+    period_start = _iso_date(row.get("DT_INI_EXERC"))
+    if accumulator.period_start is None and period_start is not None:
+        accumulator.period_start = period_start
+    if accumulator.published_at is None:
+        accumulator.published_at = publications.get((cnpj, reference, version))
     accumulator.add(code, value * scale, row.get("DS_CONTA"))
 
 
 def _select_periods(
-    accumulators: dict[tuple[str, date, bool], _PeriodAccumulator],
+    accumulators: dict[tuple[str, date, bool, str], _PeriodAccumulator],
     *,
     prefer_consolidated: bool,
 ) -> dict[str, list[StatementPeriod]]:
@@ -248,11 +294,19 @@ def _prefer(
     *,
     prefer_consolidated: bool,
 ) -> _PeriodAccumulator:
+    eligible = candidates
     if prefer_consolidated:
-        for candidate in candidates:
-            if candidate.consolidated and candidate.accounts:
-                return candidate
-    return max(candidates, key=lambda candidate: len(candidate.accounts))
+        consolidated = [candidate for candidate in candidates if candidate.consolidated]
+        if consolidated:
+            eligible = consolidated
+    return max(
+        eligible,
+        key=lambda candidate: (
+            _version_number(candidate.version),
+            candidate.published_at or date.min,
+            len(candidate.accounts),
+        ),
+    )
 
 
 def _add_share_capital(
@@ -269,11 +323,16 @@ def _add_share_capital(
     existing = results.get(cnpj)
     if existing is not None and existing.reference_date >= reference:
         return
+    common = _decimal(row.get("QT_ACAO_ORDIN_CAP_INTEGR")) or Decimal("0")
+    preferred = _decimal(row.get("QT_ACAO_PREF_CAP_INTEGR")) or Decimal("0")
+    total = _decimal(row.get("QT_ACAO_TOTAL_CAP_INTEGR")) or Decimal("0")
+    if common + preferred <= 0 and total > 0:
+        common = total
     results[cnpj] = ShareCapital(
         cnpj=cnpj,
         reference_date=reference,
-        common_shares=_decimal(row.get("QT_ACAO_ORDIN_CAP_INTEGR")) or Decimal("0"),
-        preferred_shares=_decimal(row.get("QT_ACAO_PREF_CAP_INTEGR")) or Decimal("0"),
+        common_shares=common,
+        preferred_shares=preferred,
         treasury_shares=_decimal(row.get("QT_ACAO_TOTAL_TESOURO")) or Decimal("0"),
     )
 
@@ -287,6 +346,7 @@ class _PeriodAccumulator:
     period_start: date | None
     period_end: date
     consolidated: bool
+    version: str = ""
     accounts: dict[str, Decimal] = field(default_factory=dict)
     depreciation: Decimal | None = None
     published_at: date | None = None
@@ -380,3 +440,7 @@ def _decimal(value: str | None) -> Decimal | None:
         return Decimal(text)
     except InvalidOperation:
         return None
+
+
+def _version_number(value: str) -> Decimal:
+    return _decimal(value) or Decimal("0")

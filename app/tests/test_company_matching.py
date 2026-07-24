@@ -42,6 +42,19 @@ def test_matches_abbreviated_filing_name() -> None:
     assert match.cnpj == "60746948000112"
 
 
+def test_keeps_brasil_as_an_identifying_bank_token() -> None:
+    match = match_company(
+        "BANCO DO BRASIL S.A.",
+        {
+            "00000000000191": "BCO BRASIL S.A.",
+            "11111111000111": "BANCO PAN S.A.",
+        },
+    )
+
+    assert match is not None
+    assert match.cnpj == "00000000000191"
+
+
 def test_matches_when_filing_name_has_extra_tokens() -> None:
     match = match_company(
         "ITAU UNIBANCO HOLDING S.A.",
