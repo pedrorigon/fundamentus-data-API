@@ -16,9 +16,16 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class FakeScraper:
-    def __init__(self, *, delay: float = 0.0, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        delay: float = 0.0,
+        fail: bool = False,
+        failed_ticker: str | None = None,
+    ) -> None:
         self.delay = delay
         self.fail = fail
+        self.failed_ticker = failed_ticker
         self.details_calls = 0
         self.dividend_calls = 0
         self.fii_dividend_calls = 0
@@ -30,7 +37,7 @@ class FakeScraper:
         self.details_calls += 1
         if self.delay:
             await asyncio.sleep(self.delay)
-        if self.fail:
+        if self.fail or ticker == self.failed_ticker:
             raise RuntimeError("upstream failed")
         fixtures = {"ITUB4": "itub4_details.html", "HGLG11": "hglg11_details.html"}
         return (FIXTURES / fixtures.get(ticker, "wege3_details.html")).read_text(
@@ -137,6 +144,17 @@ async def test_singleflight_coalesces_concurrent_scrapes() -> None:
     results = await asyncio.gather(*[service.get_details("ITUB4") for _ in range(8)])
     assert all(details.ticker == "ITUB4" for details, _cached in results)
     assert scraper.details_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_isolates_an_upstream_failure_per_ticker() -> None:
+    service = await make_service(FakeScraper(failed_ticker="WEGE3"))
+
+    results = await service.get_batch(["WEGE3", "ITUB4"])
+
+    assert [result.ticker for result in results] == ["WEGE3", "ITUB4"]
+    assert results[0].details is None
+    assert results[1].details is not None
 
 
 @pytest.mark.asyncio
