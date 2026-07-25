@@ -442,3 +442,50 @@ def test_empty_csv_file_yields_no_rows() -> None:
 
 def test_registry_ignores_empty_payload() -> None:
     assert parse_company_registry(b"") == {}
+
+
+def test_a_label_repeated_in_another_statement_does_not_answer_for_it() -> None:
+    """The value added statement repeats income statement wording.
+
+    Without confining the lookup to one statement group, the profit attributed
+    to controlling shareholders can be read from the wrong statement.
+    """
+    payload = build_archive(
+        [
+            statement_row(
+                "3.11.01",
+                "10301606.0000000000",
+                label="Atribuído a Sócios da Empresa Controladora",
+            ),
+            statement_row(
+                "4.03.01",
+                "0.0000000000",
+                label="Atribuído a Sócios da Empresa Controladora",
+            ),
+        ]
+    )
+
+    period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
+
+    assert period.account_by_label(
+        "Atribuído a Sócios da Empresa Controladora",
+        prefix="3.",
+    ) == Decimal("10301606000")
+
+
+def test_labels_are_tried_in_the_order_they_are_given() -> None:
+    payload = build_archive(
+        [
+            statement_row("3.11.02", "0.0000000000", label="Atribuído a Sócios Não Controladores"),
+            statement_row(
+                "3.11.01", "500.0000000000", label="Atribuído a Sócios da Empresa Controladora"
+            ),
+        ]
+    )
+
+    period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
+
+    assert period.account_by_label(
+        "Atribuído a Sócios da Empresa Controladora",
+        "Atribuído a Sócios Não Controladores",
+    ) == Decimal("500000")

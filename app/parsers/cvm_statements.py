@@ -64,15 +64,27 @@ class StatementPeriod:
     def account(self, code: str) -> Decimal | None:
         return self.accounts.get(code)
 
-    def account_by_label(self, *labels: str) -> Decimal | None:
-        """Return the first account whose normalized label matches exactly."""
-        wanted = {_fold(label) for label in labels}
+    def account_by_label(self, *labels: str, prefix: str | None = None) -> Decimal | None:
+        """Return the account matching the earliest label given.
+
+        Labels are tried in the order the caller listed them, because several
+        may be present in the same filing and only the first expresses the
+        wanted figure.
+
+        ``prefix`` restricts the search to one statement group. The same label
+        appears in different statements — the value added statement repeats the
+        wording of the income statement, for instance — so without it a lookup
+        can answer with a figure from an unrelated statement.
+        """
+        by_label: dict[str, Decimal] = {}
+        for code, label in self.account_labels.items():
+            if code not in self.accounts:
+                continue
+            if prefix is not None and not code.startswith(prefix):
+                continue
+            by_label.setdefault(_fold(label), self.accounts[code])
         return next(
-            (
-                self.accounts[code]
-                for code, label in self.account_labels.items()
-                if _fold(label) in wanted and code in self.accounts
-            ),
+            (value for label in labels if (value := by_label.get(_fold(label))) is not None),
             None,
         )
 

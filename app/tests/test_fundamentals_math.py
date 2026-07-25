@@ -291,3 +291,53 @@ def test_financial_sector_detection_is_accent_insensitive() -> None:
     assert is_financial_sector("Intermediários Financeiros") is True
     assert is_financial_sector("Seguros e Previdência") is True
     assert is_financial_sector("Bens Industriais") is False
+
+
+def test_an_unfilled_attribution_falls_back_to_the_parent_line() -> None:
+    """Many issuers report profit on 3.11 and leave 3.11.01 at zero."""
+    statement_period = StatementPeriod(
+        cnpj="11111111000111",
+        cvm_code="001",
+        company_name="EMPRESA TESTE S.A.",
+        reference_date=date(2024, 12, 31),
+        period_start=date(2024, 1, 1),
+        period_end=date(2024, 12, 31),
+        consolidated=True,
+        accounts={
+            ACCOUNT_NET_INCOME: Decimal("1415510000"),
+            "3.11.01": Decimal("0"),
+            "3.11.02": Decimal("0"),
+        },
+        account_labels={
+            ACCOUNT_NET_INCOME: "Lucro/Prejuízo Consolidado do Período",
+            "3.11.01": "Atribuído a Sócios da Empresa Controladora",
+            "3.11.02": "Atribuído a Sócios Não Controladores",
+        },
+    )
+
+    assert build_period(statement_period).net_income == Decimal("1415510000")
+
+
+def test_a_filled_attribution_still_takes_precedence() -> None:
+    """When the breakdown is reported, the controlling share is the figure."""
+    statement_period = StatementPeriod(
+        cnpj="11111111000111",
+        cvm_code="001",
+        company_name="EMPRESA TESTE S.A.",
+        reference_date=date(2024, 12, 31),
+        period_start=date(2024, 1, 1),
+        period_end=date(2024, 12, 31),
+        consolidated=True,
+        accounts={
+            ACCOUNT_NET_INCOME: Decimal("1000"),
+            "3.11.01": Decimal("900"),
+            "3.11.02": Decimal("100"),
+        },
+        account_labels={
+            ACCOUNT_NET_INCOME: "Lucro/Prejuízo Consolidado do Período",
+            "3.11.01": "Atribuído a Sócios da Empresa Controladora",
+            "3.11.02": "Atribuído a Sócios Não Controladores",
+        },
+    )
+
+    assert build_period(statement_period).net_income == Decimal("900")
