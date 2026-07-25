@@ -34,6 +34,7 @@ from app.models import (
     InstrumentMetadata,
     InstrumentType,
     OpportunityResponse,
+    SectorUniverseResponse,
 )
 from app.services import (
     AssetService,
@@ -145,6 +146,27 @@ async def get_fundamentals(
     return FundamentalsResponse(
         ticker=snapshot.ticker,
         snapshot=snapshot,
+        refreshed_at=datetime.now(UTC).date(),
+    )
+
+
+@router.get(
+    "/v1/sectors/universe",
+    response_model=SectorUniverseResponse,
+    tags=["assets"],
+)
+async def get_sector_universe(
+    fundamentals: FundamentalsServiceDep,
+    response: Response,
+) -> SectorUniverseResponse:
+    """Return every filing company grouped by its registered sector.
+
+    Consumers use this to build peer medians from the whole market instead of
+    from the tickers they happen to hold.
+    """
+    _cache_headers(response)
+    return SectorUniverseResponse(
+        sectors=await fundamentals.sector_universe(),
         refreshed_at=datetime.now(UTC).date(),
     )
 
