@@ -20,6 +20,7 @@ from app.models.fundamentals import (
     FinancialPeriod,
     FundamentalsSnapshot,
     PeerGroup,
+    SectorCompany,
 )
 from app.parsers.cvm_statements import StatementPeriod
 from app.parsers.normalizers import normalize_ticker
@@ -205,6 +206,60 @@ class FundamentalsService:
             median_free_cash_flow_yield=_median(samples["free_cash_flow_yield"]),
         )
 
+    async def sector_universe(
+        self,
+        *,
+        reference: date | None = None,
+    ) -> dict[str, list[SectorCompany]]:
+        """Group every filing company by its registered sector.
+
+        Relative valuation needs a comparison base drawn from the whole market
+        rather than from the tickers a caller happens to hold, so the universe
+        comes from the CVM archives themselves.
+        """
+        today = reference or datetime.now(UTC).date()
+        archives = await self._archives(today)
+        if not archives:
+            return {}
+        sectors = await self._sectors()
+
+        latest: dict[str, StatementPeriod] = {}
+        for archive in archives:
+            for cnpj, periods in archive.items():
+                for statement in periods:
+                    current = latest.get(cnpj)
+                    if current is None or statement.period_end > current.period_end:
+                        latest[cnpj] = statement
+
+        universe: dict[str, list[SectorCompany]] = {}
+        for cnpj, statement in latest.items():
+            sector = sectors.get(cnpj)
+            if not sector:
+                continue
+            period = build_period(statement, sector=sector)
+            if period.equity is None or period.equity <= 0:
+                continue
+            universe.setdefault(sector, []).append(
+                SectorCompany(
+                    cnpj=cnpj,
+                    company_name=statement.company_name,
+                    sector=sector,
+                    period=period,
+                )
+            )
+        return universe
+
+    async def _sectors(self) -> dict[str, str]:
+        key = f"{_CACHE_PREFIX}:registry"
+        cached, hit = await self.cache.get(key)
+        if not hit:
+            registry = await self.provider.registry()
+            cached = {code: entry.sector for code, entry in registry.items() if entry.sector}
+            await self.cache.set(key, cached, self.settings.company_registry_ttl_seconds)
+        if not isinstance(cached, dict):
+            return {}
+        return {str(cnpj): str(sector) for cnpj, sector in cached.items() if sector}
+
     async def _archives(self, reference: date) -> list[dict[str, list[StatementPeriod]]]:
         years = range(reference.year, reference.year - self.settings.fundamentals_history_years, -1)
         annual = await asyncio.gather(*(self._archive(StatementKind.ANNUAL, y) for y in years))
@@ -286,16 +341,7 @@ class FundamentalsService:
         return None
 
     async def _sector(self, cnpj: str) -> str | None:
-        key = f"{_CACHE_PREFIX}:registry"
-        cached, hit = await self.cache.get(key)
-        if not hit:
-            registry = await self.provider.registry()
-            cached = {code: entry.sector for code, entry in registry.items() if entry.sector}
-            await self.cache.set(key, cached, self.settings.company_registry_ttl_seconds)
-        if isinstance(cached, dict):
-            sector = cached.get(cnpj)
-            return str(sector) if sector else None
-        return None
+        return (await self._sectors()).get(cnpj)
 
     def _normalized(self, ticker: str) -> str:
         try:

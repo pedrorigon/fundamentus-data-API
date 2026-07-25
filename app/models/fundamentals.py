@@ -70,6 +70,22 @@ class FundamentalsResponse(BaseModel):
     refreshed_at: date | None = None
 
 
+class SectorCompany(BaseModel):
+    """One filing company placed in its sector, for peer aggregation."""
+
+    cnpj: str
+    company_name: str
+    sector: str
+    period: FinancialPeriod
+
+
+class SectorUniverseResponse(BaseModel):
+    """Every filing company grouped by sector."""
+
+    sectors: dict[str, list[SectorCompany]] = Field(default_factory=dict)
+    refreshed_at: date | None = None
+
+
 class PeerGroup(BaseModel):
     """Sector aggregates used for relative valuation."""
 

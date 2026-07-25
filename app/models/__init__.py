@@ -33,6 +33,8 @@ from app.models.fundamentals import (
     FundamentalsResponse,
     FundamentalsSnapshot,
     PeerGroup,
+    SectorCompany,
+    SectorUniverseResponse,
 )
 from app.models.historical_quotes import (
     HistoricalQuote,
@@ -67,6 +69,8 @@ __all__ = [
     "FundamentalsResponse",
     "FundamentalsSnapshot",
     "PeerGroup",
+    "SectorCompany",
+    "SectorUniverseResponse",
     "FixedIncomeValuation",
     "FixedIncomeValuationRequest",
     "FixedIncomeValuationResponse",
