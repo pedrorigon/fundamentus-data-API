@@ -108,9 +108,20 @@ def _semantic_account(
     standard_code: str,
     labels: tuple[str, ...],
 ) -> Decimal | None:
-    """Prefer semantic labels because CVM account codes vary by issuer chart."""
-    by_label = statement.account_by_label(*labels)
-    return by_label if by_label is not None else statement.account(standard_code)
+    """Prefer semantic labels because CVM account codes vary by issuer chart.
+
+    The search is confined to the statement group the standard code belongs to,
+    so a label repeated in another statement cannot answer in its place.
+
+    Many issuers file the attribution breakdown as zero while reporting the
+    figure on the parent line, so a zero from a label is treated as unfilled
+    and the standard code answers instead.
+    """
+    group = standard_code.split(".", 1)[0]
+    by_label = statement.account_by_label(*labels, prefix=f"{group}.")
+    if by_label:
+        return by_label
+    return statement.account(standard_code) or by_label
 
 
 def _shareholder_equity(statement: StatementPeriod) -> Decimal | None:
