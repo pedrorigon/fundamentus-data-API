@@ -371,10 +371,9 @@ def _opportunity_metrics(
         if dividend_total > 0 or details is not None or "dividends_12m" in status
         else None
     )
-    dividend_yield = fields.get("div_yield")
-    if dividend_yield is None:
-        dividend_yield = status.get("dividend_yield_12m")
-    if dividend_yield is None and dividend_total_value is not None and current_price:
+    reported_dividend_yield = fields.get("div_yield") or status.get("dividend_yield_12m")
+    dividend_yield = reported_dividend_yield
+    if dividend_total_value is not None and current_price:
         dividend_yield = dividend_total_value / current_price * Decimal("100")
 
     graham = None
