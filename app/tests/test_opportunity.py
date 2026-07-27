@@ -11,13 +11,17 @@ from app.models import (
     DetailSection,
     Dividend,
     FieldData,
+    FundDistribution,
     InstrumentMetadata,
     InstrumentType,
 )
+from app.scrapers.cvm_fund_reports import FundReportPoint, FundReportSeries
 from app.services.opportunity import (
     B3InstrumentProvider,
     OpportunityService,
+    StatusInvestProfile,
     StatusInvestProvider,
+    parse_status_invest_profile,
     parse_status_invest_snapshot,
 )
 
@@ -76,6 +80,13 @@ class FakeStatusProvider:
     async def get(self, ticker: str, instrument_type: InstrumentType | None) -> dict[str, Decimal]:
         return {"dividend_yield_12m": Decimal("10")}
 
+    async def profile(
+        self,
+        ticker: str,
+        instrument_type: InstrumentType | None,
+    ) -> StatusInvestProfile:
+        return StatusInvestProfile(values=await self.get(ticker, instrument_type))
+
 
 class FakeEmptyStatusProvider:
     async def get(
@@ -84,6 +95,33 @@ class FakeEmptyStatusProvider:
         instrument_type: InstrumentType | None,
     ) -> dict[str, Decimal]:
         return {}
+
+    async def profile(
+        self,
+        ticker: str,
+        instrument_type: InstrumentType | None,
+    ) -> StatusInvestProfile:
+        return StatusInvestProfile(values={})
+
+
+class FakeCvmProvider:
+    async def reports(
+        self,
+        instrument: InstrumentMetadata | None,
+        *,
+        cnpj: str | None = None,
+        today: date | None = None,
+    ) -> FundReportSeries:
+        return FundReportSeries(
+            cnpj=cnpj,
+            reports=(
+                FundReportPoint(
+                    as_of=date(2026, 6, 1),
+                    nav_per_share=Decimal("40"),
+                    monthly_distribution_yield=Decimal("0.01"),
+                ),
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -170,6 +208,67 @@ async def test_opportunity_recomputes_yield_from_reconciled_dividends_and_price(
     assert result.metrics.dividend_yield_12m.value == Decimal("10.0")
 
 
+@pytest.mark.asyncio
+async def test_fund_opportunity_prefers_official_nav_and_exposes_income_horizons() -> None:
+    class FundB3Provider(FakeB3Provider):
+        async def get(self, ticker: str) -> InstrumentMetadata:
+            return InstrumentMetadata(
+                ticker=ticker,
+                name="Example FII",
+                instrument_type=InstrumentType.fii,
+                isin="BREXAMCTF000",
+            )
+
+    class FundStatusProvider(FakeStatusProvider):
+        async def profile(
+            self,
+            ticker: str,
+            instrument_type: InstrumentType | None,
+        ) -> StatusInvestProfile:
+            return StatusInvestProfile(
+                values=await self.get(ticker, instrument_type),
+                cnpj="12.345.678/0001-00",
+                distributions=(
+                    FundDistribution(
+                        ex_date=date(2026, 6, 30),
+                        value=Decimal("1.20"),
+                        source="status_invest",
+                    ),
+                    FundDistribution(
+                        ex_date=date(2026, 5, 30),
+                        value=Decimal("1.00"),
+                        source="status_invest",
+                    ),
+                    FundDistribution(
+                        ex_date=date(2026, 4, 30),
+                        value=Decimal("0.80"),
+                        source="status_invest",
+                    ),
+                ),
+            )
+
+    service = OpportunityService(
+        FakeAssetService(),  # type: ignore[arg-type]
+        Settings(),
+        b3_provider=FundB3Provider(),  # type: ignore[arg-type]
+        status_provider=FundStatusProvider(),  # type: ignore[arg-type]
+        cvm_provider=FakeCvmProvider(),  # type: ignore[arg-type]
+    )
+
+    result = await service.opportunity("TEST11")
+
+    assert result.metrics.book_value_per_share.value == Decimal("40")
+    assert result.metrics.book_value_per_share.sources == ["cvm"]
+    assert result.metrics.price_to_book.value == Decimal("0.75")
+    assert result.metrics.latest_distribution is not None
+    assert result.metrics.latest_distribution.value == Decimal("1.20")
+    assert result.metrics.median_distribution_3m is not None
+    assert result.metrics.median_distribution_3m.value == Decimal("1.20")
+    assert result.fund_reports is not None
+    assert result.fund_reports.cnpj == "12.345.678/0001-00"
+    assert len(result.fund_distributions) == 4
+
+
 def test_status_invest_parser_reads_visible_opportunity_values() -> None:
     html = """
     <div title="Valor atual do ativo"><strong class="value">97,89</strong></div>
@@ -203,6 +302,43 @@ def test_status_invest_parser_reads_visible_opportunity_values() -> None:
         "earnings_per_share": Decimal("2.50"),
         "book_value_per_share": Decimal("8.00"),
     }
+
+
+def test_status_profile_reads_cnpj_and_distribution_history() -> None:
+    html = """
+    <div class="info"><h3 class="title">CNPJ</h3>
+      <strong class="value">42.730.834/0001-00</strong>
+    </div>
+    <div id="earning-section">
+      <input id="results" value='[
+        {"ed":"29/05/2026","et":"Rendimento","v":0.5},
+        {"ed":"30/04/2026","et":"Rendimento","v":0.75},
+        {"ed":"01/04/2026","et":"Amortização","v":1.25},
+        {"ed":"invalid","et":"Rendimento","v":"bad"}
+      ]'>
+    </div>
+    """
+
+    result = parse_status_invest_profile(html)
+
+    assert result.cnpj == "42730834000100"
+    assert [(item.ex_date, item.value) for item in result.distributions] == [
+        (date(2026, 5, 29), Decimal("0.5")),
+        (date(2026, 4, 30), Decimal("0.75")),
+    ]
+
+
+def test_status_profile_reads_fi_infra_cnpj_layout() -> None:
+    html = """
+    <div class="fund-section-itens">
+      <div>
+        <strong>Cnpj</strong>
+        <span class="span-item">42.730.834/0001-00</span>
+      </div>
+    </div>
+    """
+
+    assert parse_status_invest_profile(html).cnpj == "42730834000100"
 
 
 @pytest.mark.asyncio
