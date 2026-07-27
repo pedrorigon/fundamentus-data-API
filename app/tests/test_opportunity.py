@@ -129,6 +129,47 @@ async def test_opportunity_reports_zero_for_a_confirmed_non_dividend_payer() -> 
     assert result.metrics.bazin_price.value == Decimal("0")
 
 
+@pytest.mark.asyncio
+async def test_opportunity_recomputes_yield_from_reconciled_dividends_and_price() -> None:
+    class ConflictingYieldAssetService(FakeAssetService):
+        async def get_asset(self, ticker: str) -> AssetResponse:
+            asset = await super().get_asset(ticker)
+            assert asset.details is not None
+            details = asset.details.model_copy(
+                update={
+                    "sections": [
+                        *asset.details.sections,
+                        DetailSection(
+                            name="Yield",
+                            key_normalized="yield",
+                            fields=[
+                                FieldData(
+                                    label="Div. Yield",
+                                    key_normalized="div_yield",
+                                    value=Decimal("1"),
+                                    raw_value="1,00%",
+                                    value_type="percent",
+                                )
+                            ],
+                        ),
+                    ]
+                }
+            )
+            return asset.model_copy(update={"details": details})
+
+    service = OpportunityService(
+        ConflictingYieldAssetService(),  # type: ignore[arg-type]
+        Settings(),
+        b3_provider=FakeB3Provider(),  # type: ignore[arg-type]
+        status_provider=FakeStatusProvider(),  # type: ignore[arg-type]
+    )
+
+    result = await service.opportunity("TEST3")
+
+    assert result.metrics.dividends_12m.value == Decimal("3")
+    assert result.metrics.dividend_yield_12m.value == Decimal("10.0")
+
+
 def test_status_invest_parser_reads_visible_opportunity_values() -> None:
     html = """
     <div title="Valor atual do ativo"><strong class="value">97,89</strong></div>
