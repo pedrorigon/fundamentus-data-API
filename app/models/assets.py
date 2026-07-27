@@ -175,12 +175,37 @@ class OpportunityMetrics(APIModel):
     bazin_price: OpportunityMetric
     min_52_weeks: OpportunityMetric
     max_52_weeks: OpportunityMetric
+    latest_distribution: OpportunityMetric | None = None
+    median_distribution_3m: OpportunityMetric | None = None
+    median_distribution_6m: OpportunityMetric | None = None
+
+
+class FundMonthlyReport(APIModel):
+    as_of: date
+    nav_per_share: Decimal
+    monthly_distribution_yield: Decimal | None = None
+    monthly_nav_return: Decimal | None = None
+    monthly_effective_return: Decimal | None = None
+    source: str = "cvm"
+
+
+class FundReportSeries(APIModel):
+    cnpj: str | None = None
+    reports: list[FundMonthlyReport] = Field(default_factory=list)
+
+
+class FundDistribution(APIModel):
+    ex_date: date
+    value: Decimal
+    source: str
 
 
 class OpportunityResponse(APIModel):
     ticker: str
     instrument: InstrumentMetadata | None = None
     metrics: OpportunityMetrics
+    fund_reports: FundReportSeries | None = None
+    fund_distributions: list[FundDistribution] = Field(default_factory=list)
     refreshed_at: datetime
 
 

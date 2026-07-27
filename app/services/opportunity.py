@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import json
 import math
 import unicodedata
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from time import monotonic
@@ -15,6 +17,9 @@ from app.core.errors import APIError, InvalidTickerError
 from app.models import (
     AssetDetails,
     Dividend,
+    FundDistribution,
+    FundMonthlyReport,
+    FundReportSeries,
     InstrumentMetadata,
     InstrumentType,
     OpportunityMetric,
@@ -22,11 +27,25 @@ from app.models import (
     OpportunityResponse,
 )
 from app.parsers.normalizers import clean_text, normalize_ticker, parse_br_decimal
+from app.scrapers.cvm_fund_reports import (
+    CvmFundReportProvider,
+)
+from app.scrapers.cvm_fund_reports import (
+    FundReportSeries as CvmReportSeries,
+)
 from app.services.assets import AssetService
 
 SOURCE_FUNDAMENTUS = "fundamentus"
 SOURCE_STATUS_INVEST = "status_invest"
 SOURCE_B3 = "b3"
+SOURCE_CVM = "cvm"
+
+
+@dataclass(frozen=True)
+class StatusInvestProfile:
+    values: dict[str, Decimal]
+    cnpj: str | None = None
+    distributions: tuple[FundDistribution, ...] = ()
 
 
 def _fold(value: str | None) -> str:
@@ -106,18 +125,28 @@ class StatusInvestProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._cache: dict[tuple[str, InstrumentType | None], tuple[float, dict[str, Decimal]]] = {}
+        self._cache: dict[
+            tuple[str, InstrumentType | None],
+            tuple[float, StatusInvestProfile],
+        ] = {}
 
     async def get(
         self,
         ticker: str,
         instrument_type: InstrumentType | None,
     ) -> dict[str, Decimal]:
+        return dict((await self.profile(ticker, instrument_type)).values)
+
+    async def profile(
+        self,
+        ticker: str,
+        instrument_type: InstrumentType | None,
+    ) -> StatusInvestProfile:
         normalized = _normalized_ticker(ticker).lower()
         cache_key = (normalized, instrument_type)
         cached = self._cache.get(cache_key)
         if cached and cached[0] > monotonic():
-            return dict(cached[1])
+            return cached[1]
         paths = _status_paths(instrument_type)
         async with httpx.AsyncClient(
             base_url=self.settings.status_invest_base_url,
@@ -139,18 +168,18 @@ class StatusInvestProvider:
                     response.raise_for_status()
                 except httpx.HTTPError:
                     continue
-                values = parse_status_invest_snapshot(response.text)
-                if values:
+                profile = parse_status_invest_profile(response.text)
+                if profile.values or profile.cnpj or profile.distributions:
                     self._cache[cache_key] = (
                         monotonic() + self.settings.opportunity_cache_ttl_seconds,
-                        values,
+                        profile,
                     )
-                    return values
+                    return profile
         self._cache[cache_key] = (
             monotonic() + self.settings.opportunity_cache_ttl_seconds,
-            {},
+            StatusInvestProfile(values={}),
         )
-        return {}
+        return StatusInvestProfile(values={})
 
 
 class OpportunityService:
@@ -161,11 +190,13 @@ class OpportunityService:
         *,
         b3_provider: B3InstrumentProvider | None = None,
         status_provider: StatusInvestProvider | None = None,
+        cvm_provider: CvmFundReportProvider | None = None,
     ) -> None:
         self.asset_service = asset_service
         self.settings = settings
         self.b3 = b3_provider or B3InstrumentProvider(settings)
         self.status = status_provider or StatusInvestProvider(settings)
+        self.cvm = cvm_provider or CvmFundReportProvider(settings)
 
     async def instrument(self, ticker: str) -> InstrumentMetadata | None:
         return await self.b3.get(ticker)
@@ -182,20 +213,29 @@ class OpportunityService:
         except APIError:
             pass
 
-        status_values = await self.status.get(
+        status_profile = await self.status.profile(
             normalized,
             instrument.instrument_type if instrument else None,
         )
         metrics = _opportunity_metrics(
             details,
             dividends,
-            status_values,
+            status_profile.values,
             self.settings.bazin_minimum_yield_percent,
         )
+        report_series = await self.cvm.reports(
+            instrument,
+            cnpj=status_profile.cnpj,
+        )
+        metrics = _merge_official_fund_metrics(metrics, report_series)
+        distributions = _merge_fund_distributions(dividends, status_profile.distributions)
+        metrics = _add_distribution_metrics(metrics, distributions)
         return OpportunityResponse(
             ticker=normalized,
             instrument=instrument,
             metrics=metrics,
+            fund_reports=_report_series(report_series),
+            fund_distributions=list(distributions),
             refreshed_at=datetime.now(UTC),
         )
 
@@ -276,6 +316,10 @@ def _status_paths(instrument_type: InstrumentType | None) -> tuple[str, ...]:
 
 
 def parse_status_invest_snapshot(html: str) -> dict[str, Decimal]:
+    return parse_status_invest_profile(html).values
+
+
+def parse_status_invest_profile(html: str) -> StatusInvestProfile:
     tree = HTMLParser(html)
     values: dict[str, Decimal] = {}
     titles = {
@@ -306,7 +350,75 @@ def parse_status_invest_snapshot(html: str) -> dict[str, Decimal]:
         value = parse_br_decimal(value_node.text() if value_node else None)
         if key is not None and value is not None:
             values.setdefault(key, value)
-    return values
+    cnpj = _status_cnpj(tree)
+    distributions = _status_distributions(tree)
+    return StatusInvestProfile(
+        values=values,
+        cnpj=cnpj,
+        distributions=distributions,
+    )
+
+
+def _status_cnpj(tree: HTMLParser) -> str | None:
+    for node in tree.css("h3.title, strong"):
+        if _fold(node.text()) != "CNPJ":
+            continue
+        container = node.parent
+        value_node = (
+            container.css_first("strong.value, .span-item") if container is not None else None
+        )
+        digits = (
+            "".join(character for character in value_node.text() if character.isdigit())
+            if value_node
+            else ""
+        )
+        if len(digits) == 14:
+            return digits
+    return None
+
+
+def _status_distributions(tree: HTMLParser) -> tuple[FundDistribution, ...]:
+    node = tree.css_first("#earning-section input#results")
+    raw = node.attributes.get("value") if node is not None else None
+    if not raw:
+        return ()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(payload, list):
+        return ()
+    distributions = []
+    for item in payload:
+        if not isinstance(item, dict) or _fold(str(item.get("et") or "")) != "RENDIMENTO":
+            continue
+        ex_date = _br_date(item.get("ed"))
+        value = _decimal_value(item.get("v"))
+        if ex_date is not None and value is not None and value >= 0:
+            distributions.append(
+                FundDistribution(
+                    ex_date=ex_date,
+                    value=value,
+                    source=SOURCE_STATUS_INVEST,
+                )
+            )
+    return tuple(sorted(distributions, key=lambda item: item.ex_date, reverse=True))
+
+
+def _br_date(value: object) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _decimal_value(value: object) -> Decimal | None:
+    try:
+        return Decimal(str(value)) if value is not None else None
+    except (ValueError, ArithmeticError):
+        return None
 
 
 def _opportunity_metrics(
@@ -466,6 +578,124 @@ def _opportunity_metrics(
             sources=[max_source] if max_source else [],
             reason="52-week maximum unavailable",
         ),
+    )
+
+
+def _merge_official_fund_metrics(
+    metrics: OpportunityMetrics,
+    series: CvmReportSeries,
+) -> OpportunityMetrics:
+    if not series.reports:
+        return metrics
+    latest = max(series.reports, key=lambda item: item.as_of)
+    current_price = metrics.current_price.value
+    price_to_book = (
+        current_price / latest.nav_per_share
+        if current_price is not None and current_price > 0
+        else None
+    )
+    return metrics.model_copy(
+        update={
+            "book_value_per_share": _metric(
+                latest.nav_per_share,
+                as_of=latest.as_of,
+                sources=[SOURCE_CVM],
+                reason="Book value per share unavailable",
+            ),
+            "price_to_book": _metric(
+                price_to_book,
+                as_of=latest.as_of,
+                sources=[SOURCE_CVM, *metrics.current_price.sources],
+                reason="Current price unavailable",
+            ),
+        }
+    )
+
+
+def _merge_fund_distributions(
+    dividends: list[Dividend],
+    status_distributions: tuple[FundDistribution, ...],
+) -> tuple[FundDistribution, ...]:
+    by_date: dict[date, FundDistribution] = {}
+    for distribution in status_distributions:
+        by_date[distribution.ex_date] = distribution
+    for dividend in dividends:
+        event_date = dividend.ex_date or dividend.payment_date
+        if (
+            event_date is None
+            or dividend.value is None
+            or dividend.value < 0
+            or "AMORT" in _fold(dividend.type)
+        ):
+            continue
+        by_date[event_date] = FundDistribution(
+            ex_date=event_date,
+            value=dividend.value,
+            source=SOURCE_FUNDAMENTUS,
+        )
+    return tuple(by_date[key] for key in sorted(by_date, reverse=True))
+
+
+def _add_distribution_metrics(
+    metrics: OpportunityMetrics,
+    distributions: tuple[FundDistribution, ...],
+) -> OpportunityMetrics:
+    if not distributions:
+        return metrics
+    latest = distributions[0]
+    return metrics.model_copy(
+        update={
+            "latest_distribution": _metric(
+                latest.value,
+                as_of=latest.ex_date,
+                sources=[latest.source],
+                reason="Latest distribution unavailable",
+            ),
+            "median_distribution_3m": _distribution_median(distributions, 3),
+            "median_distribution_6m": _distribution_median(distributions, 6),
+        }
+    )
+
+
+def _distribution_median(
+    distributions: tuple[FundDistribution, ...],
+    months: int,
+) -> OpportunityMetric:
+    selected = distributions[:months]
+    value = _median(tuple(item.value for item in selected)) if len(selected) >= months else None
+    return _metric(
+        value,
+        as_of=max((item.ex_date for item in selected), default=None),
+        sources=sorted({item.source for item in selected}),
+        reason=f"At least {months} monthly distributions are required",
+    )
+
+
+def _median(values: tuple[Decimal, ...]) -> Decimal | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / Decimal("2")
+
+
+def _report_series(series: CvmReportSeries) -> FundReportSeries | None:
+    if not series.reports:
+        return None
+    return FundReportSeries(
+        cnpj=series.cnpj,
+        reports=[
+            FundMonthlyReport(
+                as_of=item.as_of,
+                nav_per_share=item.nav_per_share,
+                monthly_distribution_yield=item.monthly_distribution_yield,
+                monthly_nav_return=item.monthly_nav_return,
+                monthly_effective_return=item.monthly_effective_return,
+            )
+            for item in series.reports
+        ],
     )
 
 
