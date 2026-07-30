@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -15,6 +16,7 @@ from app.models import (
     InstrumentType,
     OpportunityResponse,
 )
+from app.models.fundamentals import SectorCompany
 from app.models.quality import (
     QualityAssetFacts,
     QualityAssetKind,
@@ -24,8 +26,13 @@ from app.models.quality import (
     QualityFactsRequest,
     QualityFactsResponse,
 )
+from app.services.bcb_quality import (
+    BankQualitySnapshot,
+    BcbBankProvider,
+    BcbMacroProvider,
+    MacroQualitySnapshot,
+)
 from app.services.fundamentals import FundamentalsService
-from app.services.fundamentals_math import is_financial_sector
 from app.services.market import InstrumentDataService
 from app.services.opportunity import OpportunityService
 
@@ -34,6 +41,9 @@ _CVM_SOURCE = "cvm"
 _CVM_CONFIDENCE = Decimal("0.95")
 _DERIVED_CONFIDENCE = Decimal("0.90")
 _FCF_CONFIDENCE = Decimal("0.65")
+_PEER_CONFIDENCE = Decimal("0.80")
+_MARKET_CONFIDENCE = Decimal("0.85")
+_BCB_CONFIDENCE = Decimal("0.98")
 
 
 class QualityFactsService:
@@ -44,20 +54,43 @@ class QualityFactsService:
         fundamentals: FundamentalsService,
         instruments: InstrumentDataService,
         opportunity: OpportunityService,
+        *,
+        macro_provider: BcbMacroProvider | None = None,
+        bank_provider: BcbBankProvider | None = None,
     ) -> None:
         self.fundamentals = fundamentals
         self.instruments = instruments
         self.opportunity = opportunity
+        self.macro_provider = macro_provider
+        self.bank_provider = bank_provider
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 
     async def resolve(self, request: QualityFactsRequest) -> QualityFactsResponse:
-        assets = await asyncio.gather(*(self._bounded(asset) for asset in request.assets))
+        has_stocks = any(asset.kind is QualityAssetKind.stock for asset in request.assets)
+        sector_task = (
+            asyncio.create_task(self.fundamentals.sector_universe())
+            if has_stocks and hasattr(self.fundamentals, "sector_universe")
+            else None
+        )
+        macro_task = (
+            asyncio.create_task(self.macro_provider.snapshot())
+            if has_stocks and self.macro_provider is not None
+            else None
+        )
+        assets = await asyncio.gather(
+            *(self._bounded(asset, sector_task, macro_task) for asset in request.assets)
+        )
         return QualityFactsResponse(assets=list(assets), refreshed_at=datetime.now(UTC))
 
-    async def _bounded(self, asset: QualityAssetRequest) -> QualityAssetFacts:
+    async def _bounded(
+        self,
+        asset: QualityAssetRequest,
+        sector_task: asyncio.Task[dict[str, list[SectorCompany]]] | None,
+        macro_task: asyncio.Task[MacroQualitySnapshot] | None,
+    ) -> QualityAssetFacts:
         async with self._semaphore:
             try:
-                return await self._resolve_asset(asset)
+                return await self._resolve_asset(asset, sector_task, macro_task)
             except APIError as error:
                 return QualityAssetFacts(
                     ticker=asset.ticker,
@@ -65,7 +98,12 @@ class QualityFactsService:
                     unavailable_reason=error.message,
                 )
 
-    async def _resolve_asset(self, asset: QualityAssetRequest) -> QualityAssetFacts:
+    async def _resolve_asset(
+        self,
+        asset: QualityAssetRequest,
+        sector_task: asyncio.Task[dict[str, list[SectorCompany]]] | None,
+        macro_task: asyncio.Task[MacroQualitySnapshot] | None,
+    ) -> QualityAssetFacts:
         if asset.kind is QualityAssetKind.crypto:
             return _unsupported(asset, "Use a network-data provider for cryptocurrency quality")
         if asset.kind is QualityAssetKind.fixed_income:
@@ -80,13 +118,21 @@ class QualityFactsService:
             return _etf_facts(asset, instrument_data)
         if asset.kind is QualityAssetKind.real_estate_fund:
             return _fund_facts(asset, opportunity)
-        return await self._stock_facts(asset, instrument_data, opportunity)
+        return await self._stock_facts(
+            asset,
+            instrument_data,
+            opportunity,
+            sector_task,
+            macro_task,
+        )
 
     async def _stock_facts(
         self,
         asset: QualityAssetRequest,
         instrument_data: InstrumentDataResponse,
         opportunity: OpportunityResponse,
+        sector_task: asyncio.Task[dict[str, list[SectorCompany]]] | None,
+        macro_task: asyncio.Task[MacroQualitySnapshot] | None,
     ) -> QualityAssetFacts:
         instrument = opportunity.instrument or instrument_data.instrument
         if instrument is None or instrument.category == "INTERNATIONAL":
@@ -105,7 +151,29 @@ class QualityFactsService:
                 "recurring_dividends_per_share": ",".join(metrics.dividends_12m.sources),
             },
         )
-        return _financial_facts(asset, snapshot, instrument.isin)
+        sector_universe = await sector_task if sector_task is not None else {}
+        macro = await macro_task if macro_task is not None else None
+        profile = _stock_profile(
+            snapshot.sector,
+            snapshot.company_name or instrument.name,
+        )
+        peers = _sector_peers(snapshot, sector_universe, profile)
+        bank = (
+            await self.bank_provider.snapshot(
+                snapshot.company_name or instrument.name or asset.ticker
+            )
+            if profile == "bank" and self.bank_provider is not None
+            else None
+        )
+        return _financial_facts(
+            asset,
+            snapshot,
+            instrument.isin,
+            opportunity,
+            peers,
+            macro,
+            bank,
+        )
 
 
 def _instrument_type(kind: QualityAssetKind) -> InstrumentType:
@@ -120,6 +188,10 @@ def _financial_facts(
     request: QualityAssetRequest,
     snapshot: FundamentalsSnapshot,
     isin: str | None,
+    opportunity: OpportunityResponse,
+    peers: list[SectorCompany],
+    macro: MacroQualitySnapshot | None,
+    bank: BankQualitySnapshot | None,
 ) -> QualityAssetFacts:
     period = snapshot.trailing_twelve_months
     if period is None:
@@ -135,7 +207,8 @@ def _financial_facts(
         key=lambda item: item.period_end,
     )
     reference_shares = snapshot.shares_outstanding or period.shares_outstanding
-    financial_profile = is_financial_sector(snapshot.sector)
+    profile = _stock_profile(snapshot.sector, snapshot.company_name)
+    recent = annual[-5:]
     facts = [
         _ratio("gross_margin", period.gross_profit, period.revenue, reference),
         _ratio("operating_margin", period.ebit, period.revenue, reference),
@@ -196,7 +269,7 @@ def _financial_facts(
             annual,
             lambda item: item.free_cash_flow,
         ),
-        _growth_fact("share_dilution", annual, lambda item: item.shares_outstanding),
+        _growth_fact("share_dilution", recent, lambda item: item.shares_outstanding),
         _consistency_fact(
             "earnings_per_share_consistency_error",
             _safe_ratio(period.net_income, reference_shares),
@@ -209,21 +282,51 @@ def _financial_facts(
             snapshot.book_value_per_share,
             reference,
         ),
+        _median_fact(
+            "roe_5y_median",
+            recent,
+            lambda item: _safe_ratio(item.net_income, item.equity),
+        ),
+        _threshold_frequency(
+            "roe_above_15_frequency",
+            recent,
+            lambda item: _safe_ratio(item.net_income, item.equity),
+            Decimal("0.15"),
+        ),
+        _median_fact(
+            "cash_conversion_median",
+            recent,
+            lambda item: _safe_ratio(item.operating_cash_flow, item.net_income),
+        ),
+        _stability_fact(
+            "gross_margin_volatility",
+            recent,
+            lambda item: _safe_ratio(item.gross_profit, item.revenue),
+        ),
+        _stability_fact(
+            "operating_margin_volatility",
+            recent,
+            lambda item: _safe_ratio(item.ebit, item.revenue),
+        ),
+        *_macro_facts(recent, macro),
+        *_peer_facts(period, peers),
+        *_market_scale_facts(opportunity),
+        *_dividend_facts(annual, opportunity.fund_distributions),
+        *_bank_facts(bank),
     ]
     facts, warnings = _validated_financial_facts(facts)
-    if financial_profile:
-        warnings.append(
-            "Bank and insurer capital adequacy and credit-loss facts require a BCB data source"
-        )
+    if profile == "bank" and (bank is None or bank.basel_ratio is None):
+        warnings.append("BCB IFData did not resolve current prudential capital evidence")
     sources = sorted(
         {item.selected_source for item in snapshot.provenance if item.selected_source is not None}
+        | {source for fact in facts for source in (fact.source or "").split(",") if source}
         | {_CVM_SOURCE}
     )
     return QualityAssetFacts(
         ticker=request.ticker,
         kind=request.kind,
         canonical_id=snapshot.cnpj or isin,
-        profile="financial" if financial_profile else "industrial",
+        profile=profile,
         facts=facts,
         sources=sources,
         warnings=warnings,
@@ -354,6 +457,7 @@ def _etf_facts(
         ticker=request.ticker,
         kind=request.kind,
         canonical_id=data.instrument.isin if data.instrument else None,
+        profile=_etf_profile(profile.description, profile.asset_types, profile.sectors),
         facts=facts,
         sources=[profile.source],
     )
@@ -373,6 +477,12 @@ def _fund_facts(
     )
     source = _CVM_SOURCE
     distribution_consistency = _distribution_report_consistency(reports, distributions)
+    latest = reports[-1] if reports else None
+    profile = (
+        request.profile
+        if request.profile and request.profile != "indeterminado"
+        else _fund_profile(latest, opportunity.instrument)
+    )
     facts = [
         _value_fact(
             "reporting_history_months",
@@ -399,6 +509,69 @@ def _fund_facts(
         _positive_nav_return_frequency(reports),
         _nav_max_drawdown(reports),
         distribution_consistency,
+        _value_fact(
+            "net_assets",
+            latest.net_assets if latest else None,
+            "currency",
+            latest.as_of if latest else None,
+            source,
+        ),
+        _value_fact(
+            "shareholder_count",
+            latest.shareholder_count if latest else None,
+            "count",
+            latest.as_of if latest else None,
+            source,
+        ),
+        _value_fact(
+            "fund_age_years",
+            _age_years(latest.inception_date, latest.as_of)
+            if latest and latest.inception_date
+            else None,
+            "years",
+            latest.as_of if latest else None,
+            source,
+        ),
+        _value_fact(
+            "administration_fee_ratio",
+            latest.administration_fee_ratio if latest else None,
+            "ratio",
+            latest.as_of if latest else None,
+            source,
+        ),
+        _administrator_stability(reports),
+        _metric_fact(
+            "daily_traded_value",
+            opportunity.metrics.average_daily_traded_value,
+            "currency",
+        ),
+        _ratio(
+            "liability_ratio",
+            latest.total_liabilities if latest else None,
+            latest.total_assets if latest else None,
+            latest.as_of if latest else None,
+        ),
+        _ratio(
+            "property_allocation",
+            latest.property_assets if latest else None,
+            latest.total_assets if latest else None,
+            latest.as_of if latest else None,
+        ),
+        _ratio(
+            "credit_allocation",
+            latest.credit_assets if latest else None,
+            latest.total_assets if latest else None,
+            latest.as_of if latest else None,
+        ),
+        _ratio(
+            "liquid_asset_ratio",
+            latest.liquid_assets if latest else None,
+            latest.total_assets if latest else None,
+            latest.as_of if latest else None,
+        ),
+        _issuance_nav_preservation(reports),
+        _shareholder_growth(reports),
+        _nav_total_consistency(latest),
     ]
     instrument = opportunity.instrument
     warnings = (
@@ -411,8 +584,16 @@ def _fund_facts(
         ticker=request.ticker,
         kind=request.kind,
         canonical_id=instrument.isin if instrument else None,
+        profile=profile,
         facts=facts,
-        sources=[source] if reports or distributions else [],
+        sources=(
+            [source, "fundamentus"]
+            if opportunity.metrics.average_daily_traded_value
+            and opportunity.metrics.average_daily_traded_value.value is not None
+            else [source]
+        )
+        if reports or distributions
+        else [],
         warnings=warnings,
         unavailable_reason=None
         if reports or distributions
@@ -420,11 +601,171 @@ def _fund_facts(
     )
 
 
+def _etf_profile(
+    description: str | None,
+    asset_types: Iterable[object],
+    sectors: Iterable[object],
+) -> str:
+    labels = " ".join(
+        [
+            description or "",
+            *(str(getattr(item, "name", "")) for item in asset_types),
+        ]
+    )
+    folded = _fold(labels)
+    if any(token in folded for token in ("BITCOIN", "CRYPTO", "DIGITAL ASSET")):
+        return "crypto"
+    if any(token in folded for token in ("BOND", "FIXED INCOME", "TREASURY", "CREDIT")):
+        return "fixed_income"
+    sector_weights = [getattr(item, "weight", Decimal("0")) for item in sectors]
+    scale = Decimal("100") if sector_weights and max(sector_weights) > 1 else Decimal("1")
+    if sector_weights and max(sector_weights) / scale >= Decimal("0.65"):
+        return "thematic"
+    return "broad"
+
+
+def _fund_profile(
+    latest: FundMonthlyReport | None,
+    instrument: object,
+) -> str:
+    instrument_type = getattr(instrument, "instrument_type", None)
+    if instrument_type is InstrumentType.fi_infra:
+        return "fi_infra"
+    property_ratio = (
+        _safe_ratio(latest.property_assets, latest.total_assets) if latest is not None else None
+    )
+    credit_ratio = (
+        _safe_ratio(latest.credit_assets, latest.total_assets) if latest is not None else None
+    )
+    if instrument_type is InstrumentType.fiagro:
+        return "fiagro_credit" if (credit_ratio or 0) >= (property_ratio or 0) else "fiagro_land"
+    if property_ratio is not None and property_ratio >= Decimal("0.50"):
+        return "brick"
+    if credit_ratio is not None and credit_ratio >= Decimal("0.50"):
+        return "paper"
+    return "hybrid"
+
+
+def _administrator_stability(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = [item for item in reports[-60:] if item.administrator]
+    if len(recent) < 12:
+        return _missing_fact(
+            "administrator_stability",
+            "ratio",
+            "At least twelve administrator observations are required",
+        )
+    changes = sum(
+        1
+        for previous, current in zip(recent, recent[1:], strict=False)
+        if previous.administrator != current.administrator
+    )
+    value = max(Decimal("0"), Decimal("1") - Decimal(changes) * Decimal("0.50"))
+    return _value_fact(
+        "administrator_stability",
+        value,
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _issuance_nav_preservation(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = [
+        item
+        for item in reports[-60:]
+        if item.issued_shares is not None and item.issued_shares > 0 and item.nav_per_share > 0
+    ]
+    if len(recent) < 12:
+        return _missing_fact(
+            "issuance_nav_preservation",
+            "ratio",
+            "At least twelve share and NAV observations are required",
+        )
+    issuances = [
+        (previous, current)
+        for previous, current in zip(recent, recent[1:], strict=False)
+        if current.issued_shares is not None
+        and previous.issued_shares is not None
+        and current.issued_shares > previous.issued_shares * Decimal("1.02")
+    ]
+    if not issuances:
+        value = Decimal("1")
+    else:
+        preserved = sum(
+            1
+            for previous, current in issuances
+            if current.nav_per_share >= previous.nav_per_share * Decimal("0.97")
+        )
+        value = Decimal(preserved) / Decimal(len(issuances))
+    return _value_fact(
+        "issuance_nav_preservation",
+        value,
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _shareholder_growth(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = [
+        item
+        for item in reports[-60:]
+        if item.shareholder_count is not None and item.shareholder_count > 0
+    ]
+    if len(recent) < 12:
+        return _missing_fact(
+            "shareholder_growth",
+            "ratio",
+            "At least twelve shareholder observations are required",
+        )
+    years = Decimal(str((recent[-1].as_of - recent[0].as_of).days / 365.25))
+    value = _annualized_growth(
+        recent[0].shareholder_count or Decimal("0"),
+        recent[-1].shareholder_count or Decimal("0"),
+        years,
+    )
+    return _value_fact(
+        "shareholder_growth",
+        value,
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _nav_total_consistency(latest: FundMonthlyReport | None) -> QualityFact:
+    if (
+        latest is None
+        or latest.net_assets is None
+        or latest.issued_shares is None
+        or latest.net_assets <= 0
+        or latest.issued_shares <= 0
+    ):
+        return _missing_fact(
+            "nav_total_consistency_error",
+            "ratio",
+            "NAV, total assets and issued shares are required",
+        )
+    implied = latest.nav_per_share * latest.issued_shares
+    error = abs(implied - latest.net_assets) / max(implied, latest.net_assets)
+    return _value_fact(
+        "nav_total_consistency_error",
+        error,
+        "ratio",
+        latest.as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
 def _ratio(
     key: str,
     numerator: Decimal | None,
     denominator: Decimal | None,
-    reference: date,
+    reference: date | None,
     *,
     unit: str = "ratio",
     confidence: Decimal = _CVM_CONFIDENCE,
@@ -487,6 +828,445 @@ def _positive_frequency(
         status="valid",
         history=observations,
     )
+
+
+def _median_fact(
+    key: str,
+    periods: list[FinancialPeriod],
+    getter: Callable[[FinancialPeriod], Decimal | None],
+) -> QualityFact:
+    observations = _observations(periods, getter)
+    if len(observations) < 3:
+        return _missing_fact(key, "ratio", "At least three annual observations are required")
+    return QualityFact(
+        key=key,
+        value=_median([item.value for item in observations]),
+        unit="ratio",
+        as_of=observations[-1].as_of,
+        source=_CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+        status="valid",
+        history=observations,
+    )
+
+
+def _threshold_frequency(
+    key: str,
+    periods: list[FinancialPeriod],
+    getter: Callable[[FinancialPeriod], Decimal | None],
+    threshold: Decimal,
+) -> QualityFact:
+    observations = _observations(periods, getter)
+    if len(observations) < 3:
+        return _missing_fact(key, "ratio", "At least three annual observations are required")
+    passing = sum(1 for item in observations if item.value >= threshold)
+    return QualityFact(
+        key=key,
+        value=Decimal(passing) / Decimal(len(observations)),
+        unit="ratio",
+        as_of=observations[-1].as_of,
+        source=_CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+        status="valid",
+        history=observations,
+    )
+
+
+def _macro_facts(
+    periods: list[FinancialPeriod],
+    macro: MacroQualitySnapshot | None,
+) -> list[QualityFact]:
+    if macro is None:
+        return [
+            _missing_fact(key, "ratio", "BCB macroeconomic series are unavailable")
+            for key in (
+                "revenue_real_cagr",
+                "earnings_real_cagr",
+                "roe_vs_selic_spread",
+                "stress_profitability_frequency",
+                "positive_real_revenue_growth_frequency",
+            )
+        ]
+    return [
+        _real_growth_fact("revenue_real_cagr", periods, lambda item: item.revenue, macro),
+        _real_growth_fact("earnings_real_cagr", periods, lambda item: item.net_income, macro),
+        _roe_selic_spread(periods, macro),
+        _stress_profitability(periods, macro),
+        _positive_real_growth_frequency(periods, macro),
+    ]
+
+
+def _real_growth_fact(
+    key: str,
+    periods: list[FinancialPeriod],
+    getter: Callable[[FinancialPeriod], Decimal | None],
+    macro: MacroQualitySnapshot,
+) -> QualityFact:
+    observations = _observations(periods, getter)
+    if len(observations) < 3:
+        return _missing_fact(key, "ratio", "At least three annual observations are required")
+    first, last = observations[0], observations[-1]
+    inflation = Decimal("1")
+    matched_years = 0
+    for year in range(first.as_of.year + 1, last.as_of.year + 1):
+        annual_inflation = macro.inflation_by_year.get(year)
+        if annual_inflation is not None:
+            inflation *= Decimal("1") + annual_inflation
+            matched_years += 1
+    years = Decimal(str((last.as_of - first.as_of).days / 365.25))
+    value = (
+        _annualized_growth(first.value, last.value / inflation, years)
+        if matched_years >= 2
+        else None
+    )
+    return QualityFact(
+        key=key,
+        value=value,
+        unit="ratio",
+        as_of=last.as_of if value is not None else None,
+        source="cvm,bcb_sgs" if value is not None else None,
+        confidence=Decimal("0.88") if value is not None else Decimal("0"),
+        status="valid" if value is not None else "missing_data",
+        unavailable_reason=(
+            None
+            if value is not None
+            else "Comparable positive values and IPCA history are required"
+        ),
+        history=observations,
+    )
+
+
+def _roe_selic_spread(
+    periods: list[FinancialPeriod],
+    macro: MacroQualitySnapshot,
+) -> QualityFact:
+    observations = [
+        QualityFactObservation(as_of=item.period_end, value=roe - selic)
+        for item in periods
+        if (roe := _safe_ratio(item.net_income, item.equity)) is not None
+        and (selic := macro.selic_by_year.get(item.period_end.year)) is not None
+    ]
+    if len(observations) < 3:
+        return _missing_fact(
+            "roe_vs_selic_spread",
+            "ratio",
+            "At least three matched ROE and Selic observations are required",
+        )
+    return QualityFact(
+        key="roe_vs_selic_spread",
+        value=_median([item.value for item in observations]),
+        unit="ratio",
+        as_of=observations[-1].as_of,
+        source="cvm,bcb_sgs",
+        confidence=Decimal("0.88"),
+        status="valid",
+        history=observations,
+    )
+
+
+def _stress_profitability(
+    periods: list[FinancialPeriod],
+    macro: MacroQualitySnapshot,
+) -> QualityFact:
+    stress_years = {
+        2015,
+        2016,
+        2020,
+        *(
+            year
+            for year, annual_selic in macro.selic_by_year.items()
+            if annual_selic >= Decimal("0.12")
+        ),
+    }
+    observations = [
+        QualityFactObservation(as_of=item.period_end, value=item.net_income)
+        for item in periods
+        if item.period_end.year in stress_years and item.net_income is not None
+    ]
+    if len(observations) < 2:
+        return _missing_fact(
+            "stress_profitability_frequency",
+            "ratio",
+            "At least two public stress-period observations are required",
+        )
+    positives = sum(1 for item in observations if item.value > 0)
+    return QualityFact(
+        key="stress_profitability_frequency",
+        value=Decimal(positives) / Decimal(len(observations)),
+        unit="ratio",
+        as_of=observations[-1].as_of,
+        source="cvm,bcb_sgs",
+        confidence=Decimal("0.88"),
+        status="valid",
+        history=observations,
+    )
+
+
+def _positive_real_growth_frequency(
+    periods: list[FinancialPeriod],
+    macro: MacroQualitySnapshot,
+) -> QualityFact:
+    comparable = []
+    for previous, current in zip(periods, periods[1:], strict=False):
+        inflation = macro.inflation_by_year.get(current.period_end.year)
+        if (
+            previous.revenue is None
+            or previous.revenue <= 0
+            or current.revenue is None
+            or inflation is None
+        ):
+            continue
+        real_growth = current.revenue / previous.revenue / (Decimal("1") + inflation) - Decimal("1")
+        comparable.append(QualityFactObservation(as_of=current.period_end, value=real_growth))
+    if len(comparable) < 3:
+        return _missing_fact(
+            "positive_real_revenue_growth_frequency",
+            "ratio",
+            "At least three matched revenue and IPCA intervals are required",
+        )
+    positives = sum(1 for item in comparable if item.value > 0)
+    return QualityFact(
+        key="positive_real_revenue_growth_frequency",
+        value=Decimal(positives) / Decimal(len(comparable)),
+        unit="ratio",
+        as_of=comparable[-1].as_of,
+        source="cvm,bcb_sgs",
+        confidence=Decimal("0.88"),
+        status="valid",
+        history=comparable,
+    )
+
+
+def _peer_facts(
+    period: FinancialPeriod,
+    peers: list[SectorCompany],
+) -> list[QualityFact]:
+    reference = period.period_end
+    comparisons = (
+        (
+            "roe_vs_sector_median",
+            _safe_ratio(period.net_income, period.equity),
+            [_safe_ratio(item.period.net_income, item.period.equity) for item in peers],
+        ),
+        (
+            "roa_vs_sector_median",
+            _safe_ratio(period.net_income, period.total_assets),
+            [_safe_ratio(item.period.net_income, item.period.total_assets) for item in peers],
+        ),
+        (
+            "net_margin_vs_sector_median",
+            _safe_ratio(period.net_income, period.revenue),
+            [_safe_ratio(item.period.net_income, item.period.revenue) for item in peers],
+        ),
+        (
+            "equity_ratio_vs_sector_median",
+            _safe_ratio(period.equity, period.total_assets),
+            [_safe_ratio(item.period.equity, item.period.total_assets) for item in peers],
+        ),
+    )
+    facts = [
+        _peer_ratio_fact(key, value, samples, reference) for key, value, samples in comparisons
+    ]
+    sector_revenue = sum(
+        (
+            item.period.revenue
+            for item in peers
+            if item.period.revenue is not None and item.period.revenue > 0
+        ),
+        Decimal("0"),
+    )
+    facts.append(
+        _value_fact(
+            "listed_sector_revenue_share",
+            _safe_ratio(period.revenue, sector_revenue),
+            "ratio",
+            reference,
+            "cvm_sector_universe",
+            confidence=Decimal("0.70"),
+        )
+        if len(peers) >= 3
+        else _missing_fact(
+            "listed_sector_revenue_share",
+            "ratio",
+            "At least three listed sector peers are required",
+        )
+    )
+    return facts
+
+
+def _peer_ratio_fact(
+    key: str,
+    value: Decimal | None,
+    samples: list[Decimal | None],
+    reference: date,
+) -> QualityFact:
+    valid = [sample for sample in samples if sample is not None and sample > 0]
+    median = _median(valid) if len(valid) >= 3 else None
+    return (
+        _value_fact(
+            key,
+            _safe_ratio(value, median),
+            "multiple",
+            reference,
+            "cvm_sector_universe",
+            confidence=_PEER_CONFIDENCE,
+        )
+        if median is not None
+        else _missing_fact(key, "multiple", "At least three positive sector peers are required")
+    )
+
+
+def _market_scale_facts(opportunity: OpportunityResponse) -> list[QualityFact]:
+    metrics = opportunity.metrics
+    return [
+        _metric_fact("daily_traded_value", metrics.average_daily_traded_value, "currency"),
+        _metric_fact("market_capitalization", metrics.market_capitalization, "currency"),
+    ]
+
+
+def _metric_fact(key: str, metric: object, unit: str) -> QualityFact:
+    value = getattr(metric, "value", None)
+    sources = getattr(metric, "sources", [])
+    reference = getattr(metric, "as_of", None)
+    return _value_fact(
+        key,
+        value if isinstance(value, Decimal) else None,
+        unit,
+        reference if isinstance(reference, date) else None,
+        ",".join(str(source) for source in sources) or "public_market_data",
+        confidence=_MARKET_CONFIDENCE,
+    )
+
+
+def _dividend_facts(
+    periods: list[FinancialPeriod],
+    distributions: list[FundDistribution],
+) -> list[QualityFact]:
+    valid = sorted(
+        (item for item in distributions if item.value >= 0),
+        key=lambda item: item.ex_date,
+    )
+    if not valid:
+        return [
+            _missing_fact(key, "ratio", "Public dividend history is unavailable")
+            for key in (
+                "dividend_history_years",
+                "dividend_payment_frequency",
+                "dividend_stability",
+                "dividend_payout_sustainability",
+            )
+        ]
+    reference = valid[-1].ex_date
+    first_year = max(valid[0].ex_date.year, reference.year - 4)
+    annual_dividends = {
+        year: sum(
+            (item.value for item in valid if item.ex_date.year == year),
+            Decimal("0"),
+        )
+        for year in range(first_year, reference.year + 1)
+    }
+    positive = [value for value in annual_dividends.values() if value > 0]
+    history_years = Decimal(reference.year - valid[0].ex_date.year + 1)
+    payment_frequency = Decimal(len(positive)) / Decimal(len(annual_dividends))
+    stability = _coefficient_of_variation(positive) if len(positive) >= 3 else None
+    payout_samples = []
+    periods_by_year = {item.period_end.year: item for item in periods}
+    for year, dividend_per_share in annual_dividends.items():
+        period = periods_by_year.get(year)
+        if dividend_per_share <= 0 or period is None:
+            continue
+        earnings_per_share = _safe_ratio(period.net_income, period.shares_outstanding)
+        payout = _safe_ratio(dividend_per_share, earnings_per_share)
+        if payout is not None and payout >= 0:
+            payout_samples.append(payout)
+    sustainable = (
+        Decimal(sum(1 for payout in payout_samples if payout <= Decimal("1.20")))
+        / Decimal(len(payout_samples))
+        if len(payout_samples) >= 3
+        else None
+    )
+    source = ",".join(sorted({item.source for item in valid}))
+    return [
+        _value_fact(
+            "dividend_history_years",
+            history_years,
+            "years",
+            reference,
+            source,
+            confidence=_MARKET_CONFIDENCE,
+        ),
+        _value_fact(
+            "dividend_payment_frequency",
+            payment_frequency,
+            "ratio",
+            reference,
+            source,
+            confidence=_MARKET_CONFIDENCE,
+        ),
+        _value_fact(
+            "dividend_stability",
+            stability,
+            "ratio",
+            reference,
+            source,
+            confidence=Decimal("0.80"),
+        ),
+        _value_fact(
+            "dividend_payout_sustainability",
+            sustainable,
+            "ratio",
+            reference,
+            "cvm,public_distributions",
+            confidence=Decimal("0.80"),
+        ),
+    ]
+
+
+def _bank_facts(bank: BankQualitySnapshot | None) -> list[QualityFact]:
+    if bank is None:
+        return [
+            _missing_fact(key, "ratio", "BCB IFData evidence is unavailable")
+            for key in (
+                "basel_ratio",
+                "core_capital_ratio",
+                "regulatory_leverage_ratio",
+                "high_risk_credit_ratio",
+            )
+        ]
+    return [
+        _value_fact(
+            "basel_ratio",
+            bank.basel_ratio,
+            "ratio",
+            bank.capital_as_of,
+            "bcb_ifdata",
+            confidence=_BCB_CONFIDENCE,
+        ),
+        _value_fact(
+            "core_capital_ratio",
+            bank.core_capital_ratio,
+            "ratio",
+            bank.capital_as_of,
+            "bcb_ifdata",
+            confidence=_BCB_CONFIDENCE,
+        ),
+        _value_fact(
+            "regulatory_leverage_ratio",
+            bank.leverage_ratio,
+            "ratio",
+            bank.capital_as_of,
+            "bcb_ifdata",
+            confidence=_BCB_CONFIDENCE,
+        ),
+        _value_fact(
+            "high_risk_credit_ratio",
+            bank.high_risk_credit_ratio,
+            "ratio",
+            bank.credit_as_of,
+            "bcb_ifdata",
+            confidence=Decimal("0.78"),
+        ),
+    ]
 
 
 def _observations(
@@ -568,6 +1348,20 @@ _FINANCIAL_RANGES: dict[str, tuple[Decimal, Decimal]] = {
     "revenue_cagr": (Decimal("-0.8"), Decimal("2")),
     "earnings_cagr": (Decimal("-0.8"), Decimal("2")),
     "share_dilution": (Decimal("-0.5"), Decimal("0.5")),
+    "roe_5y_median": (Decimal("-2"), Decimal("3")),
+    "cash_conversion_median": (Decimal("-5"), Decimal("8")),
+    "revenue_real_cagr": (Decimal("-0.8"), Decimal("2")),
+    "earnings_real_cagr": (Decimal("-0.8"), Decimal("2")),
+    "roe_vs_selic_spread": (Decimal("-2"), Decimal("3")),
+    "roe_vs_sector_median": (Decimal("-10"), Decimal("20")),
+    "roa_vs_sector_median": (Decimal("-10"), Decimal("20")),
+    "net_margin_vs_sector_median": (Decimal("-10"), Decimal("20")),
+    "equity_ratio_vs_sector_median": (Decimal("-10"), Decimal("20")),
+    "listed_sector_revenue_share": (Decimal("0"), Decimal("1")),
+    "basel_ratio": (Decimal("0"), Decimal("1")),
+    "core_capital_ratio": (Decimal("0"), Decimal("1")),
+    "regulatory_leverage_ratio": (Decimal("0"), Decimal("1")),
+    "high_risk_credit_ratio": (Decimal("0"), Decimal("1")),
 }
 
 
@@ -746,14 +1540,14 @@ def _nav_growth(reports: list[FundMonthlyReport]) -> QualityFact:
 
 
 def _nav_return_volatility(reports: list[FundMonthlyReport]) -> QualityFact:
-    observations = [item for item in reports[-36:] if item.monthly_nav_return is not None]
+    observations = _nav_return_observations(reports[-36:])
     if len(observations) < 6:
         return _missing_fact(
             "nav_return_volatility",
             "ratio",
             "At least six monthly NAV returns are required",
         )
-    values = [value for item in observations if (value := item.monthly_nav_return) is not None]
+    values = [item.value for item in observations]
     average = sum(values, Decimal("0")) / Decimal(len(values))
     variance = sum(((value - average) ** 2 for value in values), Decimal("0")) / Decimal(
         len(values)
@@ -769,16 +1563,14 @@ def _nav_return_volatility(reports: list[FundMonthlyReport]) -> QualityFact:
 
 
 def _positive_nav_return_frequency(reports: list[FundMonthlyReport]) -> QualityFact:
-    observations = [item for item in reports[-36:] if item.monthly_nav_return is not None]
+    observations = _nav_return_observations(reports[-36:])
     if len(observations) < 6:
         return _missing_fact(
             "positive_nav_return_frequency",
             "ratio",
             "At least six monthly NAV returns are required",
         )
-    positive = sum(
-        1 for item in observations if (value := item.monthly_nav_return) is not None and value >= 0
-    )
+    positive = sum(1 for item in observations if item.value >= 0)
     return _value_fact(
         "positive_nav_return_frequency",
         Decimal(positive) / Decimal(len(observations)),
@@ -787,6 +1579,24 @@ def _positive_nav_return_frequency(reports: list[FundMonthlyReport]) -> QualityF
         _CVM_SOURCE,
         confidence=_DERIVED_CONFIDENCE,
     )
+
+
+def _nav_return_observations(
+    reports: list[FundMonthlyReport],
+) -> list[QualityFactObservation]:
+    observations = []
+    for index, current in enumerate(reports):
+        value = current.monthly_nav_return
+        if (
+            value is None
+            and index > 0
+            and reports[index - 1].nav_per_share > 0
+            and current.nav_per_share > 0
+        ):
+            value = current.nav_per_share / reports[index - 1].nav_per_share - Decimal("1")
+        if value is not None:
+            observations.append(QualityFactObservation(as_of=current.as_of, value=value))
+    return observations
 
 
 def _nav_max_drawdown(reports: list[FundMonthlyReport]) -> QualityFact:
@@ -883,6 +1693,70 @@ def _safe_ratio(
         return None
     value = numerator / denominator
     return value if value.is_finite() else None
+
+
+def _median(values: list[Decimal]) -> Decimal | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / Decimal("2")
+
+
+def _coefficient_of_variation(values: list[Decimal]) -> Decimal | None:
+    if len(values) < 2:
+        return None
+    average = sum(values, Decimal("0")) / Decimal(len(values))
+    if average <= 0:
+        return None
+    variance = sum(((value - average) ** 2 for value in values), Decimal("0")) / Decimal(
+        len(values)
+    )
+    return Decimal(str(float(variance) ** 0.5)) / average
+
+
+def _sector_peers(
+    snapshot: FundamentalsSnapshot,
+    universe: dict[str, list[SectorCompany]],
+    profile: str,
+) -> list[SectorCompany]:
+    if profile not in {"bank", "insurer"}:
+        return universe.get(snapshot.sector or "", [])
+    return [
+        company
+        for companies in universe.values()
+        for company in companies
+        if _stock_profile(company.sector, company.company_name) == profile
+    ]
+
+
+def _stock_profile(sector: str | None, company_name: str | None = None) -> str:
+    folded = _fold(f"{sector or ''} {company_name or ''}")
+    if any(token in folded for token in ("BANCO", "BCO ", "INTERMEDIAR", "SERVICOS FINANCEIROS")):
+        return "bank"
+    if any(token in folded for token in ("SEGURO", "SEGURIDADE", "PREVIDENCIA")):
+        return "insurer"
+    if any(
+        token in folded
+        for token in (
+            "PETROLEO",
+            "MINERACAO",
+            "SIDERURGIA",
+            "METALURGIA",
+            "PAPEL E CELULOSE",
+        )
+    ):
+        return "commodity"
+    if any(token in folded for token in ("ENERGIA ELETRICA", "SANEAMENTO", "GAS")):
+        return "utility"
+    return "industrial"
+
+
+def _fold(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return " ".join(normalized.encode("ascii", "ignore").decode("ascii").upper().split())
 
 
 def _subtract(left: Decimal | None, right: Decimal | None) -> Decimal | None:
