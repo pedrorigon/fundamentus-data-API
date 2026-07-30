@@ -14,8 +14,10 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-# Legal forms and connectives carry no identifying information.
-_NOISE_TOKENS = frozenset(
+# Legal forms and connectives carry no identifying information, but business
+# qualifiers remain useful for distinguishing a listed operating company from
+# a historical holding with the same short name.
+_LEGAL_NOISE_TOKENS = frozenset(
     {
         "SA",
         "S",
@@ -32,6 +34,11 @@ _NOISE_TOKENS = frozenset(
         "DAS",
         "E",
         "EM",
+    }
+)
+
+_NOISE_TOKENS = _LEGAL_NOISE_TOKENS | frozenset(
+    {
         "PARTICIPACOES",
         "PARTICIPACAO",
         "PART",
@@ -80,11 +87,19 @@ class CompanyMatch:
 
 def normalize_company_name(name: str) -> str:
     """Reduce a corporate name to its identifying tokens."""
+    return _normalize_company_name(name, _NOISE_TOKENS)
+
+
+def _normalize_legal_name(name: str) -> str:
+    return _normalize_company_name(name, _LEGAL_NOISE_TOKENS)
+
+
+def _normalize_company_name(name: str, noise_tokens: frozenset[str]) -> str:
     folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").upper()
     folded = folded.replace("S/A", " SA ").replace("S.A.", " SA ")
     folded = re.sub(r"[^A-Z0-9]+", " ", folded)
     tokens = [_SYNONYMS.get(token, token) for token in folded.split() if token]
-    meaningful = [token for token in tokens if token not in _NOISE_TOKENS]
+    meaningful = [token for token in tokens if token not in noise_tokens]
     # Fall back to the raw tokens when a name is made entirely of noise words.
     return " ".join(meaningful or tokens)
 
@@ -100,6 +115,15 @@ def match_company(
     """
     target = normalize_company_name(corporate_name)
     if not target:
+        return None
+
+    legal_target = _normalize_legal_name(corporate_name)
+    legal_names = {cnpj: _normalize_legal_name(name) for cnpj, name in candidates.items()}
+    legal_exact = [cnpj for cnpj, name in legal_names.items() if name == legal_target]
+    if len(legal_exact) == 1:
+        cnpj = legal_exact[0]
+        return CompanyMatch(cnpj, candidates[cnpj], "high")
+    if len(legal_exact) > 1:
         return None
 
     normalized = {cnpj: normalize_company_name(name) for cnpj, name in candidates.items()}

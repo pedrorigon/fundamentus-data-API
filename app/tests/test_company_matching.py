@@ -32,6 +32,20 @@ def test_matches_exact_normalized_name() -> None:
     assert match.confidence == "high"
 
 
+def test_prefers_exact_legal_name_over_historical_holding() -> None:
+    match = match_company(
+        "TIM S.A.",
+        {
+            "02421421000111": "TIM S.A.",
+            "02558115000121": "TIM PARTICIPACOES S.A.",
+        },
+    )
+
+    assert match is not None
+    assert match.cnpj == "02421421000111"
+    assert match.confidence == "high"
+
+
 def test_matches_abbreviated_filing_name() -> None:
     match = match_company(
         "BANCO BRADESCO S.A.",
