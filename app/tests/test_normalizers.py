@@ -31,3 +31,21 @@ def test_normalize_key_and_ticker() -> None:
     assert normalize_ticker(" itub4 ") == "ITUB4"
     with pytest.raises(ValueError):
         normalize_ticker("bad ticker")
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    ["O", "KO", "VZ", "SPY", "VNQ", "AAPL", "BRK.B", "VUAA.L", "PETR4"],
+)
+def test_normalize_ticker_accepts_international_symbols(ticker: str) -> None:
+    """A four-character minimum rejected real NYSE, LSE and share-class symbols."""
+    assert normalize_ticker(ticker.lower()) == ticker
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    ["", ".", "-", "A.", ".A", "A--B", "TOOLONGTICKER12", "AB CD", "PE#R4"],
+)
+def test_normalize_ticker_still_rejects_malformed_symbols(ticker: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_ticker(ticker)
