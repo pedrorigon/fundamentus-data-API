@@ -44,6 +44,15 @@ from app.models.historical_quotes import (
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
 )
+from app.models.quality import (
+    QualityAssetFacts,
+    QualityAssetKind,
+    QualityAssetRequest,
+    QualityFact,
+    QualityFactObservation,
+    QualityFactsRequest,
+    QualityFactsResponse,
+)
 
 __all__ = [
     "AssetDetails",
@@ -84,4 +93,11 @@ __all__ = [
     "HistoricalQuote",
     "HistoricalQuoteRequest",
     "HistoricalQuoteResponse",
+    "QualityAssetFacts",
+    "QualityAssetKind",
+    "QualityAssetRequest",
+    "QualityFact",
+    "QualityFactObservation",
+    "QualityFactsRequest",
+    "QualityFactsResponse",
 ]

@@ -16,6 +16,7 @@ from app.services import (
     HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
+    QualityFactsService,
 )
 
 
@@ -33,10 +34,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     asset_service = AssetService(scraper, cache, settings)
     app.state.asset_service = asset_service
     app.state.opportunity_service = OpportunityService(asset_service, settings)
-    app.state.instrument_data_service = InstrumentDataService(settings)
+    instrument_data_service = InstrumentDataService(settings)
+    app.state.instrument_data_service = instrument_data_service
     app.state.fixed_income_valuation_service = FixedIncomeValuationService(settings, cache)
     app.state.historical_quote_service = HistoricalQuoteService(settings, cache)
-    app.state.fundamentals_service = FundamentalsService(settings, cache)
+    fundamentals_service = FundamentalsService(settings, cache)
+    app.state.fundamentals_service = fundamentals_service
+    app.state.quality_facts_service = QualityFactsService(
+        fundamentals_service,
+        instrument_data_service,
+        app.state.opportunity_service,
+    )
     try:
         yield
     finally:
