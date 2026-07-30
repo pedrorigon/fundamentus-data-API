@@ -44,6 +44,12 @@ ACCOUNT_INVESTING_CASH_FLOW = "6.02"
 # Depreciation lines live under the cash-flow statement with company-specific
 # sub-codes, so they are matched by label instead of code.
 _DEPRECIATION_TOKENS = ("DEPRECIA", "AMORTIZA")
+_MEANINGFUL_ACCOUNT_CODES = (
+    ACCOUNT_REVENUE,
+    ACCOUNT_NET_INCOME,
+    ACCOUNT_EQUITY,
+    ACCOUNT_TOTAL_ASSETS,
+)
 
 
 @dataclass(frozen=True)
@@ -320,9 +326,10 @@ def _prefer(
     *,
     prefer_consolidated: bool,
 ) -> _PeriodAccumulator:
-    eligible = candidates
+    meaningful = [candidate for candidate in candidates if _has_meaningful_financials(candidate)]
+    eligible = meaningful or candidates
     if prefer_consolidated:
-        consolidated = [candidate for candidate in candidates if candidate.consolidated]
+        consolidated = [candidate for candidate in eligible if candidate.consolidated]
         if consolidated:
             eligible = consolidated
     return max(
@@ -332,6 +339,13 @@ def _prefer(
             candidate.published_at or date.min,
             len(candidate.accounts),
         ),
+    )
+
+
+def _has_meaningful_financials(candidate: _PeriodAccumulator) -> bool:
+    return any(
+        candidate.accounts.get(code) not in {None, Decimal("0")}
+        for code in _MEANINGFUL_ACCOUNT_CODES
     )
 
 
