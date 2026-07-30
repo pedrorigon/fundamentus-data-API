@@ -32,7 +32,7 @@ SOURCE_CVM = "cvm"
 STATUS_VALID = "valid"
 STATUS_MISSING = "missing_data"
 
-_CACHE_PREFIX = "fundamentals:v6"
+_CACHE_PREFIX = "fundamentals:v7"
 _MINIMUM_PEERS = 3
 
 

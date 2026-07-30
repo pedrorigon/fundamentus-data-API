@@ -194,6 +194,23 @@ def test_falls_back_to_individual_when_consolidated_absent() -> None:
     assert period.account(ACCOUNT_REVENUE) == Decimal("400000")
 
 
+def test_falls_back_to_individual_when_consolidated_values_are_zero() -> None:
+    payload = build_archive(
+        [statement_row(ACCOUNT_REVENUE, "0.0000000000")],
+        extra={
+            "dfp_cia_aberta_DRE_ind_2024.csv": [
+                STATEMENT_HEADER,
+                statement_row(ACCOUNT_REVENUE, "400.0000000000"),
+            ]
+        },
+    )
+
+    period = parse_statement_archive(payload)[CNPJ_DIGITS][0]
+
+    assert period.consolidated is False
+    assert period.account(ACCOUNT_REVENUE) == Decimal("400000")
+
+
 def test_captures_depreciation_by_label() -> None:
     payload = build_archive(
         [
