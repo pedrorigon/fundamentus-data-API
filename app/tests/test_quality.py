@@ -26,6 +26,7 @@ from app.models import (
     OpportunityMetric,
     OpportunityMetrics,
     OpportunityResponse,
+    SectorCompany,
 )
 from app.models.quality import (
     QualityAssetKind,
@@ -33,6 +34,7 @@ from app.models.quality import (
     QualityFactsRequest,
     QualityFactsResponse,
 )
+from app.services.bcb_quality import BankQualitySnapshot, MacroQualitySnapshot
 from app.services.quality import QualityFactsService
 
 TODAY = date(2026, 7, 30)
@@ -97,6 +99,8 @@ def opportunity_metrics() -> OpportunityMetrics:
         bazin_price=metric(),
         min_52_weeks=metric("8"),
         max_52_weeks=metric("12"),
+        average_daily_traded_value=metric("50000000"),
+        market_capitalization=metric("50000000000"),
     )
 
 
@@ -158,6 +162,7 @@ def annual_period(year: int, revenue: str, shares: str) -> FinancialPeriod:
 
 def stock_snapshot() -> FundamentalsSnapshot:
     periods = [
+        annual_period(2021, "700", "99"),
         annual_period(2022, "800", "100"),
         annual_period(2023, "900", "101"),
         annual_period(2024, "1000", "102"),
@@ -280,6 +285,150 @@ async def test_resolves_complete_domestic_stock_quality_facts() -> None:
     assert fundamentals.calls == ["TEST3"]
 
 
+async def test_resolves_bank_specific_macro_peer_and_prudential_facts() -> None:
+    sector = "Intermediários Financeiros"
+    snapshot = stock_snapshot().model_copy(
+        update={
+            "ticker": "ITUB4",
+            "company_name": "ITAU UNIBANCO HOLDING S.A.",
+            "sector": sector,
+        }
+    )
+
+    class FundamentalsWithPeers(FundamentalsStub):
+        async def sector_universe(self) -> dict[str, list[SectorCompany]]:
+            peer_periods = [
+                annual_period(2024, revenue, "100") for revenue in ("800", "900", "1000")
+            ]
+            return {
+                sector: [
+                    SectorCompany(
+                        cnpj=str(index),
+                        company_name=f"Peer {index}",
+                        sector=sector,
+                        period=period,
+                    )
+                    for index, period in enumerate(peer_periods)
+                ]
+            }
+
+    class MacroStub:
+        async def snapshot(self) -> MacroQualitySnapshot:
+            return MacroQualitySnapshot(
+                inflation_by_year={
+                    2022: Decimal("0.058"),
+                    2023: Decimal("0.045"),
+                    2024: Decimal("0.048"),
+                },
+                selic_by_year={
+                    2021: Decimal("0.07"),
+                    2022: Decimal("0.12"),
+                    2023: Decimal("0.13"),
+                    2024: Decimal("0.11"),
+                },
+                as_of=TODAY,
+            )
+
+    class BankStub:
+        async def snapshot(self, company_name: str) -> BankQualitySnapshot:
+            assert company_name == "ITAU UNIBANCO HOLDING S.A."
+            return BankQualitySnapshot(
+                basel_ratio=Decimal("0.147697"),
+                core_capital_ratio=Decimal("0.119663"),
+                leverage_ratio=Decimal("0.064760"),
+                high_risk_credit_ratio=Decimal("0.032"),
+                capital_as_of=date(2026, 3, 1),
+                credit_as_of=date(2024, 12, 1),
+            )
+
+    instrument = InstrumentMetadata(
+        ticker="ITUB4",
+        name="ITAU UNIBANCO HOLDING S.A.",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+        isin="BRITUBACNPR1",
+    )
+    distributions = [
+        FundDistribution(
+            ex_date=date(year, 6, 15),
+            value=Decimal("0.10"),
+            source="b3",
+        )
+        for year in range(2022, 2025)
+    ]
+    service = QualityFactsService(
+        FundamentalsWithPeers(snapshot),  # type: ignore[arg-type]
+        InstrumentsStub({"ITUB4": instrument_data("ITUB4", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "ITUB4": opportunity(
+                    "ITUB4",
+                    instrument,
+                    distributions=distributions,
+                )
+            }
+        ),  # type: ignore[arg-type]
+        macro_provider=MacroStub(),  # type: ignore[arg-type]
+        bank_provider=BankStub(),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="ITUB4", kind=QualityAssetKind.stock)]
+            )
+        )
+    ).assets[0]
+    facts = {fact.key: fact for fact in result.facts}
+
+    assert result.profile == "bank"
+    assert facts["basel_ratio"].value == Decimal("0.147697")
+    assert facts["high_risk_credit_ratio"].value == Decimal("0.032")
+    assert facts["roe_vs_sector_median"].value is not None
+    assert facts["roe_vs_selic_spread"].value is not None
+    assert facts["revenue_real_cagr"].value is not None
+    assert facts["daily_traded_value"].value == Decimal("50000000")
+    assert facts["market_capitalization"].value == Decimal("50000000000")
+    assert "bcb_ifdata" in result.sources
+
+
+@pytest.mark.parametrize(
+    ("sector", "company_name", "expected_profile"),
+    [
+        ("Holdings Diversificadas", "BB SEGURIDADE PARTICIPACOES S.A.", "insurer"),
+        ("Energia Elétrica", "Electric Company", "utility"),
+        ("Petróleo, Gás e Biocombustíveis", "Oil Company", "commodity"),
+    ],
+)
+async def test_classifies_stock_methodology_from_registered_sector(
+    sector: str,
+    company_name: str,
+    expected_profile: str,
+) -> None:
+    snapshot = stock_snapshot().model_copy(update={"sector": sector, "company_name": company_name})
+    instrument = InstrumentMetadata(
+        ticker="SECT3",
+        name="Sector Company",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+    )
+    service = QualityFactsService(
+        FundamentalsStub(snapshot),  # type: ignore[arg-type]
+        InstrumentsStub({"SECT3": instrument_data("SECT3", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({"SECT3": opportunity("SECT3", instrument)}),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="SECT3", kind=QualityAssetKind.stock)]
+            )
+        )
+    ).assets[0]
+
+    assert result.profile == expected_profile
+
+
 async def test_financial_facts_preserve_missing_history_and_zero_denominator() -> None:
     period = annual_period(2024, "1000", "100").model_copy(
         update={
@@ -355,6 +504,48 @@ async def test_financial_facts_reject_implausible_cross_checked_growth() -> None
     assert facts["earnings_cagr"].status == "missing_data"
     assert facts["share_dilution"].status == "missing_data"
     assert len(result.warnings) == 3
+
+
+async def test_share_dilution_uses_only_the_latest_five_annual_periods() -> None:
+    periods = [
+        annual_period(2019, "700", "10"),
+        annual_period(2020, "750", "20"),
+        annual_period(2021, "800", "100"),
+        annual_period(2022, "850", "100"),
+        annual_period(2023, "900", "99"),
+        annual_period(2024, "950", "98"),
+        annual_period(2025, "1000", "97"),
+    ]
+    snapshot = FundamentalsSnapshot(
+        ticker="SPLT3",
+        sector="Bens Industriais",
+        periods=periods,
+        trailing_twelve_months=periods[-1],
+    )
+    instrument = InstrumentMetadata(
+        ticker="SPLT3",
+        name="Split History",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+    )
+    service = QualityFactsService(
+        FundamentalsStub(snapshot),  # type: ignore[arg-type]
+        InstrumentsStub({"SPLT3": instrument_data("SPLT3", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({"SPLT3": opportunity("SPLT3", instrument)}),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="SPLT3", kind=QualityAssetKind.stock)]
+            )
+        )
+    ).assets[0]
+    dilution = next(fact for fact in result.facts if fact.key == "share_dilution")
+
+    assert dilution.status == "valid"
+    assert dilution.value is not None
+    assert dilution.value < 0
 
 
 async def test_reports_stock_snapshot_resolution_failure() -> None:
@@ -472,6 +663,7 @@ async def test_resolves_etf_cost_scale_and_diversification_facts() -> None:
     )
 
     facts = {fact.key: fact.value for fact in response.assets[0].facts}
+    assert response.assets[0].profile == "broad"
     assert facts["holdings_count"] == Decimal("3")
     assert facts["top_ten_concentration"] == Decimal("100")
     assert facts["holdings_hhi"] == Decimal("0.3450")
@@ -492,6 +684,49 @@ async def test_reports_missing_etf_profile() -> None:
     )
 
     assert response.assets[0].unavailable_reason == "No public fund profile was resolved"
+
+
+@pytest.mark.parametrize(
+    ("description", "sectors", "expected_profile"),
+    [
+        ("Bitcoin exchange traded fund", [], "crypto"),
+        ("Global aggregate bond fund", [], "fixed_income"),
+        (
+            "Sector equity fund",
+            [FundAllocation(name="Technology", weight=Decimal("0.70"))],
+            "thematic",
+        ),
+    ],
+)
+async def test_classifies_etf_methodology_from_public_profile(
+    description: str,
+    sectors: list[FundAllocation],
+    expected_profile: str,
+) -> None:
+    instrument = InstrumentMetadata(ticker="ETF", instrument_type=InstrumentType.etf)
+    profile = FundProfile(
+        description=description,
+        net_assets=Decimal("100000000"),
+        inception_date=date(2020, 1, 1),
+        holdings=[FundHolding(symbol="A", weight=Decimal("1"))],
+        sectors=sectors,
+        source="public_fund_profile",
+    )
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ETF": instrument_data("ETF", instrument, fund_profile=profile)}),  # type: ignore[arg-type]
+        OpportunityStub({"ETF": opportunity("ETF", instrument)}),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="ETF", kind=QualityAssetKind.etf)]
+            )
+        )
+    ).assets[0]
+
+    assert result.profile == expected_profile
 
 
 async def test_resolves_fund_reporting_and_distribution_stability() -> None:
@@ -580,6 +815,60 @@ async def test_fund_with_short_history_explains_missing_stability() -> None:
     assert "six distributions" in (facts["distribution_stability"].unavailable_reason or "")
 
 
+async def test_fi_infra_derives_monthly_nav_returns_from_daily_cvm_history() -> None:
+    instrument = InstrumentMetadata(
+        ticker="JURO11",
+        instrument_type=InstrumentType.fi_infra,
+    )
+    reports = [
+        FundMonthlyReport(
+            as_of=date(2025 + index // 12, index % 12 + 1, 28),
+            nav_per_share=Decimal("100") + Decimal(index),
+        )
+        for index in range(18)
+    ]
+    distributions = [
+        FundDistribution(
+            ex_date=date(2025 + index // 12, index % 12 + 1, 15),
+            value=Decimal("1"),
+            source="public",
+        )
+        for index in range(18)
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"JURO11": instrument_data("JURO11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "JURO11": opportunity(
+                    "JURO11",
+                    instrument,
+                    reports=reports,
+                    distributions=distributions,
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[
+                    QualityAssetRequest(
+                        ticker="JURO11",
+                        kind=QualityAssetKind.real_estate_fund,
+                    )
+                ]
+            )
+        )
+    ).assets[0]
+    facts = {fact.key: fact for fact in result.facts}
+
+    assert result.profile == "fi_infra"
+    assert facts["nav_return_volatility"].value is not None
+    assert facts["positive_nav_return_frequency"].value == Decimal("1")
+
+
 async def test_fund_facts_measure_nav_preservation_reporting_and_distribution_cuts() -> None:
     instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
     reports = [
@@ -588,6 +877,20 @@ async def test_fund_facts_measure_nav_preservation_reporting_and_distribution_cu
             nav_per_share=Decimal("100") + Decimal(index),
             monthly_distribution_yield=Decimal("0.001"),
             monthly_nav_return=Decimal("0.005"),
+            net_assets=(Decimal("100") + Decimal(index))
+            * (Decimal("1100000") if index >= 12 else Decimal("1000000")),
+            issued_shares=Decimal("1100000") if index >= 12 else Decimal("1000000"),
+            shareholder_count=Decimal("10000") + Decimal(index * 100),
+            administration_fee_ratio=Decimal("0.008"),
+            total_assets=(Decimal("100") + Decimal(index))
+            * (Decimal("1100000") if index >= 12 else Decimal("1000000"))
+            + Decimal("10000000"),
+            total_liabilities=Decimal("10000000"),
+            property_assets=(Decimal("95") + Decimal(index)) * Decimal("1000000"),
+            credit_assets=Decimal("0"),
+            liquid_assets=Decimal("10000000"),
+            inception_date=date(2016, 1, 1),
+            administrator="TRUSTED ADMIN",
         )
         for index in range(24)
     ]
@@ -620,12 +923,14 @@ async def test_fund_facts_measure_nav_preservation_reporting_and_distribution_cu
                 QualityAssetRequest(
                     ticker="FUND11",
                     kind=QualityAssetKind.real_estate_fund,
+                    profile="indeterminado",
                 )
             ]
         )
     )
 
     facts = {fact.key: fact for fact in response.assets[0].facts}
+    assert response.assets[0].profile == "brick"
     assert facts["reporting_regularity"].value == Decimal("1")
     assert facts["report_completeness"].value == Decimal("1")
     assert facts["nav_growth"].value is not None
@@ -634,6 +939,14 @@ async def test_fund_facts_measure_nav_preservation_reporting_and_distribution_cu
     assert facts["nav_max_drawdown"].value == Decimal("0")
     assert facts["distribution_growth"].value is not None
     assert facts["distribution_cut_frequency"].value is not None
+    assert facts["net_assets"].value == Decimal("135300000")
+    assert facts["shareholder_count"].value == Decimal("12300")
+    assert facts["administration_fee_ratio"].value == Decimal("0.008")
+    assert facts["administrator_stability"].value == Decimal("1")
+    assert facts["daily_traded_value"].value == Decimal("50000000")
+    assert facts["property_allocation"].value is not None
+    assert facts["issuance_nav_preservation"].value == Decimal("1")
+    assert facts["nav_total_consistency_error"].value == Decimal("0")
     consistency = facts["distribution_report_consistency_error"].value
     assert consistency is not None
     assert consistency > Decimal("0.25")

@@ -11,6 +11,8 @@ from app.core.errors import register_error_handlers
 from app.scrapers import FundamentusClient, FundamentusScraper
 from app.services import (
     AssetService,
+    BcbBankProvider,
+    BcbMacroProvider,
     FixedIncomeValuationService,
     FundamentalsService,
     HistoricalQuoteService,
@@ -44,6 +46,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         fundamentals_service,
         instrument_data_service,
         app.state.opportunity_service,
+        macro_provider=BcbMacroProvider(settings),
+        bank_provider=BcbBankProvider(settings),
     )
     try:
         yield
