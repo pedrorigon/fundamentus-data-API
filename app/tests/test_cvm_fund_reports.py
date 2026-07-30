@@ -72,12 +72,9 @@ def test_fii_parser_rejects_archives_without_required_members_or_matches() -> No
     payload = _zip(
         {
             "geral.csv": (
-                "CNPJ_Fundo_Classe;Nome_Fundo_Classe;Codigo_ISIN\n"
-                "1;OTHER;BROTHER00000\n"
+                "CNPJ_Fundo_Classe;Nome_Fundo_Classe;Codigo_ISIN\n1;OTHER;BROTHER00000\n"
             ),
-            "complemento.csv": (
-                "CNPJ_Fundo_Classe;Data_Referencia;Valor_Patrimonial_Cotas\n"
-            ),
+            "complemento.csv": ("CNPJ_Fundo_Classe;Data_Referencia;Valor_Patrimonial_Cotas\n"),
         }
     )
     assert parse_fii_reports(payload, _instrument()).reports == ()
@@ -124,9 +121,7 @@ def test_daily_fund_parser_keeps_the_last_nav_of_each_month() -> None:
 
     result = parse_daily_fund_reports(payload, "42730834000100")
 
-    assert result == (
-        result[0],
-    )
+    assert result == (result[0],)
     assert result[0].as_of == date(2026, 7, 24)
     assert result[0].nav_per_share == Decimal("99.75")
 
@@ -136,8 +131,7 @@ def test_report_series_merge_prefers_the_cnpj_with_more_observations() -> None:
         _zip(
             {
                 "inf_diario_fi_202601.csv": (
-                    "CNPJ_FUNDO_CLASSE;DT_COMPTC;VL_QUOTA\n"
-                    "1;2026-01-30;10\n"
+                    "CNPJ_FUNDO_CLASSE;DT_COMPTC;VL_QUOTA\n1;2026-01-30;10\n"
                 )
             }
         ),
@@ -147,9 +141,7 @@ def test_report_series_merge_prefers_the_cnpj_with_more_observations() -> None:
         _zip(
             {
                 "inf_diario_fi_202602.csv": (
-                    "CNPJ_FUNDO_CLASSE;DT_COMPTC;VL_QUOTA\n"
-                    "2;2026-01-30;20\n"
-                    "2;2026-02-27;21\n"
+                    "CNPJ_FUNDO_CLASSE;DT_COMPTC;VL_QUOTA\n2;2026-01-30;20\n2;2026-02-27;21\n"
                 )
             }
         ),
@@ -176,8 +168,7 @@ async def test_provider_loads_fi_infra_archives_once_and_handles_missing_months(
     payload = _zip(
         {
             "inf_diario_fi_202607.csv": (
-                "CNPJ_FUNDO_CLASSE;DT_COMPTC;VL_QUOTA\n"
-                "42.730.834/0001-00;2026-07-24;99.75\n"
+                "CNPJ_FUNDO_CLASSE;DT_COMPTC;VL_QUOTA\n42.730.834/0001-00;2026-07-24;99.75\n"
             )
         }
     )
@@ -267,12 +258,18 @@ async def test_provider_ignores_unsupported_or_unidentified_instruments() -> Non
     provider = CvmFundReportProvider(Settings(), httpx.MockTransport(lambda _: httpx.Response(500)))
 
     assert await provider.reports(None) == FundReportSeries()
-    assert await provider.reports(
-        InstrumentMetadata(ticker="TEST3", instrument_type=InstrumentType.stock)
-    ) == FundReportSeries()
-    assert await provider.reports(
-        InstrumentMetadata(ticker="JURO11", instrument_type=InstrumentType.fi_infra)
-    ) == FundReportSeries()
+    assert (
+        await provider.reports(
+            InstrumentMetadata(ticker="TEST3", instrument_type=InstrumentType.stock)
+        )
+        == FundReportSeries()
+    )
+    assert (
+        await provider.reports(
+            InstrumentMetadata(ticker="JURO11", instrument_type=InstrumentType.fi_infra)
+        )
+        == FundReportSeries()
+    )
 
     failing = CvmFundReportProvider(
         Settings(),
