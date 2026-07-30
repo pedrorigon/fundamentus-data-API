@@ -263,6 +263,61 @@ async def test_registry_is_fetched_once_across_calls(tmp_path: Path) -> None:
     assert provider.registry_calls == 1
 
 
+async def test_sector_universe_compares_trailing_twelve_month_periods(tmp_path: Path) -> None:
+    annual = archive(2024, [period(date(2024, 12, 31), revenue="1000")])
+    prior_interim = StatementArchive(
+        kind=StatementKind.QUARTERLY,
+        year=2024,
+        periods={
+            CNPJ: [
+                period(
+                    date(2024, 3, 31),
+                    start=date(2024, 1, 1),
+                    revenue="200",
+                )
+            ]
+        },
+        share_capital={},
+    )
+    current_interim = StatementArchive(
+        kind=StatementKind.QUARTERLY,
+        year=2025,
+        periods={
+            CNPJ: [
+                period(
+                    date(2025, 3, 31),
+                    start=date(2025, 1, 1),
+                    revenue="300",
+                )
+            ]
+        },
+        share_capital={},
+    )
+    provider = StubProvider(
+        {
+            ("dfp", 2024): annual,
+            ("itr", 2024): prior_interim,
+            ("itr", 2025): current_interim,
+        },
+        registry={
+            CNPJ: CompanyRegistration(
+                cnpj=CNPJ,
+                cvm_code="001",
+                corporate_name=COMPANY,
+                trade_name=None,
+                sector="Comércio",
+                status="ATIVO",
+            )
+        },
+    )
+    service = await build(tmp_path, provider)
+
+    universe = await service.sector_universe(reference=date(2025, 4, 30))
+
+    assert universe["Comércio"][0].period.period_end == date(2025, 3, 31)
+    assert universe["Comércio"][0].period.revenue == Decimal("1100")
+
+
 async def test_missing_sector_is_reported_as_none(tmp_path: Path) -> None:
     provider = StubProvider({("dfp", 2024): archive(2024, [period(date(2024, 12, 31))])})
     service = await build(tmp_path, provider)

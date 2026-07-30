@@ -223,26 +223,26 @@ class FundamentalsService:
             return {}
         sectors = await self._sectors()
 
-        latest: dict[str, StatementPeriod] = {}
+        statements_by_company: dict[str, list[StatementPeriod]] = {}
         for archive in archives:
             for cnpj, periods in archive.items():
-                for statement in periods:
-                    current = latest.get(cnpj)
-                    if current is None or statement.period_end > current.period_end:
-                        latest[cnpj] = statement
+                statements_by_company.setdefault(cnpj, []).extend(periods)
 
         universe: dict[str, list[SectorCompany]] = {}
-        for cnpj, statement in latest.items():
+        for cnpj, statements in statements_by_company.items():
             sector = sectors.get(cnpj)
             if not sector:
                 continue
-            period = build_period(statement, sector=sector)
-            if period.equity is None or period.equity <= 0:
+            built_periods = _unique_periods(
+                build_period(statement, sector=sector) for statement in statements
+            )
+            period = trailing_twelve_months(built_periods)
+            if period is None or period.equity is None or period.equity <= 0:
                 continue
             universe.setdefault(sector, []).append(
                 SectorCompany(
                     cnpj=cnpj,
-                    company_name=statement.company_name,
+                    company_name=statements[0].company_name,
                     sector=sector,
                     period=period,
                 )

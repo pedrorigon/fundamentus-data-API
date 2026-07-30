@@ -27,6 +27,18 @@ class FundReportPoint:
     monthly_distribution_yield: Decimal | None = None
     monthly_nav_return: Decimal | None = None
     monthly_effective_return: Decimal | None = None
+    net_assets: Decimal | None = None
+    issued_shares: Decimal | None = None
+    shareholder_count: Decimal | None = None
+    administration_fee_ratio: Decimal | None = None
+    total_assets: Decimal | None = None
+    total_liabilities: Decimal | None = None
+    property_assets: Decimal | None = None
+    credit_assets: Decimal | None = None
+    liquid_assets: Decimal | None = None
+    inception_date: date | None = None
+    segment: str | None = None
+    administrator: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,8 +182,10 @@ def parse_fii_reports(
         complement_name = _member(archive, "complemento")
         if general_name is None or complement_name is None:
             return FundReportSeries()
+        asset_name = _member(archive, "ativo_passivo")
+        general_rows = list(_rows(archive.read(general_name)))
         matches = []
-        for row in _rows(archive.read(general_name)):
+        for row in general_rows:
             isin = _text(row.get("Codigo_ISIN"))
             if not _same_isin(isin, instrument.isin):
                 continue
@@ -182,11 +196,35 @@ def parse_fii_reports(
         cnpj = max(matches, key=lambda item: item[0])[1] if matches else None
         if cnpj is None:
             return FundReportSeries()
+        metadata = {
+            _row_date_key(row): row
+            for row in general_rows
+            if _digits(row.get("CNPJ_Fundo_Classe") or row.get("CNPJ_Fundo")) == cnpj
+            and _row_date_key(row) is not None
+        }
+        assets = (
+            {
+                _row_date_key(row): row
+                for row in _rows(archive.read(asset_name))
+                if _digits(row.get("CNPJ_Fundo_Classe") or row.get("CNPJ_Fundo")) == cnpj
+                and _row_date_key(row) is not None
+            }
+            if asset_name is not None
+            else {}
+        )
         reports = [
             point
             for row in _rows(archive.read(complement_name))
             if _digits(row.get("CNPJ_Fundo_Classe") or row.get("CNPJ_Fundo")) == cnpj
-            and (point := _monthly_report(row, percentage_points=False)) is not None
+            and (
+                point := _monthly_report(
+                    row,
+                    percentage_points=False,
+                    metadata=metadata.get(_row_date_key(row)),
+                    assets=assets.get(_row_date_key(row)),
+                )
+            )
+            is not None
         ]
     return FundReportSeries(cnpj=cnpj, reports=_latest_version_by_date(reports))
 
@@ -255,6 +293,8 @@ def _monthly_report(
     row: dict[str, str],
     *,
     percentage_points: bool,
+    metadata: dict[str, str] | None = None,
+    assets: dict[str, str] | None = None,
 ) -> FundReportPoint | None:
     as_of = _date(row.get("Data_Referencia"))
     nav = _decimal(row.get("Valor_Patrimonial_Cotas"))
@@ -276,7 +316,92 @@ def _monthly_report(
             row.get("Percentual_Rentabilidade_Efetiva_Mes") or row.get("Rentabilidade_Efetiva_Mes"),
             percentage_points=percentage_points,
         ),
+        net_assets=_decimal(row.get("Patrimonio_Liquido")),
+        issued_shares=_decimal(
+            row.get("Cotas_Emitidas")
+            or row.get("Quantidade_Cotas_Emitidas")
+            or (metadata or {}).get("Quantidade_Cotas_Emitidas")
+        ),
+        shareholder_count=_decimal(row.get("Total_Numero_Cotistas") or row.get("Numero_Cotistas")),
+        administration_fee_ratio=_annualized_fee(
+            row.get("Percentual_Despesas_Taxa_Administracao"),
+            percentage_points=percentage_points,
+        ),
+        total_assets=_first_or_sum(
+            assets,
+            "Valor_Ativo",
+            (
+                "Total_Necessidades_Liquidez",
+                "Total_Investido",
+                "Valores_Receber",
+            ),
+        ),
+        total_liabilities=_decimal((assets or {}).get("Total_Passivo")),
+        property_assets=_first_or_sum(
+            assets,
+            "Direitos_Bens_Imoveis",
+            (
+                "Terrenos",
+                "Imoveis_Renda_Acabados",
+                "Imoveis_Renda_Construcao",
+                "Imoveis_Venda_Acabados",
+                "Imoveis_Venda_Construcao",
+                "Outros_Direitos_Reais",
+            ),
+        ),
+        credit_assets=_sum_fields(
+            assets,
+            (
+                "CRI",
+                "CRI_CRA",
+                "Letras_Hipotecarias",
+                "LCI",
+                "LCI_LCA",
+                "LIG",
+                "Debentures",
+            ),
+        ),
+        liquid_assets=_first_or_sum(
+            assets,
+            "Total_Necessidades_Liquidez",
+            (
+                "Disponibilidades",
+                "Titulos_Publicos",
+                "Fundos_Renda_Fixa",
+            ),
+        ),
+        inception_date=_date((metadata or {}).get("Data_Funcionamento")),
+        segment=_text((metadata or {}).get("Segmento_Atuacao")),
+        administrator=_text((metadata or {}).get("Nome_Administrador")),
     )
+
+
+def _row_date_key(row: dict[str, str]) -> date | None:
+    return _date(row.get("Data_Referencia"))
+
+
+def _annualized_fee(value: str | None, *, percentage_points: bool) -> Decimal | None:
+    monthly = _ratio(value, percentage_points=percentage_points)
+    return monthly * Decimal("12") if monthly is not None and monthly >= 0 else None
+
+
+def _sum_fields(
+    row: dict[str, str] | None,
+    fields: tuple[str, ...],
+) -> Decimal | None:
+    if row is None:
+        return None
+    values = [value for field in fields if (value := _decimal(row.get(field))) is not None]
+    return sum(values, Decimal("0")) if values else None
+
+
+def _first_or_sum(
+    row: dict[str, str] | None,
+    total_field: str,
+    component_fields: tuple[str, ...],
+) -> Decimal | None:
+    total = _decimal((row or {}).get(total_field))
+    return total if total is not None else _sum_fields(row, component_fields)
 
 
 def _rows(payload: bytes) -> csv.DictReader[str]:
