@@ -578,6 +578,18 @@ def _opportunity_metrics(
             sources=[max_source] if max_source else [],
             reason="52-week maximum unavailable",
         ),
+        average_daily_traded_value=_metric(
+            details.average_daily_volume_2m if details else None,
+            as_of=as_of,
+            sources=[SOURCE_FUNDAMENTUS],
+            reason="Average daily traded value unavailable",
+        ),
+        market_capitalization=_metric(
+            details.market_value if details else None,
+            as_of=as_of,
+            sources=[SOURCE_FUNDAMENTUS],
+            reason="Market capitalization unavailable",
+        ),
     )
 
 
@@ -693,6 +705,18 @@ def _report_series(series: CvmReportSeries) -> FundReportSeries | None:
                 monthly_distribution_yield=item.monthly_distribution_yield,
                 monthly_nav_return=item.monthly_nav_return,
                 monthly_effective_return=item.monthly_effective_return,
+                net_assets=item.net_assets,
+                issued_shares=item.issued_shares,
+                shareholder_count=item.shareholder_count,
+                administration_fee_ratio=item.administration_fee_ratio,
+                total_assets=item.total_assets,
+                total_liabilities=item.total_liabilities,
+                property_assets=item.property_assets,
+                credit_assets=item.credit_assets,
+                liquid_assets=item.liquid_assets,
+                inception_date=item.inception_date,
+                segment=item.segment,
+                administrator=item.administrator,
             )
             for item in series.reports
         ],

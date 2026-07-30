@@ -178,6 +178,8 @@ class OpportunityMetrics(APIModel):
     latest_distribution: OpportunityMetric | None = None
     median_distribution_3m: OpportunityMetric | None = None
     median_distribution_6m: OpportunityMetric | None = None
+    average_daily_traded_value: OpportunityMetric | None = None
+    market_capitalization: OpportunityMetric | None = None
 
 
 class FundMonthlyReport(APIModel):
@@ -186,6 +188,18 @@ class FundMonthlyReport(APIModel):
     monthly_distribution_yield: Decimal | None = None
     monthly_nav_return: Decimal | None = None
     monthly_effective_return: Decimal | None = None
+    net_assets: Decimal | None = None
+    issued_shares: Decimal | None = None
+    shareholder_count: Decimal | None = None
+    administration_fee_ratio: Decimal | None = None
+    total_assets: Decimal | None = None
+    total_liabilities: Decimal | None = None
+    property_assets: Decimal | None = None
+    credit_assets: Decimal | None = None
+    liquid_assets: Decimal | None = None
+    inception_date: date | None = None
+    segment: str | None = None
+    administrator: str | None = None
     source: str = "cvm"
 
 

@@ -43,16 +43,30 @@ def test_fii_parser_matches_the_fund_name_when_an_isin_is_reused() -> None:
     payload = _zip(
         {
             "inf_mensal_fii_geral_2026.csv": (
-                "CNPJ_Fundo_Classe;Data_Referencia;Nome_Fundo_Classe;Codigo_ISIN\n"
-                "07.583.627/0001-61;2026-06-01;PENINSULA FII;BRXPMLCTF000\n"
-                "28.757.546/0001-00;2026-06-01;XP MALLS FII;BRXPMLCTF000\n"
+                "CNPJ_Fundo_Classe;Data_Referencia;Nome_Fundo_Classe;Codigo_ISIN;"
+                "Quantidade_Cotas_Emitidas;Data_Funcionamento;Segmento_Atuacao;"
+                "Nome_Administrador\n"
+                "07.583.627/0001-61;2026-06-01;PENINSULA FII;BRXPMLCTF000;"
+                "100;2019-01-01;Tijolo;OLD ADMIN\n"
+                "28.757.546/0001-00;2026-06-01;XP MALLS FII;BRXPMLCTF000;"
+                "20000000;2017-12-15;Shoppings;XP ADMINISTRADORA\n"
             ),
             "inf_mensal_fii_complemento_2026.csv": (
                 "CNPJ_Fundo_Classe;Data_Referencia;Valor_Patrimonial_Cotas;"
                 "Percentual_Dividend_Yield_Mes;Percentual_Rentabilidade_Patrimonial_Mes;"
-                "Percentual_Rentabilidade_Efetiva_Mes\n"
-                "07.583.627/0001-61;2026-06-01;900,00;0,0010;0,0020;0,0030\n"
-                "28.757.546/0001-00;2026-06-01;102,50;0,0095;0,0120;0,0140\n"
+                "Percentual_Rentabilidade_Efetiva_Mes;Patrimonio_Liquido;"
+                "Total_Numero_Cotistas;Percentual_Despesas_Taxa_Administracao\n"
+                "07.583.627/0001-61;2026-06-01;900,00;0,0010;0,0020;0,0030;"
+                "90000;10;0,0009\n"
+                "28.757.546/0001-00;2026-06-01;102,50;0,0095;0,0120;0,0140;"
+                "2050000000;150000;0,0006\n"
+            ),
+            "inf_mensal_fii_ativo_passivo_2026.csv": (
+                "CNPJ_Fundo_Classe;Data_Referencia;Total_Necessidades_Liquidez;"
+                "Total_Investido;Valores_Receber;Total_Passivo;Direitos_Bens_Imoveis;"
+                "Imoveis_Renda_Acabados;CRI;Disponibilidades;Titulos_Publicos\n"
+                "28.757.546/0001-00;2026-06-01;75000000;2000000000;125000000;"
+                "150000000;1800000000;1800000000;100000000;50000000;25000000\n"
             ),
         }
     )
@@ -64,6 +78,18 @@ def test_fii_parser_matches_the_fund_name_when_an_isin_is_reused() -> None:
     assert result.reports[0].monthly_distribution_yield == Decimal("0.0095")
     assert result.reports[0].monthly_nav_return == Decimal("0.012")
     assert result.reports[0].monthly_effective_return == Decimal("0.014")
+    assert result.reports[0].net_assets == Decimal("2050000000")
+    assert result.reports[0].issued_shares == Decimal("20000000")
+    assert result.reports[0].shareholder_count == Decimal("150000")
+    assert result.reports[0].administration_fee_ratio == Decimal("0.0072")
+    assert result.reports[0].total_assets == Decimal("2200000000")
+    assert result.reports[0].total_liabilities == Decimal("150000000")
+    assert result.reports[0].property_assets == Decimal("1800000000")
+    assert result.reports[0].credit_assets == Decimal("100000000")
+    assert result.reports[0].liquid_assets == Decimal("75000000")
+    assert result.reports[0].inception_date == date(2017, 12, 15)
+    assert result.reports[0].segment == "Shoppings"
+    assert result.reports[0].administrator == "XP ADMINISTRADORA"
 
 
 def test_fii_parser_rejects_archives_without_required_members_or_matches() -> None:

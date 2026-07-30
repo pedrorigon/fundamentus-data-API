@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     )
     status_invest_base_url: str = "https://statusinvest.com.br"
     cvm_open_data_base_url: str = "https://dados.cvm.gov.br"
+    bcb_sgs_base_url: str = "https://api.bcb.gov.br"
+    bcb_ifdata_base_url: str = "https://olinda.bcb.gov.br/olinda/servico/IFDATA/versao/v1/odata"
     brapi_base_url: str = "https://brapi.dev"
     brapi_token: SecretStr | None = None
     alpha_vantage_base_url: str = "https://www.alphavantage.co"
@@ -66,7 +68,7 @@ class Settings(BaseSettings):
     fundamentals_statements_ttl_seconds: int = 86400
     company_registry_ttl_seconds: int = 604800
     peer_group_ttl_seconds: int = 86400
-    fundamentals_history_years: int = 10
+    fundamentals_history_years: int = 12
 
     sqlite_cache_enabled: bool = True
     sqlite_cache_path: Path = Field(default=Path(".cache/fundamentus_cache.sqlite3"))
