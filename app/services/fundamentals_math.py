@@ -13,9 +13,13 @@ from typing import cast
 from app.models.fundamentals import FinancialPeriod
 from app.parsers.cvm_statements import (
     ACCOUNT_CASH,
+    ACCOUNT_CURRENT_ASSETS,
     ACCOUNT_CURRENT_DEBT,
+    ACCOUNT_CURRENT_LIABILITIES,
     ACCOUNT_EBIT,
     ACCOUNT_EQUITY,
+    ACCOUNT_FINANCIAL_RESULT,
+    ACCOUNT_GROSS_PROFIT,
     ACCOUNT_INVESTING_CASH_FLOW,
     ACCOUNT_LONG_TERM_DEBT,
     ACCOUNT_NET_INCOME,
@@ -69,6 +73,8 @@ def build_period(
     capex = None if financial_institution else _capex(statement)
     cash = None if financial_institution else _cash_position(statement)
     gross_debt = None if financial_institution else _gross_debt(statement)
+    short_term_debt = None if financial_institution else statement.account(ACCOUNT_CURRENT_DEBT)
+    long_term_debt = None if financial_institution else statement.account(ACCOUNT_LONG_TERM_DEBT)
 
     net_income = _semantic_account(statement, ACCOUNT_NET_INCOME, _NET_INCOME_LABELS)
     resolved_shares = shares_outstanding or _shares_from_earnings(statement, net_income)
@@ -78,12 +84,24 @@ def build_period(
         consolidated=statement.consolidated,
         annual=_is_annual(statement),
         revenue=statement.account(ACCOUNT_REVENUE),
+        gross_profit=(None if financial_institution else statement.account(ACCOUNT_GROSS_PROFIT)),
         ebit=ebit,
         ebitda=_sum_optional(ebit, depreciation),
+        financial_result=(
+            None if financial_institution else statement.account(ACCOUNT_FINANCIAL_RESULT)
+        ),
         net_income=net_income,
         equity=_shareholder_equity(statement),
         total_assets=statement.account(ACCOUNT_TOTAL_ASSETS),
+        current_assets=(
+            None if financial_institution else statement.account(ACCOUNT_CURRENT_ASSETS)
+        ),
+        current_liabilities=(
+            None if financial_institution else statement.account(ACCOUNT_CURRENT_LIABILITIES)
+        ),
         cash_and_equivalents=cash,
+        short_term_debt=short_term_debt,
+        long_term_debt=long_term_debt,
         gross_debt=gross_debt,
         net_debt=_net_debt(gross_debt, cash),
         operating_cash_flow=operating_cash_flow,
@@ -192,12 +210,28 @@ def trailing_twelve_months(periods: list[FinancialPeriod]) -> FinancialPeriod | 
         consolidated=latest.consolidated,
         annual=True,
         revenue=_trailing_value(latest, previous_annual, comparable, "revenue"),
+        gross_profit=_trailing_value(
+            latest,
+            previous_annual,
+            comparable,
+            "gross_profit",
+        ),
         ebit=_trailing_value(latest, previous_annual, comparable, "ebit"),
         ebitda=_trailing_value(latest, previous_annual, comparable, "ebitda"),
+        financial_result=_trailing_value(
+            latest,
+            previous_annual,
+            comparable,
+            "financial_result",
+        ),
         net_income=_trailing_value(latest, previous_annual, comparable, "net_income"),
         equity=latest.equity,
         total_assets=latest.total_assets,
+        current_assets=latest.current_assets,
+        current_liabilities=latest.current_liabilities,
         cash_and_equivalents=latest.cash_and_equivalents,
+        short_term_debt=latest.short_term_debt,
+        long_term_debt=latest.long_term_debt,
         gross_debt=latest.gross_debt,
         net_debt=latest.net_debt,
         operating_cash_flow=_trailing_value(

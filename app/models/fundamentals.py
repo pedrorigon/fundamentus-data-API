@@ -30,12 +30,18 @@ class FinancialPeriod(BaseModel):
     consolidated: bool
     annual: bool
     revenue: Decimal | None = None
+    gross_profit: Decimal | None = None
     ebit: Decimal | None = None
     ebitda: Decimal | None = None
+    financial_result: Decimal | None = None
     net_income: Decimal | None = None
     equity: Decimal | None = None
     total_assets: Decimal | None = None
+    current_assets: Decimal | None = None
+    current_liabilities: Decimal | None = None
     cash_and_equivalents: Decimal | None = None
+    short_term_debt: Decimal | None = None
+    long_term_debt: Decimal | None = None
     gross_debt: Decimal | None = None
     net_debt: Decimal | None = None
     operating_cash_flow: Decimal | None = None
