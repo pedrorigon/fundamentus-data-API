@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.api.dependencies import get_quality_facts_service
+from app.core.errors import InvalidTickerError
 from app.main import create_app
 from app.models import (
     FinancialPeriod,
@@ -167,6 +168,9 @@ def stock_snapshot() -> FundamentalsSnapshot:
         company_name="Test",
         periods=periods,
         trailing_twelve_months=periods[-1],
+        shares_outstanding=Decimal("100"),
+        earnings_per_share=Decimal("1.2"),
+        book_value_per_share=Decimal("6"),
     )
 
 
@@ -193,6 +197,34 @@ async def test_reports_specialized_sources_for_unsupported_local_kinds(
 
     assert response.assets[0].ticker == "BTC"
     assert reason in (response.assets[0].unavailable_reason or "")
+
+
+async def test_isolates_provider_errors_inside_a_quality_batch() -> None:
+    class FailingInstruments:
+        async def get(
+            self,
+            ticker: str,
+            _instrument_type: InstrumentType | None = None,
+        ) -> InstrumentDataResponse:
+            raise InvalidTickerError(ticker=ticker)
+
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        FailingInstruments(),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[
+                QualityAssetRequest(ticker="VUAA.L", kind=QualityAssetKind.etf),
+                QualityAssetRequest(ticker="BTC", kind=QualityAssetKind.crypto),
+            ]
+        )
+    )
+
+    assert response.assets[0].unavailable_reason == "Invalid ticker."
+    assert "network-data" in (response.assets[1].unavailable_reason or "")
 
 
 def test_request_normalizes_tickers_and_rejects_duplicates() -> None:
@@ -240,7 +272,11 @@ async def test_resolves_complete_domestic_stock_quality_facts() -> None:
     assert facts["positive_earnings_frequency"].value == Decimal("1")
     assert facts["revenue_cagr"].value is not None
     assert facts["share_dilution"].value is not None
-    assert all(fact.source == "cvm" for fact in result.facts if fact.value is not None)
+    assert facts["operating_cash_flow_margin"].value == Decimal("0.15")
+    assert facts["accrual_ratio"].value == Decimal("-0.03")
+    assert facts["earnings_per_share_consistency_error"].value == Decimal("0")
+    assert facts["book_value_per_share_consistency_error"].value == Decimal("0")
+    assert result.profile == "industrial"
     assert fundamentals.calls == ["TEST3"]
 
 
@@ -281,6 +317,44 @@ async def test_financial_facts_preserve_missing_history_and_zero_denominator() -
     assert facts["revenue_cagr"].unavailable_reason == (
         "At least three annual observations are required"
     )
+
+
+async def test_financial_facts_reject_implausible_cross_checked_growth() -> None:
+    periods = [
+        annual_period(2022, "100", "100"),
+        annual_period(2023, "200", "100"),
+        annual_period(2024, "1000", "300"),
+    ]
+    snapshot = FundamentalsSnapshot(
+        ticker="OUT3",
+        sector="Bens Industriais",
+        periods=periods,
+        trailing_twelve_months=periods[-1],
+    )
+    instrument = InstrumentMetadata(
+        ticker="OUT3",
+        name="Outlier",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+    )
+    service = QualityFactsService(
+        FundamentalsStub(snapshot),  # type: ignore[arg-type]
+        InstrumentsStub({"OUT3": instrument_data("OUT3", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({"OUT3": opportunity("OUT3", instrument)}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="OUT3", kind=QualityAssetKind.stock)]
+        )
+    )
+
+    result = response.assets[0]
+    facts = {fact.key: fact for fact in result.facts}
+    assert facts["revenue_cagr"].status == "missing_data"
+    assert facts["earnings_cagr"].status == "missing_data"
+    assert facts["share_dilution"].status == "missing_data"
+    assert len(result.warnings) == 3
 
 
 async def test_reports_stock_snapshot_resolution_failure() -> None:
@@ -442,8 +516,8 @@ async def test_resolves_fund_reporting_and_distribution_stability() -> None:
                 "FUND11": opportunity(
                     "FUND11",
                     instrument,
-                    reports=reports,
-                    distributions=distributions,
+                    reports=list(reversed(reports)),
+                    distributions=list(reversed(distributions)),
                 )
             }
         ),  # type: ignore[arg-type]
@@ -504,6 +578,68 @@ async def test_fund_with_short_history_explains_missing_stability() -> None:
     facts = {fact.key: fact for fact in response.assets[0].facts}
     assert facts["distribution_stability"].status == "missing_data"
     assert "six distributions" in (facts["distribution_stability"].unavailable_reason or "")
+
+
+async def test_fund_facts_measure_nav_preservation_reporting_and_distribution_cuts() -> None:
+    instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
+    reports = [
+        FundMonthlyReport(
+            as_of=date(2024 + index // 12, index % 12 + 1, 1),
+            nav_per_share=Decimal("100") + Decimal(index),
+            monthly_distribution_yield=Decimal("0.001"),
+            monthly_nav_return=Decimal("0.005"),
+        )
+        for index in range(24)
+    ]
+    distributions = [
+        FundDistribution(
+            ex_date=date(2024 + index // 12, index % 12 + 1, 15),
+            value=Decimal("1") if index != 18 else Decimal("0.70"),
+            source="cvm",
+        )
+        for index in range(24)
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"FUND11": instrument_data("FUND11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "FUND11": opportunity(
+                    "FUND11",
+                    instrument,
+                    reports=list(reversed(reports)),
+                    distributions=list(reversed(distributions)),
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[
+                QualityAssetRequest(
+                    ticker="FUND11",
+                    kind=QualityAssetKind.real_estate_fund,
+                )
+            ]
+        )
+    )
+
+    facts = {fact.key: fact for fact in response.assets[0].facts}
+    assert facts["reporting_regularity"].value == Decimal("1")
+    assert facts["report_completeness"].value == Decimal("1")
+    assert facts["nav_growth"].value is not None
+    assert facts["nav_return_volatility"].value == Decimal("0")
+    assert facts["positive_nav_return_frequency"].value == Decimal("1")
+    assert facts["nav_max_drawdown"].value == Decimal("0")
+    assert facts["distribution_growth"].value is not None
+    assert facts["distribution_cut_frequency"].value is not None
+    consistency = facts["distribution_report_consistency_error"].value
+    assert consistency is not None
+    assert consistency > Decimal("0.25")
+    assert response.assets[0].warnings == [
+        "Distribution values diverge from the corresponding CVM monthly reports"
+    ]
 
 
 async def test_quality_endpoint_uses_bounded_service_contract() -> None:
