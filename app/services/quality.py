@@ -5,10 +5,12 @@ from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
+from app.core.errors import APIError
 from app.models import (
     FinancialPeriod,
     FundamentalsSnapshot,
     FundDistribution,
+    FundMonthlyReport,
     InstrumentDataResponse,
     InstrumentType,
     OpportunityResponse,
@@ -23,11 +25,15 @@ from app.models.quality import (
     QualityFactsResponse,
 )
 from app.services.fundamentals import FundamentalsService
+from app.services.fundamentals_math import is_financial_sector
 from app.services.market import InstrumentDataService
 from app.services.opportunity import OpportunityService
 
 _MAX_CONCURRENCY = 6
 _CVM_SOURCE = "cvm"
+_CVM_CONFIDENCE = Decimal("0.95")
+_DERIVED_CONFIDENCE = Decimal("0.90")
+_FCF_CONFIDENCE = Decimal("0.65")
 
 
 class QualityFactsService:
@@ -50,7 +56,14 @@ class QualityFactsService:
 
     async def _bounded(self, asset: QualityAssetRequest) -> QualityAssetFacts:
         async with self._semaphore:
-            return await self._resolve_asset(asset)
+            try:
+                return await self._resolve_asset(asset)
+            except APIError as error:
+                return QualityAssetFacts(
+                    ticker=asset.ticker,
+                    kind=asset.kind,
+                    unavailable_reason=error.message,
+                )
 
     async def _resolve_asset(self, asset: QualityAssetRequest) -> QualityAssetFacts:
         if asset.kind is QualityAssetKind.crypto:
@@ -121,6 +134,8 @@ def _financial_facts(
         (item for item in snapshot.periods if item.annual),
         key=lambda item: item.period_end,
     )
+    reference_shares = snapshot.shares_outstanding or period.shares_outstanding
+    financial_profile = is_financial_sector(snapshot.sector)
     facts = [
         _ratio("gross_margin", period.gross_profit, period.revenue, reference),
         _ratio("operating_margin", period.ebit, period.revenue, reference),
@@ -133,8 +148,27 @@ def _financial_facts(
             period.net_income,
             reference,
         ),
-        _ratio("free_cash_flow_margin", period.free_cash_flow, period.revenue, reference),
+        _ratio(
+            "operating_cash_flow_margin",
+            period.operating_cash_flow,
+            period.revenue,
+            reference,
+        ),
+        _ratio(
+            "accrual_ratio",
+            _subtract(period.net_income, period.operating_cash_flow),
+            period.total_assets,
+            reference,
+        ),
+        _ratio(
+            "free_cash_flow_margin",
+            period.free_cash_flow,
+            period.revenue,
+            reference,
+            confidence=_FCF_CONFIDENCE,
+        ),
         _ratio("net_debt_to_ebitda", period.net_debt, period.ebitda, reference, unit="multiple"),
+        _ratio("debt_to_equity", period.gross_debt, period.equity, reference, unit="multiple"),
         _ratio("equity_ratio", period.equity, period.total_assets, reference),
         _ratio(
             "current_ratio",
@@ -145,6 +179,17 @@ def _financial_facts(
         ),
         _interest_coverage(period.ebit, period.financial_result, reference),
         _growth_fact("revenue_cagr", annual, lambda item: item.revenue),
+        _growth_fact("earnings_cagr", annual, lambda item: item.net_income),
+        _stability_fact(
+            "net_margin_volatility",
+            annual,
+            lambda item: _safe_ratio(item.net_income, item.revenue),
+        ),
+        _stability_fact(
+            "return_on_equity_volatility",
+            annual,
+            lambda item: _safe_ratio(item.net_income, item.equity),
+        ),
         _positive_frequency("positive_earnings_frequency", annual, lambda item: item.net_income),
         _positive_frequency(
             "positive_free_cash_flow_frequency",
@@ -152,7 +197,24 @@ def _financial_facts(
             lambda item: item.free_cash_flow,
         ),
         _growth_fact("share_dilution", annual, lambda item: item.shares_outstanding),
+        _consistency_fact(
+            "earnings_per_share_consistency_error",
+            _safe_ratio(period.net_income, reference_shares),
+            snapshot.earnings_per_share,
+            reference,
+        ),
+        _consistency_fact(
+            "book_value_per_share_consistency_error",
+            _safe_ratio(period.equity, reference_shares),
+            snapshot.book_value_per_share,
+            reference,
+        ),
     ]
+    facts, warnings = _validated_financial_facts(facts)
+    if financial_profile:
+        warnings.append(
+            "Bank and insurer capital adequacy and credit-loss facts require a BCB data source"
+        )
     sources = sorted(
         {item.selected_source for item in snapshot.provenance if item.selected_source is not None}
         | {_CVM_SOURCE}
@@ -161,8 +223,10 @@ def _financial_facts(
         ticker=request.ticker,
         kind=request.kind,
         canonical_id=snapshot.cnpj or isin,
+        profile="financial" if financial_profile else "industrial",
         facts=facts,
         sources=sources,
+        warnings=warnings,
     )
 
 
@@ -219,6 +283,8 @@ def _etf_facts(
         )
     reference = data.refreshed_at.date()
     holdings = profile.holdings
+    total_weight = sum((holding.weight for holding in holdings), Decimal("0"))
+    weight_scale = Decimal("100") if total_weight > Decimal("1.5") else Decimal("1")
     facts = [
         _value_fact(
             "expense_ratio",
@@ -276,6 +342,13 @@ def _etf_facts(
             reference,
             profile.source,
         ),
+        _value_fact(
+            "holdings_weight_coverage",
+            _safe_ratio(total_weight, weight_scale) if holdings else None,
+            "ratio",
+            reference,
+            profile.source,
+        ),
     ]
     return QualityAssetFacts(
         ticker=request.ticker,
@@ -290,9 +363,16 @@ def _fund_facts(
     request: QualityAssetRequest,
     opportunity: OpportunityResponse,
 ) -> QualityAssetFacts:
-    reports = opportunity.fund_reports.reports if opportunity.fund_reports else []
-    distributions = opportunity.fund_distributions
+    reports = sorted(
+        opportunity.fund_reports.reports if opportunity.fund_reports else [],
+        key=lambda item: item.as_of,
+    )
+    distributions = sorted(
+        opportunity.fund_distributions,
+        key=lambda item: item.ex_date,
+    )
     source = _CVM_SOURCE
+    distribution_consistency = _distribution_report_consistency(reports, distributions)
     facts = [
         _value_fact(
             "reporting_history_months",
@@ -310,14 +390,30 @@ def _fund_facts(
         ),
         _distribution_stability(distributions),
         _positive_distribution_frequency(distributions),
+        _distribution_growth(distributions),
+        _distribution_cut_frequency(distributions),
+        _reporting_regularity(reports),
+        _report_completeness(reports),
+        _nav_growth(reports),
+        _nav_return_volatility(reports),
+        _positive_nav_return_frequency(reports),
+        _nav_max_drawdown(reports),
+        distribution_consistency,
     ]
     instrument = opportunity.instrument
+    warnings = (
+        ["Distribution values diverge from the corresponding CVM monthly reports"]
+        if distribution_consistency.value is not None
+        and distribution_consistency.value > Decimal("0.25")
+        else []
+    )
     return QualityAssetFacts(
         ticker=request.ticker,
         kind=request.kind,
         canonical_id=instrument.isin if instrument else None,
         facts=facts,
         sources=[source] if reports or distributions else [],
+        warnings=warnings,
         unavailable_reason=None
         if reports or distributions
         else "No public fund history was resolved",
@@ -331,9 +427,10 @@ def _ratio(
     reference: date,
     *,
     unit: str = "ratio",
+    confidence: Decimal = _CVM_CONFIDENCE,
 ) -> QualityFact:
     value = _safe_ratio(numerator, denominator)
-    return _value_fact(key, value, unit, reference, _CVM_SOURCE)
+    return _value_fact(key, value, unit, reference, _CVM_SOURCE, confidence=confidence)
 
 
 def _interest_coverage(
@@ -364,7 +461,7 @@ def _growth_fact(
         unit="ratio",
         as_of=last.as_of,
         source=_CVM_SOURCE if value is not None else None,
-        confidence=Decimal("1") if value is not None else Decimal("0"),
+        confidence=_DERIVED_CONFIDENCE if value is not None else Decimal("0"),
         status="valid" if value is not None else "missing_data",
         unavailable_reason=None if value is not None else "Growth needs positive comparable values",
         history=observations,
@@ -386,7 +483,7 @@ def _positive_frequency(
         unit="ratio",
         as_of=observations[-1].as_of,
         source=_CVM_SOURCE,
-        confidence=Decimal("1"),
+        confidence=_DERIVED_CONFIDENCE,
         status="valid",
         history=observations,
     )
@@ -401,6 +498,101 @@ def _observations(
         for period in periods
         if (value := getter(period)) is not None
     ]
+
+
+def _stability_fact(
+    key: str,
+    periods: list[FinancialPeriod],
+    getter: Callable[[FinancialPeriod], Decimal | None],
+) -> QualityFact:
+    observations = _observations(periods, getter)
+    if len(observations) < 3:
+        return _missing_fact(key, "ratio", "At least three annual observations are required")
+    values = [item.value for item in observations]
+    average = sum(values, Decimal("0")) / Decimal(len(values))
+    variance = sum(((value - average) ** 2 for value in values), Decimal("0")) / Decimal(
+        len(values)
+    )
+    volatility = Decimal(str(float(variance) ** 0.5))
+    return QualityFact(
+        key=key,
+        value=volatility,
+        unit="ratio",
+        as_of=observations[-1].as_of,
+        source=_CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+        status="valid",
+        history=observations,
+    )
+
+
+def _consistency_fact(
+    key: str,
+    filing_value: Decimal | None,
+    public_value: Decimal | None,
+    reference: date,
+) -> QualityFact:
+    if filing_value is None or public_value is None:
+        return _missing_fact(
+            key,
+            "ratio",
+            "Both CVM totals and independent per-share data are required",
+        )
+    denominator = max(abs(filing_value), abs(public_value), Decimal("0.000001"))
+    error = abs(filing_value - public_value) / denominator
+    return _value_fact(
+        key,
+        error,
+        "ratio",
+        reference,
+        "cvm,fundamentus",
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+_FINANCIAL_RANGES: dict[str, tuple[Decimal, Decimal]] = {
+    "gross_margin": (Decimal("-0.5"), Decimal("1.2")),
+    "operating_margin": (Decimal("-1"), Decimal("1.2")),
+    "net_margin": (Decimal("-1"), Decimal("1.2")),
+    "return_on_equity": (Decimal("-2"), Decimal("3")),
+    "return_on_assets": (Decimal("-1"), Decimal("1")),
+    "cash_conversion": (Decimal("-5"), Decimal("8")),
+    "operating_cash_flow_margin": (Decimal("-1"), Decimal("1")),
+    "accrual_ratio": (Decimal("-1"), Decimal("1")),
+    "free_cash_flow_margin": (Decimal("-1"), Decimal("1")),
+    "net_debt_to_ebitda": (Decimal("-10"), Decimal("15")),
+    "debt_to_equity": (Decimal("0"), Decimal("20")),
+    "equity_ratio": (Decimal("-0.2"), Decimal("1.2")),
+    "current_ratio": (Decimal("0"), Decimal("20")),
+    "interest_coverage": (Decimal("-10"), Decimal("100")),
+    "revenue_cagr": (Decimal("-0.8"), Decimal("2")),
+    "earnings_cagr": (Decimal("-0.8"), Decimal("2")),
+    "share_dilution": (Decimal("-0.5"), Decimal("0.5")),
+}
+
+
+def _validated_financial_facts(
+    facts: list[QualityFact],
+) -> tuple[list[QualityFact], list[str]]:
+    validated: list[QualityFact] = []
+    warnings: list[str] = []
+    for fact in facts:
+        bounds = _FINANCIAL_RANGES.get(fact.key)
+        if fact.value is None or bounds is None or bounds[0] <= fact.value <= bounds[1]:
+            validated.append(fact)
+            continue
+        warnings.append(
+            f"{fact.key} was rejected as implausible ({fact.value}); "
+            f"expected {bounds[0]}..{bounds[1]}"
+        )
+        validated.append(
+            _missing_fact(
+                fact.key,
+                fact.unit,
+                "Public values failed the plausibility cross-check",
+            )
+        )
+    return validated, warnings
 
 
 def _distribution_stability(distributions: list[FundDistribution]) -> QualityFact:
@@ -443,12 +635,229 @@ def _positive_distribution_frequency(distributions: list[FundDistribution]) -> Q
     )
 
 
+def _distribution_growth(distributions: list[FundDistribution]) -> QualityFact:
+    recent = distributions[-36:]
+    if len(recent) < 12:
+        return _missing_fact(
+            "distribution_growth",
+            "ratio",
+            "At least twelve distributions are required",
+        )
+    midpoint = len(recent) // 2
+    earlier = sum((item.value for item in recent[:midpoint]), Decimal("0")) / Decimal(midpoint)
+    later_count = len(recent) - midpoint
+    later = sum((item.value for item in recent[midpoint:]), Decimal("0")) / Decimal(later_count)
+    return _value_fact(
+        "distribution_growth",
+        _safe_ratio(later - earlier, earlier),
+        "ratio",
+        recent[-1].ex_date,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _distribution_cut_frequency(distributions: list[FundDistribution]) -> QualityFact:
+    recent = distributions[-36:]
+    if len(recent) < 6:
+        return _missing_fact(
+            "distribution_cut_frequency",
+            "ratio",
+            "At least six distributions are required",
+        )
+    comparable = [
+        (previous.value, current.value)
+        for previous, current in zip(recent, recent[1:], strict=False)
+        if previous.value > 0
+    ]
+    if not comparable:
+        return _missing_fact(
+            "distribution_cut_frequency",
+            "ratio",
+            "No positive prior distribution is available",
+        )
+    cuts = sum(1 for previous, current in comparable if current < previous * Decimal("0.90"))
+    return _value_fact(
+        "distribution_cut_frequency",
+        Decimal(cuts) / Decimal(len(comparable)),
+        "ratio",
+        recent[-1].ex_date,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _reporting_regularity(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = reports[-36:]
+    if len(recent) < 6:
+        return _missing_fact(
+            "reporting_regularity",
+            "ratio",
+            "At least six monthly reports are required",
+        )
+    months = {item.as_of.year * 12 + item.as_of.month for item in recent}
+    span = max(months) - min(months) + 1
+    return _value_fact(
+        "reporting_regularity",
+        Decimal(len(months)) / Decimal(span),
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _report_completeness(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = reports[-36:]
+    if len(recent) < 6:
+        return _missing_fact(
+            "report_completeness",
+            "ratio",
+            "At least six monthly reports are required",
+        )
+    completed = sum(
+        1
+        for item in recent
+        if item.monthly_nav_return is not None and item.monthly_distribution_yield is not None
+    )
+    return _value_fact(
+        "report_completeness",
+        Decimal(completed) / Decimal(len(recent)),
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _nav_growth(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = [item for item in reports[-60:] if item.nav_per_share > 0]
+    if len(recent) < 12:
+        return _missing_fact("nav_growth", "ratio", "At least twelve monthly reports are required")
+    years = Decimal(str((recent[-1].as_of - recent[0].as_of).days / 365.25))
+    return _value_fact(
+        "nav_growth",
+        _annualized_growth(recent[0].nav_per_share, recent[-1].nav_per_share, years),
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _nav_return_volatility(reports: list[FundMonthlyReport]) -> QualityFact:
+    observations = [item for item in reports[-36:] if item.monthly_nav_return is not None]
+    if len(observations) < 6:
+        return _missing_fact(
+            "nav_return_volatility",
+            "ratio",
+            "At least six monthly NAV returns are required",
+        )
+    values = [value for item in observations if (value := item.monthly_nav_return) is not None]
+    average = sum(values, Decimal("0")) / Decimal(len(values))
+    variance = sum(((value - average) ** 2 for value in values), Decimal("0")) / Decimal(
+        len(values)
+    )
+    return _value_fact(
+        "nav_return_volatility",
+        Decimal(str(float(variance) ** 0.5)),
+        "ratio",
+        observations[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _positive_nav_return_frequency(reports: list[FundMonthlyReport]) -> QualityFact:
+    observations = [item for item in reports[-36:] if item.monthly_nav_return is not None]
+    if len(observations) < 6:
+        return _missing_fact(
+            "positive_nav_return_frequency",
+            "ratio",
+            "At least six monthly NAV returns are required",
+        )
+    positive = sum(
+        1 for item in observations if (value := item.monthly_nav_return) is not None and value >= 0
+    )
+    return _value_fact(
+        "positive_nav_return_frequency",
+        Decimal(positive) / Decimal(len(observations)),
+        "ratio",
+        observations[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _nav_max_drawdown(reports: list[FundMonthlyReport]) -> QualityFact:
+    recent = [item for item in reports[-60:] if item.nav_per_share > 0]
+    if len(recent) < 6:
+        return _missing_fact(
+            "nav_max_drawdown",
+            "ratio",
+            "At least six monthly reports are required",
+        )
+    peak = recent[0].nav_per_share
+    drawdown = Decimal("0")
+    for item in recent:
+        peak = max(peak, item.nav_per_share)
+        drawdown = max(drawdown, (peak - item.nav_per_share) / peak)
+    return _value_fact(
+        "nav_max_drawdown",
+        drawdown,
+        "ratio",
+        recent[-1].as_of,
+        _CVM_SOURCE,
+        confidence=_DERIVED_CONFIDENCE,
+    )
+
+
+def _distribution_report_consistency(
+    reports: list[FundMonthlyReport],
+    distributions: list[FundDistribution],
+) -> QualityFact:
+    report_values = {
+        (item.as_of.year, item.as_of.month): item.nav_per_share * distribution_yield
+        for item in reports[-36:]
+        if (distribution_yield := item.monthly_distribution_yield) is not None
+        and item.nav_per_share > 0
+    }
+    errors = [
+        abs(item.value - expected) / max(abs(item.value), abs(expected), Decimal("0.000001"))
+        for item in distributions[-36:]
+        if (expected := report_values.get((item.ex_date.year, item.ex_date.month))) is not None
+    ]
+    if len(errors) < 6:
+        return _missing_fact(
+            "distribution_report_consistency_error",
+            "ratio",
+            "At least six matching distribution and report months are required",
+        )
+    errors.sort()
+    midpoint = len(errors) // 2
+    median_error = (
+        errors[midpoint]
+        if len(errors) % 2
+        else (errors[midpoint - 1] + errors[midpoint]) / Decimal("2")
+    )
+    return _value_fact(
+        "distribution_report_consistency_error",
+        median_error,
+        "ratio",
+        reports[-1].as_of,
+        "cvm,public_distributions",
+        confidence=Decimal("0.85"),
+    )
+
+
 def _value_fact(
     key: str,
     value: Decimal | None,
     unit: str,
     reference: date | None,
     source: str,
+    *,
+    confidence: Decimal = _CVM_CONFIDENCE,
 ) -> QualityFact:
     return QualityFact(
         key=key,
@@ -456,7 +865,7 @@ def _value_fact(
         unit=unit,
         as_of=reference if value is not None else None,
         source=source if value is not None else None,
-        confidence=Decimal("1") if value is not None else Decimal("0"),
+        confidence=confidence if value is not None else Decimal("0"),
         status="valid" if value is not None else "missing_data",
         unavailable_reason=None if value is not None else "Public source did not provide this fact",
     )
@@ -474,6 +883,10 @@ def _safe_ratio(
         return None
     value = numerator / denominator
     return value if value.is_finite() else None
+
+
+def _subtract(left: Decimal | None, right: Decimal | None) -> Decimal | None:
+    return left - right if left is not None and right is not None else None
 
 
 def _annualized_growth(

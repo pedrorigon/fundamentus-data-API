@@ -66,6 +66,7 @@ class QualityAssetFacts(BaseModel):
     ticker: str
     kind: QualityAssetKind
     canonical_id: str | None = None
+    profile: str | None = None
     facts: list[QualityFact] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
