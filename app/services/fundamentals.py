@@ -12,6 +12,8 @@ from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+import httpx
+
 from app.cache import CacheStore
 from app.config import Settings
 from app.core.errors import InvalidTickerError
@@ -25,6 +27,7 @@ from app.models.fundamentals import (
 from app.parsers.cvm_statements import StatementPeriod
 from app.parsers.normalizers import normalize_ticker
 from app.scrapers.cvm_open_data import CvmOpenDataProvider, StatementKind
+from app.scrapers.yahoo_fundamentals import YahooFundamentalsProvider
 from app.services.company_matching import match_company
 from app.services.fundamentals_math import build_period, ratio, trailing_twelve_months
 
@@ -42,10 +45,12 @@ class FundamentalsService:
         settings: Settings,
         cache: CacheStore,
         provider: CvmOpenDataProvider | None = None,
+        international: YahooFundamentalsProvider | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache
         self.provider = provider or CvmOpenDataProvider(settings)
+        self.international = international or YahooFundamentalsProvider(settings)
         self._decoded_archives: dict[
             tuple[StatementKind, int],
             dict[str, list[StatementPeriod]] | None,
@@ -65,12 +70,15 @@ class FundamentalsService:
     ) -> FundamentalsSnapshot:
         normalized = self._normalized(ticker)
         if not corporate_name:
-            return _empty(normalized, "Corporate name is required to resolve CVM filings")
+            return await self._fallback(
+                normalized,
+                "Corporate name is required to resolve CVM filings",
+            )
 
         today = reference or datetime.now(UTC).date()
         archives = await self._archives(today)
         if not archives:
-            return _empty(normalized, "CVM statement archives are unavailable")
+            return await self._fallback(normalized, "CVM statement archives are unavailable")
 
         candidates = {
             cnpj: periods[0].company_name
@@ -80,13 +88,16 @@ class FundamentalsService:
         }
         match = match_company(corporate_name, candidates)
         if match is None:
-            return _empty(normalized, "No CVM filing matched this company")
+            return await self._fallback(normalized, "No CVM filing matched this company")
 
         statements = [
             statement for archive in archives for statement in archive.get(match.cnpj, [])
         ]
         if not statements:
-            return _empty(normalized, "No statement periods available for this company")
+            return await self._fallback(
+                normalized,
+                "No statement periods available for this company",
+            )
 
         sector = await self._sector(match.cnpj)
         shares = await self._shares(match.cnpj, today)
@@ -348,6 +359,23 @@ class FundamentalsService:
             return normalize_ticker(ticker)
         except ValueError as exc:
             raise InvalidTickerError(ticker=ticker) from exc
+
+    async def _fallback(self, ticker: str, reason: str) -> FundamentalsSnapshot:
+        """Resolve a foreign listing that the CVM archives cannot describe.
+
+        Every Brazilian issuer files with the CVM, so reaching this point means
+        the ticker is either foreign or genuinely unresolvable. The public
+        annual statements answer the first case; the second keeps the original
+        reason, which explains the CVM failure rather than hiding it behind a
+        second lookup.
+        """
+        try:
+            snapshot = await self.international.snapshot(ticker)
+        except httpx.HTTPError:
+            return _empty(ticker, reason)
+        if snapshot is None:
+            return _empty(ticker, reason)
+        return snapshot
 
 
 def _collect_multiples(

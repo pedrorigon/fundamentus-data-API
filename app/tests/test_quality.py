@@ -601,21 +601,71 @@ async def test_resolves_international_stock_public_facts() -> None:
 
     result = response.assets[0]
     assert result.canonical_id == "US0000000001"
-    assert {fact.key for fact in result.facts} == {
-        "market_capitalization",
-        "dividend_yield",
+    # A foreign listing is derived from the same statements as a Brazilian one,
+    # so it carries the full accounting evidence rather than a thin parallel set.
+    assert {"gross_margin", "net_margin", "return_on_equity"} <= {
+        fact.key for fact in result.facts
     }
-    assert result.warnings == ["Public international profitability history is unavailable"]
+
+
+async def test_international_facts_declare_their_own_source() -> None:
+    """The shared derivation labels its facts as CVM; the origin must be restated."""
+    instrument = InstrumentMetadata(
+        ticker="ACME",
+        instrument_type=InstrumentType.stock,
+        category="INTERNATIONAL",
+        isin="US0000000001",
+    )
+    snapshot = stock_snapshot()
+    for period in snapshot.periods:
+        period.source = "yahoo"
+    service = QualityFactsService(
+        FundamentalsStub(snapshot),  # type: ignore[arg-type]
+        InstrumentsStub({"ACME": instrument_data("ACME", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({"ACME": opportunity("ACME", instrument)}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="ACME", kind=QualityAssetKind.stock)]
+        )
+    )
+
+    result = response.assets[0]
+    assert result.sources == ["yahoo"]
+    assert not any(fact.source == "cvm" for fact in result.facts)
+
+
+async def test_international_facts_report_their_missing_evidence() -> None:
+    instrument = InstrumentMetadata(
+        ticker="ACME",
+        instrument_type=InstrumentType.stock,
+        category="INTERNATIONAL",
+    )
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ACME": instrument_data("ACME", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({"ACME": opportunity("ACME", instrument)}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="ACME", kind=QualityAssetKind.stock)]
+        )
+    )
+
+    assert any("peers" in warning for warning in response.assets[0].warnings)
 
 
 async def test_reports_missing_international_fundamentals() -> None:
+    """Without statements the thin public profile is the only evidence left."""
     instrument = InstrumentMetadata(
         ticker="EMPTY",
         instrument_type=InstrumentType.stock,
         category="INTERNATIONAL",
     )
     service = QualityFactsService(
-        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        FundamentalsStub(FundamentalsSnapshot(ticker="EMPTY")),  # type: ignore[arg-type]
         InstrumentsStub({"EMPTY": instrument_data("EMPTY", instrument)}),  # type: ignore[arg-type]
         OpportunityStub({"EMPTY": opportunity("EMPTY", instrument)}),  # type: ignore[arg-type]
     )

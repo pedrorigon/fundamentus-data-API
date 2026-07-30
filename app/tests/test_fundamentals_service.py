@@ -105,11 +105,32 @@ def archive(year: int, periods: list[StatementPeriod], shares: str = "1000") -> 
     )
 
 
-async def build(tmp_path: Path, provider: CvmOpenDataProvider) -> FundamentalsService:
+class StubInternationalProvider:
+    """Stands in for the foreign statement source, which is never reached in tests."""
+
+    def __init__(self, snapshot: FundamentalsSnapshot | None = None) -> None:
+        self.snapshot_value = snapshot
+        self.calls: list[str] = []
+
+    async def snapshot(self, ticker: str) -> FundamentalsSnapshot | None:
+        self.calls.append(ticker)
+        return self.snapshot_value
+
+
+async def build(
+    tmp_path: Path,
+    provider: CvmOpenDataProvider,
+    international: StubInternationalProvider | None = None,
+) -> FundamentalsService:
     config = settings(tmp_path)
     cache = CacheStore(sqlite_enabled=False, sqlite_path=config.sqlite_cache_path)
     await cache.startup()
-    return FundamentalsService(config, cache, provider)
+    return FundamentalsService(
+        config,
+        cache,
+        provider,
+        international or StubInternationalProvider(),  # type: ignore[arg-type]
+    )
 
 
 async def test_resolves_snapshot_from_primary_source(tmp_path: Path) -> None:
@@ -561,7 +582,12 @@ async def test_periods_carry_the_share_count_of_their_own_year(tmp_path: Path) -
     config = settings(tmp_path)
     cache = CacheStore(sqlite_enabled=False, sqlite_path=config.sqlite_cache_path)
     await cache.startup()
-    service = FundamentalsService(config, cache, provider)
+    service = FundamentalsService(
+        config,
+        cache,
+        provider,
+        StubInternationalProvider(),  # type: ignore[arg-type]
+    )
 
     snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
 
@@ -621,8 +647,72 @@ async def test_periods_do_not_invent_a_historical_share_count(tmp_path: Path) ->
     config = settings(tmp_path)
     cache = CacheStore(sqlite_enabled=False, sqlite_path=config.sqlite_cache_path)
     await cache.startup()
-    service = FundamentalsService(config, cache, provider)
+    service = FundamentalsService(
+        config,
+        cache,
+        provider,
+        StubInternationalProvider(),  # type: ignore[arg-type]
+    )
 
     snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
 
     assert snapshot.periods[0].shares_outstanding is None
+
+
+def _international_snapshot() -> FundamentalsSnapshot:
+    return FundamentalsSnapshot(
+        ticker="AAPL",
+        periods=[
+            FinancialPeriod(
+                period_end=date(2025, 9, 30),
+                consolidated=True,
+                annual=True,
+                revenue=Decimal("416161000000"),
+                net_income=Decimal("112010000000"),
+                source="yahoo",
+            )
+        ],
+        trailing_twelve_months=FinancialPeriod(
+            period_end=date(2025, 9, 30),
+            consolidated=True,
+            annual=True,
+            revenue=Decimal("416161000000"),
+            net_income=Decimal("112010000000"),
+            source="yahoo",
+        ),
+    )
+
+
+async def test_a_foreign_listing_falls_back_to_public_statements(tmp_path: Path) -> None:
+    """No Brazilian issuer is absent from the CVM, so an unmatched ticker is foreign."""
+    international = StubInternationalProvider(_international_snapshot())
+    service = await build(tmp_path, StubProvider(), international)
+
+    snapshot = await service.snapshot("AAPL", None)
+
+    assert snapshot.unavailable_reason is None
+    assert snapshot.periods[0].source == "yahoo"
+    assert international.calls == ["AAPL"]
+
+
+async def test_the_cvm_reason_survives_when_no_statements_are_found(tmp_path: Path) -> None:
+    """A ticker neither source knows must explain the original failure."""
+    service = await build(tmp_path, StubProvider(), StubInternationalProvider(None))
+
+    snapshot = await service.snapshot("NOPE", None)
+
+    assert snapshot.unavailable_reason == "Corporate name is required to resolve CVM filings"
+
+
+async def test_an_unreachable_public_source_does_not_mask_the_cvm_reason(
+    tmp_path: Path,
+) -> None:
+    class FailingProvider(StubInternationalProvider):
+        async def snapshot(self, ticker: str) -> FundamentalsSnapshot | None:
+            raise httpx.ConnectTimeout("unreachable")
+
+    service = await build(tmp_path, StubProvider(), FailingProvider())
+
+    snapshot = await service.snapshot("AAPL", None)
+
+    assert snapshot.unavailable_reason == "Corporate name is required to resolve CVM filings"
