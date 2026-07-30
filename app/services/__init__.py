@@ -4,6 +4,7 @@ from app.services.fundamentals import FundamentalsService
 from app.services.historical_quotes import HistoricalQuoteService
 from app.services.market import InstrumentDataService
 from app.services.opportunity import OpportunityService
+from app.services.quality import QualityFactsService
 
 __all__ = [
     "AssetService",
@@ -12,4 +13,5 @@ __all__ = [
     "HistoricalQuoteService",
     "InstrumentDataService",
     "OpportunityService",
+    "QualityFactsService",
 ]

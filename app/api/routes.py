@@ -12,6 +12,7 @@ from app.api.dependencies import (
     get_historical_quote_service,
     get_instrument_data_service,
     get_opportunity_service,
+    get_quality_facts_service,
 )
 from app.config import get_settings
 from app.core.errors import UnauthorizedCacheInvalidationError
@@ -34,6 +35,8 @@ from app.models import (
     InstrumentMetadata,
     InstrumentType,
     OpportunityResponse,
+    QualityFactsRequest,
+    QualityFactsResponse,
     SectorUniverseResponse,
 )
 from app.services import (
@@ -43,6 +46,7 @@ from app.services import (
     HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
+    QualityFactsService,
 )
 
 router = APIRouter()
@@ -51,6 +55,7 @@ AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
 InstrumentDataServiceDep = Annotated[InstrumentDataService, Depends(get_instrument_data_service)]
 FundamentalsServiceDep = Annotated[FundamentalsService, Depends(get_fundamentals_service)]
+QualityFactsServiceDep = Annotated[QualityFactsService, Depends(get_quality_facts_service)]
 FixedIncomeServiceDep = Annotated[
     FixedIncomeValuationService,
     Depends(get_fixed_income_valuation_service),
@@ -112,6 +117,21 @@ async def get_opportunity(
     service: OpportunityServiceDep,
 ) -> OpportunityResponse:
     return await service.opportunity(ticker)
+
+
+@router.post(
+    "/v1/quality/facts:resolve",
+    response_model=QualityFactsResponse,
+    tags=["quality"],
+)
+async def resolve_quality_facts(
+    payload: QualityFactsRequest,
+    service: QualityFactsServiceDep,
+    response: Response,
+) -> QualityFactsResponse:
+    """Resolve provenanced quality evidence for a bounded asset batch."""
+    _cache_headers(response)
+    return await service.resolve(payload)
 
 
 @router.get(

@@ -50,6 +50,31 @@ the normalized instrument type, confidence, source and reference date. This
 also covers listed instruments that Fundamentus does not expose, such as
 FI-Infra and Fiagro funds.
 
+### `POST /v1/quality/facts:resolve`
+
+Resolves a maximum of 20 assets in one bounded request. Supported kinds are
+`stock`, `real_estate_fund`, `etf`, `crypto` and `fixed_income`.
+
+Stocks receive normalized profitability, cash conversion, growth, solvency,
+liquidity and dilution evidence from CVM statements. Listed funds receive
+reporting and distribution-history evidence. ETFs receive cost, scale, age and
+diversification evidence when a public fund profile is available.
+
+Every fact includes its unit, reference date, source, confidence and explicit
+availability status. Cryptocurrency and fixed-income requests remain in the
+same batch response but report the specialized source or identifier that is
+still required, rather than inferring quality from a ticker.
+
+```json
+{
+  "assets": [
+    {"ticker": "WEGE3", "kind": "stock"},
+    {"ticker": "HGLG11", "kind": "real_estate_fund"},
+    {"ticker": "VOO", "kind": "etf"}
+  ]
+}
+```
+
 ### `POST /v1/equities/historical-quotes/resolve`
 
 Resolves public B3 COTAHIST closing prices for Brazilian equities on or before

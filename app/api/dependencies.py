@@ -9,6 +9,7 @@ from app.services import (
     HistoricalQuoteService,
     InstrumentDataService,
     OpportunityService,
+    QualityFactsService,
 )
 
 
@@ -34,3 +35,7 @@ def get_historical_quote_service(request: Request) -> HistoricalQuoteService:
 
 def get_fundamentals_service(request: Request) -> FundamentalsService:
     return cast(FundamentalsService, request.app.state.fundamentals_service)
+
+
+def get_quality_facts_service(request: Request) -> QualityFactsService:
+    return cast(QualityFactsService, request.app.state.quality_facts_service)
