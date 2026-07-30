@@ -7,9 +7,13 @@ from decimal import Decimal
 from app.models.fundamentals import FinancialPeriod
 from app.parsers.cvm_statements import (
     ACCOUNT_CASH,
+    ACCOUNT_CURRENT_ASSETS,
     ACCOUNT_CURRENT_DEBT,
+    ACCOUNT_CURRENT_LIABILITIES,
     ACCOUNT_EBIT,
     ACCOUNT_EQUITY,
+    ACCOUNT_FINANCIAL_RESULT,
+    ACCOUNT_GROSS_PROFIT,
     ACCOUNT_INVESTING_CASH_FLOW,
     ACCOUNT_LONG_TERM_DEBT,
     ACCOUNT_NET_INCOME,
@@ -73,6 +77,8 @@ def test_net_debt_subtracts_cash_and_short_term_investments() -> None:
     )
 
     assert period.gross_debt == Decimal("200")
+    assert period.short_term_debt == Decimal("50")
+    assert period.long_term_debt == Decimal("150")
     assert period.net_debt == Decimal("150")
 
 
@@ -231,17 +237,64 @@ def test_build_period_maps_core_accounts() -> None:
         statement(
             {
                 ACCOUNT_REVENUE: Decimal("1000"),
+                ACCOUNT_GROSS_PROFIT: Decimal("450"),
+                ACCOUNT_EBIT: Decimal("220"),
+                ACCOUNT_FINANCIAL_RESULT: Decimal("-35"),
                 ACCOUNT_NET_INCOME: Decimal("150"),
                 ACCOUNT_EQUITY: Decimal("900"),
+                ACCOUNT_CURRENT_ASSETS: Decimal("600"),
+                ACCOUNT_CURRENT_LIABILITIES: Decimal("300"),
             }
         ),
         shares_outstanding=Decimal("100"),
     )
 
     assert period.revenue == Decimal("1000")
+    assert period.gross_profit == Decimal("450")
+    assert period.ebit == Decimal("220")
+    assert period.financial_result == Decimal("-35")
     assert period.net_income == Decimal("150")
     assert period.equity == Decimal("900")
+    assert period.current_assets == Decimal("600")
+    assert period.current_liabilities == Decimal("300")
     assert period.shares_outstanding == Decimal("100")
+
+
+def test_trailing_twelve_months_keeps_balance_and_aggregates_new_flows() -> None:
+    comparable = interim(date(2023, 9, 30), "900")
+    previous = FinancialPeriod(
+        period_end=date(2023, 12, 31),
+        consolidated=True,
+        annual=True,
+        gross_profit=Decimal("500"),
+        financial_result=Decimal("-30"),
+    )
+    latest = interim(date(2024, 9, 30), "1200").model_copy(
+        update={
+            "gross_profit": Decimal("480"),
+            "financial_result": Decimal("-20"),
+            "current_assets": Decimal("700"),
+            "current_liabilities": Decimal("350"),
+            "short_term_debt": Decimal("80"),
+            "long_term_debt": Decimal("200"),
+        }
+    )
+    comparable = comparable.model_copy(
+        update={
+            "gross_profit": Decimal("360"),
+            "financial_result": Decimal("-15"),
+        }
+    )
+
+    result = trailing_twelve_months([comparable, previous, latest])
+
+    assert result is not None
+    assert result.gross_profit == Decimal("620")
+    assert result.financial_result == Decimal("-35")
+    assert result.current_assets == Decimal("700")
+    assert result.current_liabilities == Decimal("350")
+    assert result.short_term_debt == Decimal("80")
+    assert result.long_term_debt == Decimal("200")
 
 
 def test_build_period_derives_historical_shares_from_filing_eps() -> None:
