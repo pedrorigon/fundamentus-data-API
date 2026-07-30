@@ -273,8 +273,7 @@ def _monthly_report(
             percentage_points=percentage_points,
         ),
         monthly_effective_return=_ratio(
-            row.get("Percentual_Rentabilidade_Efetiva_Mes")
-            or row.get("Rentabilidade_Efetiva_Mes"),
+            row.get("Percentual_Rentabilidade_Efetiva_Mes") or row.get("Rentabilidade_Efetiva_Mes"),
             percentage_points=percentage_points,
         ),
     )
