@@ -26,6 +26,7 @@ from app.models.quality import (
     QualityFactsRequest,
     QualityFactsResponse,
 )
+from app.scrapers.yahoo_fundamentals import SOURCE_YAHOO
 from app.services.bcb_quality import (
     BankQualitySnapshot,
     BcbBankProvider,
@@ -136,7 +137,7 @@ class QualityFactsService:
     ) -> QualityAssetFacts:
         instrument = opportunity.instrument or instrument_data.instrument
         if instrument is None or instrument.category == "INTERNATIONAL":
-            return _international_stock_facts(asset, instrument_data)
+            return await self._international_facts(asset, instrument_data, opportunity)
         metrics = opportunity.metrics
         snapshot = await self.fundamentals.snapshot(
             asset.ticker,
@@ -173,6 +174,57 @@ class QualityFactsService:
             peers,
             macro,
             bank,
+        )
+
+
+    async def _international_facts(
+        self,
+        asset: QualityAssetRequest,
+        instrument_data: InstrumentDataResponse,
+        opportunity: OpportunityResponse,
+    ) -> QualityAssetFacts:
+        """Quality evidence for a listing outside the CVM filing universe.
+
+        The statements are read from the public annual timeseries and then run
+        through the same derivation as a Brazilian issuer, so an international
+        stock and a REIT are scored on the same definitions rather than on a
+        thinner parallel set. Sector peers and prudential data have no free
+        international equivalent, so those inputs stay absent and their weight
+        is redistributed by the consumer.
+        """
+        snapshot = await self.fundamentals.snapshot(asset.ticker)
+        if snapshot.trailing_twelve_months is None:
+            return _international_stock_facts(asset, instrument_data)
+        facts = _financial_facts(
+            asset,
+            snapshot,
+            instrument_data.instrument.isin if instrument_data.instrument else None,
+            opportunity,
+            [],
+            None,
+            None,
+        )
+        # The derivations are shared with the CVM path, which labels every fact
+        # it produces with its own source. Restate the origin so the provenance
+        # names the statements these figures actually came from.
+        origin = snapshot.periods[-1].source if snapshot.periods else SOURCE_YAHOO
+        isin = instrument_data.instrument.isin if instrument_data.instrument else None
+        return facts.model_copy(
+            update={
+                # A foreign listing is identified by its ISIN; it has no CNPJ.
+                "canonical_id": isin or facts.canonical_id,
+                "facts": [
+                    fact.model_copy(update={"source": origin})
+                    if fact.source == _CVM_SOURCE
+                    else fact
+                    for fact in facts.facts
+                ],
+                "sources": [origin],
+                "warnings": [
+                    *facts.warnings,
+                    "International peers and prudential evidence are unavailable",
+                ],
+            }
         )
 
 
