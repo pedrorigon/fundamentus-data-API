@@ -4,7 +4,12 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 NULL_TOKENS = {"", "-", "--", "n/a", "na", "nd", "n.d.", "indisponivel", "indisponível"}
-TICKER_RE = re.compile(r"^[A-Z0-9]{4,12}$")
+# Brazilian tickers are always four or more characters, but international
+# symbols are not: a NYSE listing can be a single letter (O, F, T), a share
+# class is written with a dot (BRK.B) and a foreign listing carries an exchange
+# suffix (VUAA.L). The separators may not start or end the symbol.
+TICKER_RE = re.compile(r"^[A-Z0-9]+(?:[.\-][A-Z0-9]+)*$")
+MAX_TICKER_LENGTH = 12
 
 
 def clean_text(value: str | None) -> str:
@@ -22,7 +27,7 @@ def normalize_key(label: str) -> str:
 
 def normalize_ticker(ticker: str) -> str:
     normalized = clean_text(ticker).upper()
-    if not TICKER_RE.fullmatch(normalized):
+    if len(normalized) > MAX_TICKER_LENGTH or not TICKER_RE.fullmatch(normalized):
         raise ValueError("invalid ticker")
     return normalized
 
