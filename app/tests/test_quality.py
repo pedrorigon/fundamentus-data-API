@@ -603,9 +603,7 @@ async def test_resolves_international_stock_public_facts() -> None:
     assert result.canonical_id == "US0000000001"
     # A foreign listing is derived from the same statements as a Brazilian one,
     # so it carries the full accounting evidence rather than a thin parallel set.
-    assert {"gross_margin", "net_margin", "return_on_equity"} <= {
-        fact.key for fact in result.facts
-    }
+    assert {"gross_margin", "net_margin", "return_on_equity"} <= {fact.key for fact in result.facts}
 
 
 async def test_international_facts_declare_their_own_source() -> None:

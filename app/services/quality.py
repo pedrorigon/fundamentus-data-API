@@ -176,7 +176,6 @@ class QualityFactsService:
             bank,
         )
 
-
     async def _international_facts(
         self,
         asset: QualityAssetRequest,
