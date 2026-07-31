@@ -309,19 +309,27 @@ class FundamentalsService:
             )
             self._decoded_archives[archive_key] = None
             return None
-        await self.cache.set(
-            key,
-            _encode_periods(archive.periods),
-            self.settings.fundamentals_statements_ttl_seconds,
-            memory=False,
-        )
+        ttl = self._archive_ttl(year)
+        await self.cache.set(key, _encode_periods(archive.periods), ttl, memory=False)
         await self.cache.set(
             f"{_CACHE_PREFIX}:shares:{year}",
             {cnpj: str(value.outstanding_shares) for cnpj, value in archive.share_capital.items()},
-            self.settings.fundamentals_statements_ttl_seconds,
+            ttl,
         )
         self._decoded_archives[archive_key] = archive.periods
         return archive.periods
+
+    def _archive_ttl(self, year: int) -> int:
+        """How long a statement archive stays valid.
+
+        A closed exercise is not stale data, it is final data: once the year is
+        over the filings it contains no longer change, so revalidating them
+        daily re-downloads and re-decodes tens of megabytes to read the same
+        numbers. Only the exercise still in progress is refreshed on a clock.
+        """
+        if year < datetime.now(UTC).date().year:
+            return self.settings.closed_statements_ttl_seconds
+        return self.settings.fundamentals_statements_ttl_seconds
 
     async def _shares_by_year(self, cnpj: str, reference: date) -> dict[int, Decimal]:
         """Share counts reported for each cached year."""
