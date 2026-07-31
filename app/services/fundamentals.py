@@ -27,9 +27,9 @@ from app.models.fundamentals import (
 from app.parsers.cvm_statements import StatementPeriod
 from app.parsers.normalizers import normalize_ticker
 from app.scrapers.cvm_open_data import CvmOpenDataProvider, StatementKind
-from app.scrapers.international_listings import (
-    InternationalListing,
-    InternationalListingProvider,
+from app.scrapers.international_statements import (
+    InternationalStatements,
+    InternationalStatementsProvider,
 )
 from app.services.company_matching import match_company
 from app.services.fundamentals_math import build_period, ratio, trailing_twelve_months
@@ -48,12 +48,12 @@ class FundamentalsService:
         settings: Settings,
         cache: CacheStore,
         provider: CvmOpenDataProvider | None = None,
-        international: InternationalListingProvider | None = None,
+        international: InternationalStatementsProvider | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache
         self.provider = provider or CvmOpenDataProvider(settings)
-        self.international = international or InternationalListingProvider(settings)
+        self.international = international or InternationalStatementsProvider(settings)
         self._decoded_archives: dict[
             tuple[StatementKind, int],
             dict[str, list[StatementPeriod]] | None,
@@ -373,12 +373,12 @@ class FundamentalsService:
         second lookup.
         """
         try:
-            listing = await self.international.listing(ticker)
+            statements = await self.international.statements(ticker)
         except httpx.HTTPError:
             return _empty(ticker, reason)
-        if listing is None:
+        if statements is None or not statements.is_available:
             return _empty(ticker, reason)
-        return _international_snapshot(listing)
+        return _international_snapshot(statements)
 
 
 def _collect_multiples(
@@ -543,46 +543,53 @@ def _empty(ticker: str, reason: str) -> FundamentalsSnapshot:
     return FundamentalsSnapshot(ticker=ticker, unavailable_reason=reason)
 
 
-def _international_snapshot(listing: InternationalListing) -> FundamentalsSnapshot:
-    """Turn published indicators into the snapshot shape consumers expect.
+def _international_snapshot(statements: InternationalStatements) -> FundamentalsSnapshot:
+    """Turn published statements into the snapshot shape consumers expect.
 
-    The page states ratios and balance-sheet totals rather than a full income
-    statement, so the period carries only what is actually published. Earnings
-    are implied by the reported equity and the two multiples, which is the one
-    derivation the stated values support: the price to book gives the market
-    value of the equity and the price to earnings turns it into a result.
+    The income statement is reported per year, so each one becomes a period and
+    the most recent stands in for the trailing figures. The balance sheet is a
+    single current snapshot rather than a series, so it is attached only to the
+    latest period: repeating it across earlier years would claim the company
+    always carried today's assets and debt.
     """
-    equity = listing.equity
-    shares = listing.shares_outstanding
-    market_cap = listing.market_capitalization or _product(
-        listing.price_to_book,
-        equity,
-    )
-    net_income = _quotient(market_cap, listing.price_to_earnings)
-    period = FinancialPeriod(
-        period_end=datetime.now(UTC).date(),
-        consolidated=True,
-        annual=True,
-        net_income=net_income,
-        equity=equity,
-        total_assets=listing.total_assets,
-        shares_outstanding=shares,
-        source=listing.source,
-    )
+    latest = statements.years[-1]
+    shares = _quotient(latest.net_income, latest.earnings_per_share)
+    periods = [
+        FinancialPeriod(
+            period_end=year.period_end,
+            consolidated=True,
+            annual=True,
+            revenue=year.revenue,
+            gross_profit=year.gross_profit,
+            ebit=year.ebit,
+            net_income=year.net_income,
+            operating_cash_flow=year.operating_cash_flow,
+            shares_outstanding=_quotient(year.net_income, year.earnings_per_share),
+            source=statements.source,
+            **(_balance_of(statements) if year is latest else {}),
+        )
+        for year in statements.years
+    ]
     return FundamentalsSnapshot(
-        ticker=listing.ticker,
-        sector=listing.sector,
-        currency=listing.currency or "USD",
-        periods=[period],
-        trailing_twelve_months=period,
+        ticker=statements.ticker,
+        currency=statements.currency,
+        periods=periods,
+        trailing_twelve_months=periods[-1],
         shares_outstanding=shares,
-        earnings_per_share=_quotient(net_income, shares),
-        book_value_per_share=_quotient(equity, shares),
-        recurring_dividends_per_share=_product(
-            listing.dividend_yield,
-            _quotient(market_cap, shares),
-        ),
+        earnings_per_share=latest.earnings_per_share,
+        book_value_per_share=_quotient(statements.equity, shares),
     )
+
+
+def _balance_of(statements: InternationalStatements) -> dict[str, Decimal | None]:
+    return {
+        "equity": statements.equity,
+        "total_assets": statements.total_assets,
+        "current_assets": statements.current_assets,
+        "gross_debt": statements.gross_debt,
+        "net_debt": statements.net_debt,
+        "cash_and_equivalents": statements.cash_and_equivalents,
+    }
 
 
 def _product(left: Decimal | None, right: Decimal | None) -> Decimal | None:
