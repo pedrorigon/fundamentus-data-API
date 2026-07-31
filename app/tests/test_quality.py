@@ -616,7 +616,7 @@ async def test_international_facts_declare_their_own_source() -> None:
     )
     snapshot = stock_snapshot()
     for period in snapshot.periods:
-        period.source = "yahoo"
+        period.source = "investidor10"
     service = QualityFactsService(
         FundamentalsStub(snapshot),  # type: ignore[arg-type]
         InstrumentsStub({"ACME": instrument_data("ACME", instrument)}),  # type: ignore[arg-type]
@@ -630,7 +630,7 @@ async def test_international_facts_declare_their_own_source() -> None:
     )
 
     result = response.assets[0]
-    assert result.sources == ["yahoo"]
+    assert result.sources == ["investidor10"]
     assert not any(fact.source == "cvm" for fact in result.facts)
 
 

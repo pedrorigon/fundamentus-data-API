@@ -27,7 +27,10 @@ from app.models.fundamentals import (
 from app.parsers.cvm_statements import StatementPeriod
 from app.parsers.normalizers import normalize_ticker
 from app.scrapers.cvm_open_data import CvmOpenDataProvider, StatementKind
-from app.scrapers.yahoo_fundamentals import YahooFundamentalsProvider
+from app.scrapers.international_listings import (
+    InternationalListing,
+    InternationalListingProvider,
+)
 from app.services.company_matching import match_company
 from app.services.fundamentals_math import build_period, ratio, trailing_twelve_months
 
@@ -45,12 +48,12 @@ class FundamentalsService:
         settings: Settings,
         cache: CacheStore,
         provider: CvmOpenDataProvider | None = None,
-        international: YahooFundamentalsProvider | None = None,
+        international: InternationalListingProvider | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache
         self.provider = provider or CvmOpenDataProvider(settings)
-        self.international = international or YahooFundamentalsProvider(settings)
+        self.international = international or InternationalListingProvider(settings)
         self._decoded_archives: dict[
             tuple[StatementKind, int],
             dict[str, list[StatementPeriod]] | None,
@@ -365,17 +368,17 @@ class FundamentalsService:
 
         Every Brazilian issuer files with the CVM, so reaching this point means
         the ticker is either foreign or genuinely unresolvable. The public
-        annual statements answer the first case; the second keeps the original
+        indicator page answers the first case; the second keeps the original
         reason, which explains the CVM failure rather than hiding it behind a
         second lookup.
         """
         try:
-            snapshot = await self.international.snapshot(ticker)
+            listing = await self.international.listing(ticker)
         except httpx.HTTPError:
             return _empty(ticker, reason)
-        if snapshot is None:
+        if listing is None:
             return _empty(ticker, reason)
-        return snapshot
+        return _international_snapshot(listing)
 
 
 def _collect_multiples(
@@ -538,6 +541,58 @@ def _normalize_share_history(series: dict[int, Decimal]) -> dict[int, Decimal]:
 
 def _empty(ticker: str, reason: str) -> FundamentalsSnapshot:
     return FundamentalsSnapshot(ticker=ticker, unavailable_reason=reason)
+
+
+def _international_snapshot(listing: InternationalListing) -> FundamentalsSnapshot:
+    """Turn published indicators into the snapshot shape consumers expect.
+
+    The page states ratios and balance-sheet totals rather than a full income
+    statement, so the period carries only what is actually published. Earnings
+    are implied by the reported equity and the two multiples, which is the one
+    derivation the stated values support: the price to book gives the market
+    value of the equity and the price to earnings turns it into a result.
+    """
+    equity = listing.equity
+    shares = listing.shares_outstanding
+    market_cap = listing.market_capitalization or _product(
+        listing.price_to_book,
+        equity,
+    )
+    net_income = _quotient(market_cap, listing.price_to_earnings)
+    period = FinancialPeriod(
+        period_end=datetime.now(UTC).date(),
+        consolidated=True,
+        annual=True,
+        net_income=net_income,
+        equity=equity,
+        total_assets=listing.total_assets,
+        shares_outstanding=shares,
+        source=listing.source,
+    )
+    return FundamentalsSnapshot(
+        ticker=listing.ticker,
+        sector=listing.sector,
+        currency=listing.currency or "USD",
+        periods=[period],
+        trailing_twelve_months=period,
+        shares_outstanding=shares,
+        earnings_per_share=_quotient(net_income, shares),
+        book_value_per_share=_quotient(equity, shares),
+        recurring_dividends_per_share=_product(
+            listing.dividend_yield,
+            _quotient(market_cap, shares),
+        ),
+    )
+
+
+def _product(left: Decimal | None, right: Decimal | None) -> Decimal | None:
+    return None if left is None or right is None else left * right
+
+
+def _quotient(numerator: Decimal | None, denominator: Decimal | None) -> Decimal | None:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
 
 
 def _encode_periods(

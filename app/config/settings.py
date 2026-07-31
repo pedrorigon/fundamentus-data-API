@@ -36,11 +36,10 @@ class Settings(BaseSettings):
     brapi_token: SecretStr | None = None
     alpha_vantage_base_url: str = "https://www.alphavantage.co"
     alpha_vantage_api_key: SecretStr | None = None
-    # Public annual statements for foreign listings. Alpha Vantage covers the
+    # Public indicator pages for foreign listings. Alpha Vantage covers the
     # same ground but requires a per-user API key, so it cannot be the default
     # source for a self-hosted deployment.
-    yahoo_fundamentals_base_url: str = "https://query2.finance.yahoo.com"
-    yahoo_quote_base_url: str = "https://query1.finance.yahoo.com"
+    investidor10_base_url: str = "https://investidor10.com.br"
     bazin_minimum_yield_percent: Decimal = Decimal("6")
     user_agent: str = (
         f"fundamentus-data-api/{__version__} local scraper "
