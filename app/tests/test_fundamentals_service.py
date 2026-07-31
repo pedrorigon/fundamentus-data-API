@@ -24,7 +24,7 @@ from app.parsers.cvm_statements import (
     StatementPeriod,
 )
 from app.scrapers.cvm_open_data import CvmOpenDataProvider, StatementArchive, StatementKind
-from app.scrapers.international_listings import InternationalListing
+from app.scrapers.international_statements import AnnualFigures, InternationalStatements
 from app.services.fundamentals import FundamentalsService
 
 CNPJ = "11111111000111"
@@ -107,15 +107,15 @@ def archive(year: int, periods: list[StatementPeriod], shares: str = "1000") -> 
 
 
 class StubInternationalProvider:
-    """Stands in for the public indicator pages, which tests never reach."""
+    """Stands in for the public statement pages, which tests never reach."""
 
-    def __init__(self, listing: InternationalListing | None = None) -> None:
-        self.listing_value = listing
+    def __init__(self, statements: InternationalStatements | None = None) -> None:
+        self.statements_value = statements
         self.calls: list[str] = []
 
-    async def listing(self, ticker: str) -> InternationalListing | None:
+    async def statements(self, ticker: str) -> InternationalStatements | None:
         self.calls.append(ticker)
-        return self.listing_value
+        return self.statements_value
 
 
 async def build(
@@ -660,28 +660,37 @@ async def test_periods_do_not_invent_a_historical_share_count(tmp_path: Path) ->
     assert snapshot.periods[0].shares_outstanding is None
 
 
-def _international_listing() -> InternationalListing:
-    return InternationalListing(
+def _international_statements() -> InternationalStatements:
+    return InternationalStatements(
         ticker="AAPL",
-        currency="USD",
-        price=Decimal("331.09"),
-        price_to_earnings=Decimal("39.84"),
-        price_to_book=Decimal("45.86"),
-        market_capitalization=Decimal("4883614590000"),
+        years=(
+            AnnualFigures(
+                period_end=date(2024, 9, 28),
+                revenue=Decimal("391035000000"),
+                net_income=Decimal("93736000000"),
+                earnings_per_share=Decimal("6.08"),
+            ),
+            AnnualFigures(
+                period_end=date(2025, 9, 27),
+                revenue=Decimal("416161000000"),
+                net_income=Decimal("112010000000"),
+                earnings_per_share=Decimal("7.46"),
+            ),
+        ),
         equity=Decimal("106491000000"),
-        shares_outstanding=Decimal("14673000000"),
+        total_assets=Decimal("371082000000"),
     )
 
 
 async def test_a_foreign_listing_falls_back_to_public_statements(tmp_path: Path) -> None:
     """No Brazilian issuer is absent from the CVM, so an unmatched ticker is foreign."""
-    international = StubInternationalProvider(_international_listing())
+    international = StubInternationalProvider(_international_statements())
     service = await build(tmp_path, StubProvider(), international)
 
     snapshot = await service.snapshot("AAPL", None)
 
     assert snapshot.unavailable_reason is None
-    assert snapshot.periods[0].source == "investidor10"
+    assert snapshot.periods[0].source == "public_filings"
     assert international.calls == ["AAPL"]
 
 
@@ -698,7 +707,7 @@ async def test_an_unreachable_public_source_does_not_mask_the_cvm_reason(
     tmp_path: Path,
 ) -> None:
     class FailingProvider(StubInternationalProvider):
-        async def listing(self, ticker: str) -> InternationalListing | None:
+        async def statements(self, ticker: str) -> InternationalStatements | None:
             raise httpx.ConnectTimeout("unreachable")
 
     service = await build(tmp_path, StubProvider(), FailingProvider())

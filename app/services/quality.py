@@ -26,7 +26,7 @@ from app.models.quality import (
     QualityFactsRequest,
     QualityFactsResponse,
 )
-from app.scrapers.international_listings import SOURCE_INVESTIDOR10
+from app.scrapers.international_statements import SOURCE_STATEMENTS
 from app.services.bcb_quality import (
     BankQualitySnapshot,
     BcbBankProvider,
@@ -206,7 +206,7 @@ class QualityFactsService:
         # The derivations are shared with the CVM path, which labels every fact
         # it produces with its own source. Restate the origin so the provenance
         # names the statements these figures actually came from.
-        origin = snapshot.periods[-1].source if snapshot.periods else SOURCE_INVESTIDOR10
+        origin = snapshot.periods[-1].source if snapshot.periods else SOURCE_STATEMENTS
         isin = instrument_data.instrument.isin if instrument_data.instrument else None
         return facts.model_copy(
             update={
