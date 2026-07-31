@@ -33,6 +33,8 @@ from app.models.fixed_income import (
 from app.models.fundamentals import (
     FieldProvenance,
     FinancialPeriod,
+    FundamentalsBatchRequest,
+    FundamentalsBatchResponse,
     FundamentalsResponse,
     FundamentalsSnapshot,
     PeerGroup,
@@ -81,6 +83,8 @@ __all__ = [
     "OpportunityResponse",
     "FieldProvenance",
     "FinancialPeriod",
+    "FundamentalsBatchRequest",
+    "FundamentalsBatchResponse",
     "FundamentalsResponse",
     "FundamentalsSnapshot",
     "PeerGroup",

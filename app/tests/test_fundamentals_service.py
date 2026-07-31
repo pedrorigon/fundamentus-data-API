@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from app.cache import CacheStore
 from app.config import Settings
@@ -785,3 +786,113 @@ async def test_a_company_that_matches_nothing_is_not_cached(tmp_path: Path) -> N
     )
 
     assert snapshot.unavailable_reason == "No CVM filing matched this company"
+
+
+async def test_batch_endpoint_matches_the_single_one(tmp_path: Path) -> None:
+    """A batch is a round-trip optimisation, not a different resolution."""
+    from app.api.dependencies import get_fundamentals_service, get_opportunity_service
+    from app.main import create_app
+    from app.models import InstrumentMetadata, InstrumentType
+
+    year = datetime.now(UTC).date().year
+    provider = StubProvider({("dfp", year): archive(year, [period(date(year, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    class StubOpportunity:
+        async def opportunity(self, ticker: str) -> SimpleNamespace:
+            instrument = InstrumentMetadata(
+                ticker=ticker,
+                name=COMPANY,
+                instrument_type=InstrumentType.stock,
+                category=None,
+                cfi_code=None,
+                isin=None,
+                currency="BRL",
+                reference_date=None,
+            )
+
+            def metric(value: Decimal) -> SimpleNamespace:
+                return SimpleNamespace(value=value, sources=["fundamentus"])
+
+            return SimpleNamespace(
+                instrument=instrument,
+                metrics=SimpleNamespace(
+                    shares_outstanding=metric(Decimal("1000")),
+                    earnings_per_share=metric(Decimal("4")),
+                    book_value_per_share=metric(Decimal("9")),
+                    dividends_12m=metric(Decimal("2")),
+                ),
+            )
+
+    app = create_app()
+    app.dependency_overrides[get_fundamentals_service] = lambda: service
+    app.dependency_overrides[get_opportunity_service] = StubOpportunity
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        single = await client.get("/v1/assets/TEST4/fundamentals")
+        batch = await client.post(
+            "/v1/assets/fundamentals:resolve",
+            json={"tickers": ["TEST4"]},
+        )
+
+    assert batch.status_code == 200
+    assert batch.json()["assets"][0]["snapshot"] == single.json()["snapshot"]
+
+
+async def test_batch_endpoint_answers_in_the_requested_order(tmp_path: Path) -> None:
+    """Results are keyed back to their ticker, not to completion order."""
+    from app.api.dependencies import get_fundamentals_service, get_opportunity_service
+    from app.main import create_app
+
+    year = datetime.now(UTC).date().year
+    provider = StubProvider({("dfp", year): archive(year, [period(date(year, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    class StubOpportunity:
+        async def opportunity(self, ticker: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                instrument=None,
+                metrics=SimpleNamespace(
+                    shares_outstanding=SimpleNamespace(value=None, sources=[]),
+                    earnings_per_share=SimpleNamespace(value=None, sources=[]),
+                    book_value_per_share=SimpleNamespace(value=None, sources=[]),
+                    dividends_12m=SimpleNamespace(value=None, sources=[]),
+                ),
+            )
+
+    app = create_app()
+    app.dependency_overrides[get_fundamentals_service] = lambda: service
+    app.dependency_overrides[get_opportunity_service] = StubOpportunity
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/assets/fundamentals:resolve",
+            json={"tickers": ["AAA4", "BBB3", "CCC11"]},
+        )
+
+    assert [item["ticker"] for item in response.json()["assets"]] == ["AAA4", "BBB3", "CCC11"]
+
+
+def test_batch_request_rejects_a_repeated_ticker() -> None:
+    """Resolving the same ticker twice would duplicate the work for one answer."""
+    from app.models import FundamentalsBatchRequest
+
+    with pytest.raises(ValidationError, match="duplicates"):
+        FundamentalsBatchRequest(tickers=["TEST4", "test4"])
+
+
+def test_batch_request_normalizes_its_tickers() -> None:
+    from app.models import FundamentalsBatchRequest
+
+    assert FundamentalsBatchRequest(tickers=[" petr4 "]).tickers == ["PETR4"]
+
+
+def test_batch_request_requires_a_usable_ticker() -> None:
+    from app.models import FundamentalsBatchRequest
+
+    with pytest.raises(ValidationError):
+        FundamentalsBatchRequest(tickers=["   "])
