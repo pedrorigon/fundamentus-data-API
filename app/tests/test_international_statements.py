@@ -14,6 +14,7 @@ from app.scrapers.international_statements import (
     parse_annual_income,
     parse_balance_sheet,
     parse_operating_cash_flow,
+    parse_reit_balance_sheet,
 )
 
 
@@ -228,3 +229,93 @@ async def test_operating_cash_flow_reaches_the_reported_years() -> None:
 
     assert statements is not None
     assert statements.years[-1].operating_cash_flow == Decimal("111482000000")
+
+
+def _reit_cell(label: str, value: str) -> str:
+    return (
+        f'<div class="cell"><span class="name">{label}</span>'
+        f'<div class="value"><span>{value}</span></div></div>'
+    )
+
+
+def test_reit_balance_totals_are_read_from_the_listing_page() -> None:
+    html = "".join(
+        [
+            _reit_cell("Patrimônio Líquido", "$ 40,12 Bilhões R$ 40.123.970.000"),
+            _reit_cell("Ativos", "$ 72,80 Bilhões R$ 72.795.610.000"),
+        ]
+    )
+
+    values = parse_reit_balance_sheet(html)
+
+    assert values["equity"] == Decimal("40120000000.00")
+    assert values["total_assets"] == Decimal("72800000000.00")
+
+
+def test_the_converted_amount_is_never_taken() -> None:
+    """The page states the figure and then a conversion; mixing them mixes currencies."""
+    values = parse_reit_balance_sheet(_reit_cell("Ativos", "$ 72,80 Bilhões R$ 72.795.610.000"))
+
+    assert values["total_assets"] == Decimal("72800000000.00")
+
+
+def test_a_reit_magnitude_is_matched_at_its_full_length() -> None:
+    """Regression: "mil" is a prefix of "milhoes" and scaled by a thousand."""
+    values = parse_reit_balance_sheet(_reit_cell("Ativos", "$ 920,00 Milhões R$ 920.000.000"))
+
+    assert values["total_assets"] == Decimal("920000000.00")
+
+
+@pytest.mark.parametrize("html", ["", "<html></html>", '<div class="cell"></div>'])
+def test_a_page_without_reit_totals_yields_nothing(html: str) -> None:
+    assert parse_reit_balance_sheet(html) == {}
+
+
+def test_an_unreadable_reit_amount_is_skipped() -> None:
+    assert parse_reit_balance_sheet(_reit_cell("Ativos", "-")) == {}
+
+
+async def test_a_reit_falls_back_to_its_listing_balance_sheet() -> None:
+    """Status Invest lists ordinary shares only, so a REIT has no entry there."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "investidor10" in request.url.host:
+            return httpx.Response(
+                200,
+                text=_reit_cell("Patrimônio Líquido", "$ 40,12 Bilhões R$ 40.123.970.000"),
+            )
+        if "statusinvest" in request.url.host:
+            return httpx.Response(404)
+        return httpx.Response(200, text=_income_page())
+
+    provider = InternationalStatementsProvider(
+        Settings(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    statements = await provider.statements("O")
+
+    assert statements is not None
+    assert statements.equity == Decimal("40120000000.00")
+
+
+async def test_a_listed_company_keeps_its_own_balance_sheet() -> None:
+    """The fallback must not override a balance sheet that already resolved."""
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.host)
+        if "statusinvest" in request.url.host:
+            return httpx.Response(200, text=_balance_row("Ativos", "371.082.000.000,00"))
+        return httpx.Response(200, text=_income_page())
+
+    provider = InternationalStatementsProvider(
+        Settings(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    statements = await provider.statements("AAPL")
+
+    assert statements is not None
+    assert statements.total_assets == Decimal("371082000000.00")
+    assert not any("investidor10" in host for host in requested)
