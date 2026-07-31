@@ -715,3 +715,26 @@ async def test_an_unreachable_public_source_does_not_mask_the_cvm_reason(
     snapshot = await service.snapshot("AAPL", None)
 
     assert snapshot.unavailable_reason == "Corporate name is required to resolve CVM filings"
+
+
+async def test_a_closed_exercise_is_cached_far_longer_than_the_current_one(
+    tmp_path: Path,
+) -> None:
+    """A finished filing no longer changes, so re-reading it daily is waste."""
+    service = await build(tmp_path, StubProvider())
+    current_year = datetime.now(UTC).date().year
+
+    closed = service._archive_ttl(current_year - 1)
+    current = service._archive_ttl(current_year)
+
+    assert closed > current
+    assert current == service.settings.fundamentals_statements_ttl_seconds
+
+
+async def test_every_past_exercise_shares_the_closed_validity(tmp_path: Path) -> None:
+    service = await build(tmp_path, StubProvider())
+    current_year = datetime.now(UTC).date().year
+
+    validities = {service._archive_ttl(current_year - offset) for offset in range(1, 8)}
+
+    assert validities == {service.settings.closed_statements_ttl_seconds}
