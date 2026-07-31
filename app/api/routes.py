@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, date, datetime
 from typing import Annotated
 
@@ -27,6 +28,8 @@ from app.models import (
     DividendPeriod,
     FixedIncomeValuationRequest,
     FixedIncomeValuationResponse,
+    FundamentalsBatchRequest,
+    FundamentalsBatchResponse,
     FundamentalsResponse,
     HealthResponse,
     HistoricalQuoteRequest,
@@ -147,6 +150,15 @@ async def get_fundamentals(
 ) -> FundamentalsResponse:
     """Return multi-year fundamentals resolved from CVM filings."""
     _cache_headers(response)
+    return await _resolve_fundamentals(ticker, fundamentals, opportunity)
+
+
+async def _resolve_fundamentals(
+    ticker: str,
+    fundamentals: FundamentalsService,
+    opportunity: OpportunityService,
+) -> FundamentalsResponse:
+    """Resolve one ticker, shared by the single and the batch routes."""
     opportunity_data = await opportunity.opportunity(ticker)
     instrument = opportunity_data.instrument
     metrics = opportunity_data.metrics
@@ -166,6 +178,33 @@ async def get_fundamentals(
     return FundamentalsResponse(
         ticker=snapshot.ticker,
         snapshot=snapshot,
+        refreshed_at=datetime.now(UTC).date(),
+    )
+
+
+@router.post(
+    "/v1/assets/fundamentals:resolve",
+    response_model=FundamentalsBatchResponse,
+    tags=["assets"],
+)
+async def resolve_fundamentals_batch(
+    payload: FundamentalsBatchRequest,
+    fundamentals: FundamentalsServiceDep,
+    opportunity: OpportunityServiceDep,
+    response: Response,
+) -> FundamentalsBatchResponse:
+    """Resolve fundamentals for a bounded batch in one round.
+
+    A caller holding a portfolio would otherwise issue one request per ticker,
+    each paying its own round trip. The tickers are independent, so they are
+    resolved together and returned in the order they were asked for.
+    """
+    _cache_headers(response)
+    resolved = await asyncio.gather(
+        *(_resolve_fundamentals(ticker, fundamentals, opportunity) for ticker in payload.tickers)
+    )
+    return FundamentalsBatchResponse(
+        assets=list(resolved),
         refreshed_at=datetime.now(UTC).date(),
     )
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 MAX_FUNDAMENTAL_TICKERS = 20
 
@@ -73,6 +73,27 @@ class FundamentalsSnapshot(BaseModel):
 class FundamentalsResponse(BaseModel):
     ticker: str
     snapshot: FundamentalsSnapshot | None = None
+    refreshed_at: date | None = None
+
+
+class FundamentalsBatchRequest(BaseModel):
+    """Tickers to resolve in one round, bounded like the other batch routes."""
+
+    tickers: list[str] = Field(min_length=1, max_length=MAX_FUNDAMENTAL_TICKERS)
+
+    @field_validator("tickers")
+    @classmethod
+    def normalize(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip().upper() for value in values if value and value.strip()]
+        if not normalized:
+            raise ValueError("At least one ticker is required")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Tickers must not contain duplicates")
+        return normalized
+
+
+class FundamentalsBatchResponse(BaseModel):
+    assets: list[FundamentalsResponse] = Field(default_factory=list)
     refreshed_at: date | None = None
 
 
