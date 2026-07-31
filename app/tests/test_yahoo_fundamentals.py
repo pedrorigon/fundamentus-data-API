@@ -209,3 +209,59 @@ async def test_provider_ignores_a_payload_that_is_not_an_object() -> None:
     )
 
     assert await provider.snapshot("AAPL") is None
+
+
+async def test_snapshot_declares_the_reporting_currency() -> None:
+    """The model defaults to BRL, which a foreign issuer does not report in."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "chart" in request.url.path:
+            return httpx.Response(
+                200,
+                json={"chart": {"result": [{"meta": {"currency": "usd"}}]}},
+            )
+        return httpx.Response(
+            200,
+            json=_payload(_series("annualTotalRevenue", [("2025-12-31", 1000.0)])),
+        )
+
+    provider = YahooFundamentalsProvider(Settings(), transport=httpx.MockTransport(handler))
+
+    snapshot = await provider.snapshot("AAPL")
+
+    assert snapshot is not None
+    assert snapshot.currency == "USD"
+
+
+async def test_snapshot_keeps_its_default_currency_when_none_is_declared() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "chart" in request.url.path:
+            return httpx.Response(500)
+        return httpx.Response(
+            200,
+            json=_payload(_series("annualTotalRevenue", [("2025-12-31", 1000.0)])),
+        )
+
+    provider = YahooFundamentalsProvider(Settings(), transport=httpx.MockTransport(handler))
+
+    snapshot = await provider.snapshot("AAPL")
+
+    assert snapshot is not None
+    assert snapshot.currency == "BRL"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"chart": {}},
+        {"chart": {"result": []}},
+        {"chart": {"result": [{"meta": {}}]}},
+        {"chart": {"result": ["unexpected"]}},
+    ],
+)
+def test_quote_currency_tolerates_unexpected_payloads(payload: Any) -> None:
+    from app.scrapers.yahoo_fundamentals import _quote_currency
+
+    assert _quote_currency(payload) is None

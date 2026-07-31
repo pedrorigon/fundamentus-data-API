@@ -67,7 +67,30 @@ class YahooFundamentalsProvider:
         payload = await self._timeseries(ticker)
         if payload is None:
             return None
-        return parse_yahoo_fundamentals(ticker, payload)
+        snapshot = parse_yahoo_fundamentals(ticker, payload)
+        if snapshot is None:
+            return None
+        # A foreign issuer reports in its own currency, and the model defaults
+        # to BRL, so the statements would otherwise claim a currency they are
+        # not stated in.
+        currency = await self._currency(ticker)
+        return snapshot if currency is None else snapshot.model_copy(update={"currency": currency})
+
+    async def _currency(self, ticker: str) -> str | None:
+        """Reporting currency, read from the quote metadata of the same symbol."""
+        async with httpx.AsyncClient(
+            base_url=self.settings.yahoo_quote_base_url,
+            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
+            transport=self.transport,
+            headers={"User-Agent": self.settings.user_agent},
+        ) as client:
+            response = await client.get(
+                f"/v8/finance/chart/{ticker}",
+                params={"range": "1d", "interval": "1d"},
+            )
+        if response.status_code != 200:
+            return None
+        return _quote_currency(response.json())
 
     async def _timeseries(self, ticker: str) -> dict[str, Any] | None:
         async with httpx.AsyncClient(
@@ -91,6 +114,18 @@ class YahooFundamentalsProvider:
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else None
+
+
+def _quote_currency(payload: Any) -> str | None:
+    """Reporting currency declared in the quote metadata."""
+    if not isinstance(payload, dict):
+        return None
+    chart = payload.get("chart")
+    results = chart.get("result") if isinstance(chart, dict) else None
+    first = results[0] if isinstance(results, list) and results else None
+    meta = first.get("meta") if isinstance(first, dict) else None
+    currency = meta.get("currency") if isinstance(meta, dict) else None
+    return str(currency).upper() if currency else None
 
 
 def parse_yahoo_fundamentals(
