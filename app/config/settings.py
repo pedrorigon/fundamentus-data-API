@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # same ground but requires a per-user API key, so it cannot be the default
     # source for a self-hosted deployment.
     yahoo_fundamentals_base_url: str = "https://query2.finance.yahoo.com"
+    yahoo_quote_base_url: str = "https://query1.finance.yahoo.com"
     bazin_minimum_yield_percent: Decimal = Decimal("6")
     user_agent: str = (
         f"fundamentus-data-api/{__version__} local scraper "
