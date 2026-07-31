@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     # A closed exercise no longer changes, so its archive is kept for ten years
     # instead of being re-downloaded and re-decoded every day.
     closed_statements_ttl_seconds: int = 315360000
+    # Resolved company filings are rebuilt daily so a newly published quarterly
+    # statement is picked up, while a refresh within the day skips the archives.
+    resolved_company_ttl_seconds: int = 86400
     company_registry_ttl_seconds: int = 604800
     peer_group_ttl_seconds: int = 86400
     fundamentals_history_years: int = 12
