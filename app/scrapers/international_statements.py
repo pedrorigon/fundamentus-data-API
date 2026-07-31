@@ -53,6 +53,22 @@ _BALANCE_LABELS: dict[str, str] = {
     "patrimonio liquido": "equity",
 }
 _MAX_YEARS = 5
+# Rows of a REIT listing page, which states its totals rather than a statement.
+_REIT_LABELS: dict[str, str] = {
+    "patrimonio liquido": "equity",
+    "ativos": "total_assets",
+    "valor de mercado": "market_capitalization",
+}
+# Magnitude words the listing pages write beside an abbreviated amount.
+_MAGNITUDES: dict[str, Decimal] = {
+    "mil": Decimal("1000"),
+    "milhao": Decimal("1000000"),
+    "milhoes": Decimal("1000000"),
+    "bilhao": Decimal("1000000000"),
+    "bilhoes": Decimal("1000000000"),
+    "trilhao": Decimal("1000000000000"),
+    "trilhoes": Decimal("1000000000000"),
+}
 
 
 @dataclass(frozen=True)
@@ -113,6 +129,11 @@ class InternationalStatementsProvider:
             parse_operating_cash_flow(await self._cash_flow_page(ticker) or ""),
         )
         balance = parse_balance_sheet(await self._balance_page(ticker) or "")
+        if not balance:
+            # Status Invest lists ordinary shares only, so a REIT reaches this
+            # point without a balance sheet. Its own listing page publishes the
+            # totals the quality methodology needs.
+            balance = parse_reit_balance_sheet(await self._reit_page(ticker) or "")
         return InternationalStatements(
             ticker=ticker.upper(),
             years=years,
@@ -143,6 +164,12 @@ class InternationalStatementsProvider:
         return await self._get(
             self.settings.status_invest_base_url,
             f"/acoes/eua/{ticker.upper()}",
+        )
+
+    async def _reit_page(self, ticker: str) -> str | None:
+        return await self._get(
+            self.settings.investidor10_base_url,
+            f"/reits/{ticker.lower()}/",
         )
 
     async def _get(self, base_url: str, path: str) -> str | None:
@@ -253,6 +280,46 @@ def _scaled_million(text: str) -> Decimal | None:
     """Statement tables are stated in millions."""
     value = _as_decimal(text.replace(",", ""))
     return None if value is None else value * Decimal("1000000")
+
+
+def parse_reit_balance_sheet(html: str) -> dict[str, Decimal]:
+    """Balance-sheet totals from a REIT listing page.
+
+    The page states each amount twice, first in the listing currency and then
+    converted, as in "$ 40,12 Bilhões R$ 40.123.970.000". Only the first is the
+    reported figure; the converted one would mix currencies into statements
+    kept in the currency the company reports in.
+    """
+    if not html:
+        return {}
+    values: dict[str, Decimal] = {}
+    for cell in HTMLParser(html).css("div.cell"):
+        name = cell.css_first("span.name, span.d-flex, .title")
+        value = cell.css_first("div.value span, span.value, .detail-value")
+        if name is None or value is None:
+            continue
+        field_name = _REIT_LABELS.get(_key(name.text()))
+        parsed = _reported_amount(" ".join(value.text().split()))
+        if field_name is not None and parsed is not None:
+            values[field_name] = parsed
+    return values
+
+
+def _reported_amount(text: str) -> Decimal | None:
+    """First amount stated, scaled by the magnitude word that follows it."""
+    reported = text.split("R$")[0] if "R$" in text else text
+    match = re.search(r"-?\d[\d.]*(?:,\d+)?", reported)
+    if match is None:
+        return None
+    base = _as_decimal(match.group())
+    if base is None:
+        return None
+    key = _key(reported)
+    # "mil" is a prefix of "milhoes", so the longest match is the intended one.
+    for word in sorted(_MAGNITUDES, key=len, reverse=True):
+        if word in key:
+            return base * _MAGNITUDES[word]
+    return base
 
 
 def parse_balance_sheet(html: str) -> dict[str, Decimal]:

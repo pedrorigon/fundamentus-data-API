@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # same ground but requires a per-user API key, so it cannot be the default
     # source for a self-hosted deployment.
     stock_analysis_base_url: str = "https://stockanalysis.com"
+    investidor10_base_url: str = "https://investidor10.com.br"
     bazin_minimum_yield_percent: Decimal = Decimal("6")
     user_agent: str = (
         f"fundamentus-data-api/{__version__} local scraper "
