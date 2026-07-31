@@ -31,7 +31,7 @@ from app.scrapers.international_statements import (
     InternationalStatements,
     InternationalStatementsProvider,
 )
-from app.services.company_matching import match_company
+from app.services.company_matching import CompanyMatch, match_company
 from app.services.fundamentals_math import build_period, ratio, trailing_twelve_months
 
 SOURCE_CVM = "cvm"
@@ -79,23 +79,12 @@ class FundamentalsService:
             )
 
         today = reference or datetime.now(UTC).date()
-        archives = await self._archives(today)
-        if not archives:
+        resolved = await self._resolved_company(normalized, corporate_name, today)
+        if resolved is None:
             return await self._fallback(normalized, "CVM statement archives are unavailable")
-
-        candidates = {
-            cnpj: periods[0].company_name
-            for archive in archives
-            for cnpj, periods in archive.items()
-            if periods
-        }
-        match = match_company(corporate_name, candidates)
+        match, statements = resolved
         if match is None:
             return await self._fallback(normalized, "No CVM filing matched this company")
-
-        statements = [
-            statement for archive in archives for statement in archive.get(match.cnpj, [])
-        ]
         if not statements:
             return await self._fallback(
                 normalized,
@@ -318,6 +307,66 @@ class FundamentalsService:
         )
         self._decoded_archives[archive_key] = archive.periods
         return archive.periods
+
+    async def _resolved_company(
+        self,
+        ticker: str,
+        corporate_name: str,
+        reference: date,
+    ) -> tuple[CompanyMatch | None, list[StatementPeriod]] | None:
+        """Match a ticker to its filings, without decoding archives when possible.
+
+        An archive holds every listed company of a year, so decoding one to read
+        a single issuer discards almost all of the work: the validation
+        installation decoded 171 MB to serve twelve companies. Both the match
+        and the filings it points at are therefore cached under the ticker, and
+        a later refresh answers from that slice alone.
+
+        Returns ``None`` when no archive could be read at all, so the caller can
+        tell an unavailable source from a company that simply did not match.
+        """
+        key = f"{_CACHE_PREFIX}:resolved:{ticker}:{reference.year}"
+        cached, hit = await self.cache.get(key)
+        if hit and isinstance(cached, dict):
+            decoded = _decode_periods(cached.get("periods"))
+            cnpj = str(cached.get("cnpj") or "")
+            if decoded is not None and cnpj:
+                return (
+                    CompanyMatch(
+                        cnpj=cnpj,
+                        company_name=str(cached.get("company_name") or ""),
+                        confidence=str(cached.get("confidence") or "low"),
+                    ),
+                    decoded.get(cnpj, []),
+                )
+
+        archives = await self._archives(reference)
+        if not archives:
+            return None
+        candidates = {
+            cnpj: periods[0].company_name
+            for archive in archives
+            for cnpj, periods in archive.items()
+            if periods
+        }
+        match = match_company(corporate_name, candidates)
+        if match is None:
+            return None, []
+        statements = [
+            statement for archive in archives for statement in archive.get(match.cnpj, [])
+        ]
+        if statements:
+            await self.cache.set(
+                key,
+                {
+                    "cnpj": match.cnpj,
+                    "company_name": match.company_name,
+                    "confidence": match.confidence,
+                    "periods": _encode_periods({match.cnpj: statements}),
+                },
+                self.settings.resolved_company_ttl_seconds,
+            )
+        return match, statements
 
     def _archive_ttl(self, year: int) -> int:
         """How long a statement archive stays valid.

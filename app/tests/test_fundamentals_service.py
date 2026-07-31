@@ -738,3 +738,50 @@ async def test_every_past_exercise_shares_the_closed_validity(tmp_path: Path) ->
     validities = {service._archive_ttl(current_year - offset) for offset in range(1, 8)}
 
     assert validities == {service.settings.closed_statements_ttl_seconds}
+
+
+async def test_a_resolved_company_is_answered_without_the_archives(tmp_path: Path) -> None:
+    """An archive holds every listed company, so decoding one to read a single
+    issuer discards almost all of the work. The second call must not repeat it.
+    """
+    provider = StubProvider({("dfp", 2024): archive(2024, [period(date(2024, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    first = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+    # A fresh process keeps the shared cache but loses the decoded archives.
+    fresh = await build(tmp_path, provider)
+    fresh.cache = service.cache
+    provider.statement_calls.clear()
+    second = await fresh.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+    assert provider.statement_calls == []
+    assert second.model_dump_json() == first.model_dump_json()
+
+
+async def test_the_cached_slice_reports_the_same_snapshot(tmp_path: Path) -> None:
+    """Reading the company slice may not change a single reported figure."""
+    provider = StubProvider({("dfp", 2024): archive(2024, [period(date(2024, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    from_archives = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+    fresh = await build(tmp_path, provider)
+    fresh.cache = service.cache
+    from_cache = await fresh.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+    assert from_cache.cnpj == from_archives.cnpj
+    assert from_cache.periods == from_archives.periods
+    assert from_cache.trailing_twelve_months == from_archives.trailing_twelve_months
+
+
+async def test_a_company_that_matches_nothing_is_not_cached(tmp_path: Path) -> None:
+    """Caching a failed match would keep answering with it after a fix."""
+    provider = StubProvider({("dfp", 2024): archive(2024, [period(date(2024, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    snapshot = await service.snapshot(
+        "OTHER4",
+        "COMPANHIA INEXISTENTE S.A.",
+        reference=date(2024, 12, 31),
+    )
+
+    assert snapshot.unavailable_reason == "No CVM filing matched this company"
