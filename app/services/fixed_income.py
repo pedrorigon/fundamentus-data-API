@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
@@ -83,8 +83,14 @@ class FixedIncomeValuationService:
 def _cached_prices(value: object) -> dict[str, Decimal]:
     if not isinstance(value, dict):
         return {}
-    return {
-        str(code): Decimal(str(price))
-        for code, price in value.items()
-        if isinstance(code, str) and isinstance(price, (str, int, float))
-    }
+    result: dict[str, Decimal] = {}
+    for code, price in value.items():
+        if not isinstance(code, str) or not isinstance(price, (str, int, float)):
+            continue
+        try:
+            parsed = Decimal(str(price))
+        except (InvalidOperation, ValueError):
+            continue
+        if parsed.is_finite() and parsed > 0:
+            result[code] = parsed
+    return result

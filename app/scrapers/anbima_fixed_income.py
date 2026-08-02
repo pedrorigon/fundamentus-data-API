@@ -10,7 +10,7 @@ import httpx
 from app.config import Settings
 
 SOURCE_ANBIMA = "anbima"
-MISSING_VALUE = "--"
+UNAVAILABLE_VALUES = frozenset({"--", "n/d", "nd", "n/a", "na"})
 
 
 class AnbimaDebentureProvider:
@@ -54,7 +54,7 @@ def parse_anbima_debenture_prices(payload: bytes) -> dict[str, Decimal]:
 
 def _decimal(value: str | None) -> Decimal | None:
     normalized = (value or "").strip()
-    if not normalized or normalized == MISSING_VALUE:
+    if not normalized or normalized.casefold() in UNAVAILABLE_VALUES:
         return None
     try:
         return Decimal(normalized.replace(".", "").replace(",", "."))

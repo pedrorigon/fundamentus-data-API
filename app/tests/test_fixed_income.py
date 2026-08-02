@@ -51,6 +51,18 @@ def test_parser_maps_positive_prices_and_ignores_invalid_rows() -> None:
     assert parse_anbima_debenture_prices(b"unexpected") == {}
 
 
+def test_parser_keeps_nd_rows_unavailable() -> None:
+    prices = parse_anbima_debenture_prices(
+        _payload(
+            _row("PEJA11", "N/D"),
+            _row("PEJA11", "--"),
+            _row("PEJA12", "1.000,00"),
+        )
+    )
+
+    assert prices == {"PEJA12": Decimal("1000")}
+
+
 @pytest.mark.asyncio
 async def test_provider_downloads_the_official_daily_file() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -133,6 +145,30 @@ async def test_service_returns_unavailable_when_source_fails() -> None:
     assert result.valuations == {"CDB925623O7": []}
 
 
+@pytest.mark.asyncio
+async def test_service_preserves_sparse_identifier_gaps() -> None:
+    friday = date(2026, 7, 17)
+    saturday = date(2026, 7, 18)
+    provider = _Provider(
+        {
+            friday: {"PEJA11": Decimal("100")},
+            saturday: {"OTHER1": Decimal("200")},
+        }
+    )
+    service = FixedIncomeValuationService(
+        Settings(),
+        _cache(),
+        provider=provider,  # type: ignore[arg-type]
+    )
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["PEJA11"], dates=[friday, saturday])
+    )
+
+    assert [item.requested_date for item in result.valuations["PEJA11"]] == [friday]
+    assert result.unavailable == []
+
+
 def test_request_rejects_unsafe_identifiers() -> None:
     with pytest.raises(ValidationError):
         FixedIncomeValuationRequest(
@@ -143,7 +179,9 @@ def test_request_rejects_unsafe_identifiers() -> None:
 
 def test_cached_prices_rejects_unexpected_payloads() -> None:
     assert _cached_prices([]) == {}
-    assert _cached_prices({"AALM12": None, 1: "2", "OK": 3}) == {"OK": Decimal("3")}
+    assert _cached_prices({"AALM12": None, 1: "2", "BAD": "N/D", "OK": 3}) == {
+        "OK": Decimal("3")
+    }
 
 
 @pytest.mark.asyncio
