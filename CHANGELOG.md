@@ -4,6 +4,46 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-08-02
+
+### Added
+
+- Add CVM open-data statement provider.
+- Expose fundamentals endpoint.
+- Report share counts per reporting year.
+- Expose the filing universe grouped by sector.
+- Add official listed fund histories.
+- Expose quality accounting fields.
+- Resolve provenanced quality facts.
+- Add cross-validated durability facts.
+- Add public quality evidence sources.
+- Resolve sector-aware asset evidence.
+- Read annual statements for foreign listings.
+- Derive foreign listings from their own statements.
+- Read multi-year statements for foreign listings.
+- Resolve balance sheets for listed real estate trusts.
+- Resolve a batch of tickers in one request.
+
+### Changed
+
+- Reuse decoded CVM archives.
+- Read foreign listings from public pages.
+- Keep closed statement archives instead of refetching them.
+- Cache the filings of a company apart from the archive.
+
+### Fixed
+
+- Preserve temporal filing accuracy.
+- Preserve CVM filing metadata.
+- Isolate batch source failures.
+- Reconcile public valuation inputs.
+- Resolve net income to the reported figure.
+- Reconcile fund dividend yield.
+- Distinguish current company filings.
+- Ignore empty consolidated filings.
+- Accept international symbol formats.
+- Declare the reporting currency of foreign statements.
+
 ## [0.1.9] - 2026-07-23
 
 ### Changed
@@ -72,6 +112,7 @@ No user-facing changes.
 - Expose local asset data endpoints.
 - Update versioning and documentation for v0.1.0 release.
 
+[0.1.10]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/pedrorigon/fundamentus-data-API/compare/v0.1.6...v0.1.7
