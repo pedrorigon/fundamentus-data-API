@@ -344,9 +344,7 @@ def test_request_rejects_unsafe_identifiers() -> None:
 
 def test_cached_prices_rejects_unexpected_payloads() -> None:
     assert _cached_prices([]) == {}
-    assert _cached_prices({"AALM12": None, 1: "2", "BAD": "N/D", "OK": 3}) == {
-        "OK": Decimal("3")
-    }
+    assert _cached_prices({"AALM12": None, 1: "2", "BAD": "N/D", "OK": 3}) == {"OK": Decimal("3")}
 
 
 @pytest.mark.asyncio
