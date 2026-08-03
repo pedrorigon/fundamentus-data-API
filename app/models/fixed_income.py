@@ -4,6 +4,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
+MAX_FIXED_INCOME_DATES = 500
+
 
 class ValuationMethod(StrEnum):
     indicative = "indicative"
@@ -21,7 +23,7 @@ class FixedIncomeValuation(BaseModel):
 
 class FixedIncomeValuationRequest(BaseModel):
     identifiers: list[str] = Field(min_length=1, max_length=50)
-    dates: list[date] = Field(min_length=1, max_length=50)
+    dates: list[date] = Field(min_length=1, max_length=MAX_FIXED_INCOME_DATES)
 
     @field_validator("identifiers")
     @classmethod

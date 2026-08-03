@@ -27,6 +27,7 @@ class B3FixedIncomeProvider:
     """
 
     source = SOURCE_B3_BDI
+    identifier_scoped = True
 
     def __init__(
         self,
@@ -36,6 +37,7 @@ class B3FixedIncomeProvider:
         self.settings = settings
         self.transport = transport
         self._cache: dict[tuple[date, str], tuple[float, Decimal | None]] = {}
+        self._semaphore = asyncio.Semaphore(max(1, self.settings.upstream_concurrency))
 
     async def prices(self, _reference: date) -> dict[str, Decimal]:
         # The BDI table is intentionally queried by identifier through
@@ -69,10 +71,8 @@ class B3FixedIncomeProvider:
                 "User-Agent": self.settings.user_agent,
             },
         ) as client:
-            semaphore = asyncio.Semaphore(max(1, self.settings.upstream_concurrency))
-
             async def fetch(identifier: str) -> tuple[str, Decimal | None]:
-                async with semaphore:
+                async with self._semaphore:
                     try:
                         response = await client.post(
                             f"/table/{_TABLE_NAME}/{reference}/{reference}/1/20",

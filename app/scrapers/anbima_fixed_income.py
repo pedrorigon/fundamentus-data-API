@@ -14,6 +14,8 @@ UNAVAILABLE_VALUES = frozenset({"--", "n/d", "nd", "n/a", "na"})
 
 
 class AnbimaDebentureProvider:
+    identifier_scoped = False
+
     def __init__(
         self,
         settings: Settings,

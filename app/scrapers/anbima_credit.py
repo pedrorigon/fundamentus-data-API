@@ -8,6 +8,7 @@ short-lived refreshes, while dates outside that window remain unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import unicodedata
 from datetime import date, datetime
 from decimal import Decimal
@@ -28,6 +29,7 @@ class AnbimaCreditProvider:
     """Resolve current CRI/CRA prices without requiring an API credential."""
 
     source = SOURCE_ANBIMA_CRI_CRA
+    identifier_scoped = False
 
     def __init__(
         self,
@@ -38,10 +40,13 @@ class AnbimaCreditProvider:
         self.transport = transport
         self._cache_expires_at = 0.0
         self._prices_by_date: dict[date, dict[str, Decimal]] = {}
+        self._refresh_lock = asyncio.Lock()
 
     async def prices(self, reference: date) -> dict[str, Decimal]:
         if monotonic() >= self._cache_expires_at:
-            await self._refresh()
+            async with self._refresh_lock:
+                if monotonic() >= self._cache_expires_at:
+                    await self._refresh()
         return dict(self._prices_by_date.get(reference, {}))
 
     async def prices_for(self, reference: date, identifiers: set[str]) -> dict[str, Decimal]:
