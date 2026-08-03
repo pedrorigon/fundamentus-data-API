@@ -36,6 +36,11 @@ class AnbimaDebentureProvider:
         response.raise_for_status()
         return parse_anbima_debenture_prices(response.content)
 
+    async def prices_for(self, reference: date, identifiers: set[str]) -> dict[str, Decimal]:
+        prices = await self.prices(reference)
+        wanted = {identifier.strip().upper() for identifier in identifiers}
+        return {identifier: price for identifier, price in prices.items() if identifier in wanted}
+
 
 def parse_anbima_debenture_prices(payload: bytes) -> dict[str, Decimal]:
     text = payload.decode("latin-1")

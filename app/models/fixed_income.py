@@ -44,3 +44,4 @@ class FixedIncomeValuationRequest(BaseModel):
 class FixedIncomeValuationResponse(BaseModel):
     valuations: dict[str, list[FixedIncomeValuation]]
     unavailable: list[str]
+    unavailable_reasons: dict[str, str] = Field(default_factory=dict)
