@@ -71,6 +71,7 @@ class B3FixedIncomeProvider:
                 "User-Agent": self.settings.user_agent,
             },
         ) as client:
+
             async def fetch(identifier: str) -> tuple[str, Decimal | None]:
                 async with self._semaphore:
                     try:
