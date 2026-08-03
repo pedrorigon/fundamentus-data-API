@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, TextIOWrapper
@@ -40,7 +41,7 @@ class B3HistoricalQuoteProvider:
         if response.status_code == 404:
             return {}
         response.raise_for_status()
-        return parse_b3_historical_quotes(response.content, tickers)
+        return await asyncio.to_thread(parse_b3_historical_quotes, response.content, tickers)
 
 
 def parse_b3_historical_quotes(payload: bytes, tickers: set[str]) -> dict[str, dict[date, Decimal]]:
