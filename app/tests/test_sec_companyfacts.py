@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.models.quality import QualityAssetKind, QualityAssetRequest, QualityFactsRequest
 from app.scrapers import sec_companyfacts as sec_module
+from app.scrapers.international_statements import AnnualFigures, InternationalStatements
 from app.scrapers.sec_companyfacts import (
     SecCompanyFactsProvider,
     normalize_cik,
@@ -189,6 +190,44 @@ async def test_sec_failure_returns_none_for_fallback() -> None:
         httpx.MockTransport(lambda _request: httpx.Response(503)),
     )
     assert await provider.statements("AAPL") is None
+
+
+@pytest.mark.asyncio
+async def test_fundamentals_falls_back_to_html_after_sec_failure(tmp_path: Path) -> None:
+    class Html:
+        async def statements(self, ticker: str) -> InternationalStatements:
+            return InternationalStatements(
+                ticker=ticker,
+                years=(
+                    AnnualFigures(
+                        period_end=date(2024, 12, 31),
+                        revenue=Decimal("100"),
+                        net_income=Decimal("10"),
+                    ),
+                ),
+                source="stockanalysis",
+                source_url="https://stockanalysis.com/stocks/aapl/financials/",
+            )
+
+    sec = SecCompanyFactsProvider(
+        Settings(
+            sec_edgar_base_url="https://data.sec.test",
+            sec_company_tickers_url="https://www.sec.test/files/company_tickers.json",
+            retry_attempts=1,
+        ),
+        httpx.MockTransport(lambda _request: httpx.Response(503)),
+    )
+    service = FundamentalsService(
+        Settings(),
+        CacheStore(sqlite_enabled=False, sqlite_path=tmp_path / "cache.sqlite"),
+        international=Html(),  # type: ignore[arg-type]
+        sec=sec,
+    )
+    snapshot = await service.snapshot("AAPL")
+    assert snapshot.periods[-1].source == "stockanalysis"
+    revenue = next(item for item in snapshot.provenance if item.field_name == "revenue_ttm")
+    assert revenue.selected_source == "stockanalysis"
+    assert revenue.fallbacks_attempted == ["sec_edgar_companyfacts"]
 
 
 @pytest.mark.asyncio
