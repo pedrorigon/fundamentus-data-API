@@ -19,7 +19,8 @@ API version is resolved from package metadata at runtime. Release artifacts use 
 - Classifies B3 ETFs and exposes quotes and market data through brapi.
 - Resolves multi-year fundamentals, including profitability, liquidity, cash flow, debt maturity and share counts, from CVM open data.
 - Resolves normalized quality facts for bounded stock, listed-fund and ETF batches with field-level availability and provenance.
-- Exposes profiles, holdings and fundamentals for international ETFs and stocks through Alpha Vantage.
+- Exposes profiles, holdings and fundamentals for international ETFs and stocks through Alpha Vantage, with SEC EDGAR CompanyFacts as the keyless official filing source when an issuer is SEC-covered.
+- Keeps BDR identity separate from its foreign issuer and routes quality facts through a verified underlying ticker; unresolved BDRs return an actionable unavailable reason instead of querying the local code abroad.
 - Filters dividends by `all`, `past`, `future` and `upcoming_ex_date`.
 - Uses local caching to reduce repeated upstream requests.
 - Provides OpenAPI docs, Prometheus-compatible metrics and consistent JSON errors.
@@ -171,6 +172,11 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `INSTRUMENT_DATA_TTL_SECONDS` | `86400` | In-memory TTL for ETF and international instrument data. |
 | `BRAPI_TOKEN` | empty | brapi backend token required for production coverage of B3 symbols. |
 | `ALPHA_VANTAGE_API_KEY` | empty | Alpha Vantage key for international ETF profiles and stock fundamentals. |
+| `SEC_EDGAR_BASE_URL` | `https://data.sec.gov` | Public SEC CompanyFacts endpoint. |
+| `SEC_COMPANY_TICKERS_URL` | `https://www.sec.gov/files/company_tickers.json` | Official SEC ticker-to-CIK directory. |
+| `SEC_USER_AGENT` | `USER_AGENT` | Optional descriptive SEC User-Agent; no secret is required. |
+| `SEC_REQUEST_TIMEOUT_SECONDS` | `10` | Timeout for SEC directory and CompanyFacts requests. |
+| `SEC_COMPANYFACTS_TTL_SECONDS` | `86400` | Local TTL for CompanyFacts payloads. |
 | `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
 | `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
 | `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
@@ -180,7 +186,9 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
 
-The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. Keep provider keys on the server and review their terms before production use.
+The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. SEC-covered issuers are resolved from the official [EDGAR CompanyFacts API](https://www.sec.gov/edgar/sec-api-documentation), then the existing public HTML statements are tried as a bounded fallback. Keep provider keys on the server and review their terms before production use.
+
+`GET /v2/instruments/search?q=...` searches only the bounded in-process directory of instruments already resolved through the B3 provider; it never makes a live per-keystroke request. BDR metadata includes `underlying_ticker`, `underlying_name`, `underlying_exchange`, `underlying_country` and explicit resolution provenance when B3 publishes those fields or a reviewed alias is available.
 
 ## Data Shape
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -39,6 +40,28 @@ SOURCE_FUNDAMENTUS = "fundamentus"
 SOURCE_STATUS_INVEST = "status_invest"
 SOURCE_B3 = "b3"
 SOURCE_CVM = "cvm"
+
+# B3's public instrument files do not consistently carry an underlying symbol
+# for older BDR records.  These aliases are intentionally small and explicit;
+# an unknown BDR is left unresolved instead of guessing from its local code.
+BDR_UNDERLYING_ALIASES: dict[str, str] = {
+    "AAPL34": "AAPL",
+    "ABUD34": "BIDU",
+    "A1AP34": "AAPL",
+    "AMZO34": "AMZN",
+    "BABA34": "BABA",
+    "BIDU34": "BIDU",
+    "DISB34": "DIS",
+    "GOGL34": "GOOGL",
+    "M1TA34": "META",
+    "MELI34": "MELI",
+    "MSFT34": "MSFT",
+    "N1DA34": "NVDA",
+    "NFLX34": "NFLX",
+    "NVDC34": "NVDA",
+    "P2LT34": "PLTR",
+    "TSLA34": "TSLA",
+}
 
 
 @dataclass(frozen=True)
@@ -266,14 +289,40 @@ def _instrument_from_b3(payload: object, ticker: str) -> InstrumentMetadata | No
             continue
         description = clean_text(str(row.get("CrpnNm") or row.get("AsstDesc") or ""))
         category = clean_text(str(row.get("SctyCtgyNm") or "")) or None
+        instrument_type = _instrument_type(category, description, str(row.get("AsstDesc") or ""))
+        underlying = _resolve_underlying(row, ticker, instrument_type)
+        identifiers = _identifiers(row)
         return InstrumentMetadata(
             ticker=ticker,
             name=description or None,
-            instrument_type=_instrument_type(category, description, str(row.get("AsstDesc") or "")),
+            instrument_type=instrument_type,
             category=category,
             cfi_code=_optional(row.get("CFICd")),
             isin=_optional(row.get("ISIN")),
+            identifiers=identifiers,
             currency=_optional(row.get("TradgCcy")),
+            exchange=_optional(row.get("MktNm") or row.get("Xchg")),
+            country=_optional(row.get("CntryNm") or row.get("Country")),
+            underlying_ticker=underlying[0],
+            underlying_name=underlying[1],
+            underlying_exchange=_optional(
+                row.get("UnderlyingExchange") or row.get("UndrlyngXchg")
+            ),
+            underlying_country=_optional(
+                row.get("UnderlyingCountry") or row.get("UndrlyngCntry")
+            ),
+            underlying_identifiers=_underlying_identifiers(row),
+            underlying_source=underlying[2],
+            underlying_unavailable_reason=(
+                None
+                if underlying[0] is not None
+                else (
+                    "B3 did not publish an authoritative underlying ticker and no safe alias "
+                    "exists"
+                )
+                if instrument_type is InstrumentType.bdr
+                else None
+            ),
             reference_date=_iso_date(row.get("RptDt")),
         )
     return None
@@ -300,6 +349,74 @@ def _instrument_type(
     if any(token in text for token in ("COMMON EQUITIES", "PREFERRED EQUITIES", " ON", " PN")):
         return InstrumentType.stock
     return InstrumentType.unknown
+
+
+def resolve_bdr_underlying(ticker: str) -> str | None:
+    """Resolve only exact, reviewed aliases for BDRs without metadata."""
+    return BDR_UNDERLYING_ALIASES.get(ticker.strip().upper())
+
+
+def _resolve_underlying(
+    row: dict[object, object],
+    ticker: str,
+    instrument_type: InstrumentType,
+) -> tuple[str | None, str | None, str | None]:
+    if instrument_type is not InstrumentType.bdr:
+        return None, None, None
+    for key in (
+        "UnderlyingTicker",
+        "UnderlyingTckrSymb",
+        "UndrlyngTckrSymb",
+        "UnderlyingSymbol",
+        "ReferenceTicker",
+        "ReferenceSymbol",
+    ):
+        candidate = _underlying_ticker(row.get(key))
+        if candidate:
+            return candidate, _optional(row.get("UnderlyingName") or row.get("UndrlyngNm")), "b3"
+    for row_key, value in row.items():
+        key_text = str(row_key).lower()
+        if ("underly" in key_text or "reference" in key_text) and (
+            "ticker" in key_text or "symbol" in key_text or "tckr" in key_text
+        ):
+            candidate = _underlying_ticker(value)
+            if candidate:
+                return (
+                    candidate,
+                    _optional(row.get("UnderlyingName") or row.get("UndrlyngNm")),
+                    "b3",
+                )
+    alias = resolve_bdr_underlying(ticker)
+    return alias, None, "b3_alias" if alias else None
+
+
+def _underlying_ticker(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().upper()
+    if not candidate or len(candidate) > 10:
+        return None
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", candidate):
+        return None
+    if re.fullmatch(r"[A-Z]{4}\d{1,2}", candidate):
+        return None
+    return candidate
+
+
+def _identifiers(row: dict[object, object]) -> dict[str, str]:
+    values = {
+        "isin": row.get("ISIN"),
+        "security_id": row.get("SctyId") or row.get("SecurityID"),
+    }
+    return {key: str(value).strip() for key, value in values.items() if value not in {None, ""}}
+
+
+def _underlying_identifiers(row: dict[object, object]) -> dict[str, str]:
+    values = {
+        "isin": row.get("UnderlyingISIN") or row.get("UndrlyngISIN"),
+        "cusip": row.get("UnderlyingCUSIP") or row.get("UndrlyngCUSIP"),
+    }
+    return {key: str(value).strip() for key, value in values.items() if value not in {None, ""}}
 
 
 def _status_paths(instrument_type: InstrumentType | None) -> tuple[str, ...]:

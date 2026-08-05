@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     brapi_token: SecretStr | None = None
     alpha_vantage_base_url: str = "https://www.alphavantage.co"
     alpha_vantage_api_key: SecretStr | None = None
+    # SEC EDGAR CompanyFacts is public and does not require an API key. SEC
+    # asks clients to identify themselves with a descriptive User-Agent.
+    sec_edgar_base_url: str = "https://data.sec.gov"
+    sec_company_tickers_url: str = "https://www.sec.gov/files/company_tickers.json"
+    sec_user_agent: str | None = None
+    sec_request_timeout_seconds: float = 10.0
+    sec_companyfacts_ttl_seconds: int = 86400
+    sec_ticker_map_ttl_seconds: int = 86400
     # Public statement pages for foreign listings. Alpha Vantage covers the
     # same ground but requires a per-user API key, so it cannot be the default
     # source for a self-hosted deployment.

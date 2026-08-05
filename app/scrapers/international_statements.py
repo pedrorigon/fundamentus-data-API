@@ -35,6 +35,7 @@ from selectolax.parser import HTMLParser
 from app.config import Settings
 
 SOURCE_STATEMENTS = "public_filings"
+SOURCE_STOCK_ANALYSIS = "stockanalysis"
 
 # Series embedded in the financials page, keyed by the identifier it uses.
 _INCOME_SERIES: dict[str, str] = {
@@ -82,6 +83,10 @@ class AnnualFigures:
     net_income: Decimal | None = None
     earnings_per_share: Decimal | None = None
     operating_cash_flow: Decimal | None = None
+    capex: Decimal | None = None
+    depreciation: Decimal | None = None
+    free_cash_flow: Decimal | None = None
+    ebitda: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -89,16 +94,24 @@ class InternationalStatements:
     """Everything two public pages state about one foreign listing."""
 
     ticker: str
+    company_name: str | None = None
     years: tuple[AnnualFigures, ...] = field(default_factory=tuple)
     equity: Decimal | None = None
     total_assets: Decimal | None = None
     current_assets: Decimal | None = None
+    current_liabilities: Decimal | None = None
     gross_debt: Decimal | None = None
+    short_term_debt: Decimal | None = None
+    long_term_debt: Decimal | None = None
     net_debt: Decimal | None = None
     cash_and_equivalents: Decimal | None = None
+    shares_outstanding: Decimal | None = None
     market_capitalization: Decimal | None = None
     currency: str = "USD"
     source: str = SOURCE_STATEMENTS
+    source_url: str | None = None
+    identifiers: dict[str, str] = field(default_factory=dict)
+    fallbacks_attempted: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def is_available(self) -> bool:
@@ -136,6 +149,7 @@ class InternationalStatementsProvider:
             balance = parse_reit_balance_sheet(await self._reit_page(ticker) or "")
         return InternationalStatements(
             ticker=ticker.upper(),
+            source=SOURCE_STOCK_ANALYSIS,
             years=years,
             equity=balance.get("equity"),
             total_assets=balance.get("total_assets"),
@@ -144,6 +158,7 @@ class InternationalStatementsProvider:
             net_debt=balance.get("net_debt"),
             cash_and_equivalents=balance.get("cash_and_equivalents"),
             market_capitalization=balance.get("market_capitalization"),
+            source_url=f"{self.settings.stock_analysis_base_url.rstrip('/')}/stocks/{ticker.lower()}/financials/",
         )
 
     async def _income_page(self, ticker: str) -> str | None:

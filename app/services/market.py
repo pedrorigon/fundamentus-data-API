@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -15,6 +16,7 @@ from app.models import (
     FundProfile,
     InstrumentDataResponse,
     InstrumentMetadata,
+    InstrumentSearchResponse,
     InstrumentType,
     InternationalFundamentals,
     MarketQuote,
@@ -161,6 +163,7 @@ class InstrumentDataService:
         self._cache: dict[
             tuple[str, InstrumentType | None], tuple[datetime, InstrumentDataResponse]
         ] = {}
+        self._directory: dict[str, InstrumentMetadata] = {}
 
     async def get(
         self,
@@ -175,7 +178,58 @@ class InstrumentDataService:
             return cached
         result = await self._load(normalized, instrument_type, now)
         self._cache[cache_key] = (now, result)
+        if result.instrument is not None:
+            self._directory[normalized] = result.instrument
         return result
+
+    async def search(self, query: str, *, limit: int = 20) -> InstrumentSearchResponse:
+        """Search the locally resolved instrument directory without network I/O.
+
+        The service deliberately does not issue a remote request per keystroke:
+        this directory is the bounded set observed by this process.  A caller
+        can prime it through normal instrument requests or use a future batch
+        directory import when B3 publishes a complete catalogue endpoint.
+        """
+        normalized_query = _fold_search(query)
+        bounded_limit = max(1, min(limit, 50))
+        if not normalized_query:
+            return InstrumentSearchResponse(
+                query=query.strip(),
+                limited=True,
+                unavailable_reason="A non-empty search query is required",
+            )
+        matches = [
+            item
+            for item in self._directory.values()
+            if normalized_query in _fold_search(
+                " ".join(
+                    value
+                    for value in (
+                        item.ticker,
+                        item.name,
+                        item.underlying_ticker,
+                        item.underlying_name,
+                    )
+                    if value
+                )
+            )
+        ]
+        matches.sort(
+            key=lambda item: (
+                0 if _fold_search(item.ticker) == normalized_query else 1,
+                item.ticker,
+            )
+        )
+        return InstrumentSearchResponse(
+            query=query.strip(),
+            results=matches[:bounded_limit],
+            limited=True,
+            unavailable_reason=(
+                "Only instruments already resolved by this process are searchable"
+                if not matches
+                else "Results are limited to the locally observed instrument directory"
+            ),
+        )
 
     def _cached(
         self,
@@ -201,7 +255,13 @@ class InstrumentDataService:
             ticker, instrument, resolved_type
         )
         return _instrument_response(
-            ticker, instrument, quote, fund_profile, fundamentals, refreshed_at
+            ticker,
+            instrument,
+            quote,
+            fund_profile,
+            fundamentals,
+            refreshed_at,
+            unavailable_reason=(instrument.underlying_unavailable_reason if instrument else None),
         )
 
     async def _provider_data(
@@ -250,6 +310,7 @@ def _instrument_response(
     fund_profile: FundProfile | None,
     fundamentals: InternationalFundamentals | None,
     refreshed_at: datetime,
+    unavailable_reason: str | None = None,
 ) -> InstrumentDataResponse:
     return InstrumentDataResponse(
         ticker=ticker,
@@ -257,6 +318,7 @@ def _instrument_response(
         quote=quote,
         fund_profile=fund_profile,
         fundamentals=fundamentals,
+        unavailable_reason=unavailable_reason,
         refreshed_at=refreshed_at,
     )
 
@@ -352,7 +414,15 @@ def _international_instrument(
         ticker=ticker,
         instrument_type=instrument_type,
         category="INTERNATIONAL",
+        name=fundamentals.description if fundamentals else None,
+        exchange=fundamentals.exchange if fundamentals else None,
+        country=fundamentals.country if fundamentals else None,
         currency=fundamentals.currency if fundamentals else None,
         source=SOURCE_ALPHA_VANTAGE,
         confidence="medium",
     )
+
+
+def _fold_search(value: str | None) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    return normalized.encode("ascii", "ignore").decode("ascii").upper().strip()

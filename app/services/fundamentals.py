@@ -17,6 +17,7 @@ import httpx
 from app.cache import CacheStore
 from app.config import Settings
 from app.core.errors import InvalidTickerError
+from app.models.assets import InstrumentMetadata, InstrumentType
 from app.models.fundamentals import (
     FieldProvenance,
     FinancialPeriod,
@@ -31,6 +32,7 @@ from app.scrapers.international_statements import (
     InternationalStatements,
     InternationalStatementsProvider,
 )
+from app.scrapers.sec_companyfacts import SecCompanyFactsProvider
 from app.services.company_matching import CompanyMatch, match_company
 from app.services.fundamentals_math import build_period, ratio, trailing_twelve_months
 
@@ -49,11 +51,17 @@ class FundamentalsService:
         cache: CacheStore,
         provider: CvmOpenDataProvider | None = None,
         international: InternationalStatementsProvider | None = None,
+        sec: SecCompanyFactsProvider | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache
         self.provider = provider or CvmOpenDataProvider(settings)
         self.international = international or InternationalStatementsProvider(settings)
+        # Tests and callers that inject a custom HTML provider can opt out of
+        # the default network adapter; the application path gets SEC first.
+        self.sec = sec if sec is not None else (
+            SecCompanyFactsProvider(settings) if international is None else None
+        )
         self._decoded_archives: dict[
             tuple[StatementKind, int],
             dict[str, list[StatementPeriod]] | None,
@@ -70,25 +78,59 @@ class FundamentalsService:
         book_value_per_share: Decimal | None = None,
         recurring_dividends_per_share: Decimal | None = None,
         supplemental_sources: dict[str, str] | None = None,
+        instrument: InstrumentMetadata | None = None,
+        underlying_ticker: str | None = None,
+        underlying_name: str | None = None,
     ) -> FundamentalsSnapshot:
         normalized = self._normalized(ticker)
+        resolved_underlying = underlying_ticker or (
+            instrument.underlying_ticker
+            if instrument is not None and instrument.instrument_type is InstrumentType.bdr
+            else None
+        )
+        if instrument is not None and instrument.instrument_type is InstrumentType.bdr:
+            if not resolved_underlying:
+                return _empty(
+                    normalized,
+                    instrument.underlying_unavailable_reason
+                    or (
+                        "BDR underlying ticker is unresolved; international fundamentals "
+                        "were not queried"
+                    ),
+                )
+            return await self._fallback(
+                normalized,
+                "BDR does not have CVM issuer statements",
+                international_ticker=resolved_underlying,
+                international_name=underlying_name or instrument.underlying_name,
+            )
         if not corporate_name:
             return await self._fallback(
                 normalized,
                 "Corporate name is required to resolve CVM filings",
+                international_ticker=resolved_underlying,
             )
 
         today = reference or datetime.now(UTC).date()
         resolved = await self._resolved_company(normalized, corporate_name, today)
         if resolved is None:
-            return await self._fallback(normalized, "CVM statement archives are unavailable")
+            return await self._fallback(
+                normalized,
+                "CVM statement archives are unavailable",
+                international_ticker=resolved_underlying,
+            )
         match, statements = resolved
         if match is None:
-            return await self._fallback(normalized, "No CVM filing matched this company")
+            return await self._fallback(
+                normalized,
+                "No CVM filing matched this company",
+                international_ticker=resolved_underlying,
+            )
         if not statements:
             return await self._fallback(
                 normalized,
                 "No statement periods available for this company",
+                international_ticker=resolved_underlying,
             )
 
         sector = await self._sector(match.cnpj)
@@ -420,7 +462,14 @@ class FundamentalsService:
         except ValueError as exc:
             raise InvalidTickerError(ticker=ticker) from exc
 
-    async def _fallback(self, ticker: str, reason: str) -> FundamentalsSnapshot:
+    async def _fallback(
+        self,
+        ticker: str,
+        reason: str,
+        *,
+        international_ticker: str | None = None,
+        international_name: str | None = None,
+    ) -> FundamentalsSnapshot:
         """Resolve a foreign listing that the CVM archives cannot describe.
 
         Every Brazilian issuer files with the CVM, so reaching this point means
@@ -429,13 +478,46 @@ class FundamentalsService:
         reason, which explains the CVM failure rather than hiding it behind a
         second lookup.
         """
+        source_ticker = international_ticker or ticker
+        attempts: list[str] = []
+        if self.sec is not None:
+            attempts.append("sec_edgar_companyfacts")
+            try:
+                statements = await self.sec.statements(source_ticker)
+            except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                statements = None
+            if statements is not None and statements.is_available:
+                return _international_snapshot(statements, ticker)
+        if self.sec is not None:
+            attempts.append("stockanalysis")
         try:
-            statements = await self.international.statements(ticker)
+            statements = await self.international.statements(source_ticker)
         except httpx.HTTPError:
-            return _empty(ticker, reason)
+            return _empty(ticker, _fallback_reason(reason, attempts))
         if statements is None or not statements.is_available:
-            return _empty(ticker, reason)
-        return _international_snapshot(statements)
+            return _empty(ticker, _fallback_reason(reason, attempts))
+        statements = InternationalStatements(
+            ticker=statements.ticker,
+            company_name=statements.company_name or international_name,
+            years=statements.years,
+            equity=statements.equity,
+            total_assets=statements.total_assets,
+            current_assets=statements.current_assets,
+            current_liabilities=statements.current_liabilities,
+            gross_debt=statements.gross_debt,
+            short_term_debt=statements.short_term_debt,
+            long_term_debt=statements.long_term_debt,
+            net_debt=statements.net_debt,
+            cash_and_equivalents=statements.cash_and_equivalents,
+            shares_outstanding=statements.shares_outstanding,
+            market_capitalization=statements.market_capitalization,
+            currency=statements.currency,
+            source=statements.source,
+            source_url=statements.source_url,
+            identifiers=statements.identifiers,
+            fallbacks_attempted=tuple(attempts[:-1]),
+        )
+        return _international_snapshot(statements, ticker)
 
 
 def _collect_multiples(
@@ -488,6 +570,9 @@ def _provenance(
     shares_source: str = SOURCE_CVM,
     supplemental: dict[str, Decimal | None] | None = None,
     supplemental_sources: dict[str, str] | None = None,
+    source_url: str | None = None,
+    fallbacks_attempted: list[str] | None = None,
+    default_source: str = SOURCE_CVM,
 ) -> list[FieldProvenance]:
     weight = Decimal("0.95") if confidence == "high" else Decimal("0.8")
     fields = {
@@ -509,10 +594,12 @@ def _provenance(
             field_name=name,
             value=value,
             selected_source=(
-                shares_source if name == "shares_outstanding" else sources.get(name, SOURCE_CVM)
+                shares_source if name == "shares_outstanding" else sources.get(name, default_source)
             )
             if value is not None
             else None,
+            source_url=source_url,
+            fallbacks_attempted=fallbacks_attempted or [],
             reference_date=reference,
             retrieved_at=retrieved,
             confidence=weight if value is not None else Decimal("0"),
@@ -600,7 +687,14 @@ def _empty(ticker: str, reason: str) -> FundamentalsSnapshot:
     return FundamentalsSnapshot(ticker=ticker, unavailable_reason=reason)
 
 
-def _international_snapshot(statements: InternationalStatements) -> FundamentalsSnapshot:
+def _fallback_reason(reason: str, attempts: list[str]) -> str:
+    return f"{reason}; attempted sources: {', '.join(attempts)}" if attempts else reason
+
+
+def _international_snapshot(
+    statements: InternationalStatements,
+    requested_ticker: str | None = None,
+) -> FundamentalsSnapshot:
     """Turn published statements into the snapshot shape consumers expect.
 
     The income statement is reported per year, so each one becomes a period and
@@ -610,7 +704,10 @@ def _international_snapshot(statements: InternationalStatements) -> Fundamentals
     always carried today's assets and debt.
     """
     latest = statements.years[-1]
-    shares = _quotient(latest.net_income, latest.earnings_per_share)
+    shares = statements.shares_outstanding or _quotient(
+        latest.net_income,
+        latest.earnings_per_share,
+    )
     periods = [
         FinancialPeriod(
             period_end=year.period_end,
@@ -621,20 +718,42 @@ def _international_snapshot(statements: InternationalStatements) -> Fundamentals
             ebit=year.ebit,
             net_income=year.net_income,
             operating_cash_flow=year.operating_cash_flow,
-            shares_outstanding=_quotient(year.net_income, year.earnings_per_share),
+            capex=year.capex,
+            depreciation=year.depreciation,
+            free_cash_flow=year.free_cash_flow,
+            ebitda=year.ebitda,
+            shares_outstanding=(
+                statements.shares_outstanding if year is latest else
+                _quotient(year.net_income, year.earnings_per_share)
+            ),
             source=statements.source,
+            source_url=statements.source_url,
             **(_balance_of(statements) if year is latest else {}),
         )
         for year in statements.years
     ]
     return FundamentalsSnapshot(
-        ticker=statements.ticker,
+        ticker=requested_ticker or statements.ticker,
+        company_name=statements.company_name,
         currency=statements.currency,
         periods=periods,
         trailing_twelve_months=periods[-1],
         shares_outstanding=shares,
         earnings_per_share=latest.earnings_per_share,
         book_value_per_share=_quotient(statements.equity, shares),
+        provenance=_provenance(
+            periods[-1],
+            shares,
+            confidence="high" if statements.source == "sec_edgar_companyfacts" else "medium",
+            shares_source=statements.source,
+            supplemental={
+                "earnings_per_share": latest.earnings_per_share,
+                "book_value_per_share": _quotient(statements.equity, shares),
+            },
+            source_url=statements.source_url,
+            fallbacks_attempted=list(statements.fallbacks_attempted),
+            default_source=statements.source,
+        ),
     )
 
 
@@ -643,7 +762,10 @@ def _balance_of(statements: InternationalStatements) -> dict[str, Decimal | None
         "equity": statements.equity,
         "total_assets": statements.total_assets,
         "current_assets": statements.current_assets,
+        "current_liabilities": statements.current_liabilities,
         "gross_debt": statements.gross_debt,
+        "short_term_debt": statements.short_term_debt,
+        "long_term_debt": statements.long_term_debt,
         "net_debt": statements.net_debt,
         "cash_and_equivalents": statements.cash_and_equivalents,
     }
