@@ -564,9 +564,31 @@ def _merge_instruments(
         if value not in (None, "", {}, []):
             if values.get(field) in (None, "", {}, []):
                 values[field] = value
+    if _confidence_rank(existing.confidence) > _confidence_rank(incoming.confidence):
+        for field in (
+            "instrument_type",
+            "source",
+            "confidence",
+            "category",
+            "cfi_code",
+            "isin",
+            "identifiers",
+            "underlying_ticker",
+            "underlying_name",
+            "underlying_exchange",
+            "underlying_country",
+            "underlying_identifiers",
+            "underlying_source",
+            "underlying_unavailable_reason",
+        ):
+            values[field] = previous[field]
     # An observed BDR response can carry richer underlying metadata than a
     # bulk index; preserve it while retaining the freshest directory identity.
     return InstrumentMetadata(**values)
+
+
+def _confidence_rank(value: str) -> int:
+    return {"high": 2, "medium": 1, "low": 0}.get(value.lower(), -1)
 
 
 def _search_match(item: InstrumentMetadata, query: str) -> bool:

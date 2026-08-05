@@ -33,6 +33,7 @@ def test_brapi_directory_parses_asset_types_and_accents() -> None:
                 {"stock": "AAPL34", "name": "Apple BDR", "type": "BDR"},
                 {"stock": "HGLG11", "name": "Fundo Imobiliário Logística", "type": "FII"},
                 {"stock": "IVVB11", "name": "iShares ETF", "type": "ETF"},
+                {"stock": "MXRF11", "name": "Maxi Renda", "type": "fund"},
             ]
         }
     )
@@ -41,6 +42,7 @@ def test_brapi_directory_parses_asset_types_and_accents() -> None:
         InstrumentType.bdr,
         InstrumentType.fii,
         InstrumentType.etf,
+        InstrumentType.fii,
     ]
     assert results[0].country == "BR"
     assert results[0].source == "brapi_directory_complementary"
@@ -62,7 +64,7 @@ def test_brapi_directory_accepts_list_shapes_and_rejects_bad_rows() -> None:
         InstrumentType.fiagro,
         InstrumentType.fi_infra,
         InstrumentType.unit,
-        InstrumentType.bdr,
+        InstrumentType.unknown,
     ]
     assert parse_brapi_directory(None) == []
     assert parse_brapi_directory({"nested": rows})
@@ -143,6 +145,23 @@ async def test_warm_merges_sec_and_brazil_sources_and_search_is_local() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sec_legacy_title_and_exchange_directory_shapes() -> None:
+    settings = _settings()
+    provider = SecCompanyFactsProvider(
+        settings,
+        httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"0": {"ticker": "AAPL", "cik_str": 1, "title": "Apple Inc"}},
+            )
+        ),
+    )
+    records = await provider.ticker_directory()
+    assert records[0].name == "Apple Inc"
+    assert records[0].security_class is None
+
+
+@pytest.mark.asyncio
 async def test_dedupe_keeps_observed_bdr_underlying_metadata() -> None:
     payload = {"stocks": [{"stock": "AAPL34", "name": "Apple BDR", "type": "BDR"}]}
     settings = _settings()
@@ -179,6 +198,40 @@ async def test_dedupe_keeps_observed_bdr_underlying_metadata() -> None:
     observed = next(item for item in result.results if item.ticker == "AAPL34")
     assert observed.underlying_ticker == "AAPL"
     assert observed.underlying_source == "b3"
+
+
+@pytest.mark.asyncio
+async def test_dedupe_does_not_overwrite_authoritative_observed_identity() -> None:
+    settings = _settings()
+    service = InstrumentDataService(settings)
+    service._remember(
+        InstrumentMetadata(
+            ticker="AAPL34",
+            name="Apple observed",
+            instrument_type=InstrumentType.bdr,
+            exchange="B3",
+            category="BDR",
+            source="b3",
+            confidence="high",
+            underlying_ticker="AAPL",
+            underlying_source="b3",
+        )
+    )
+    service._remember(
+        InstrumentMetadata(
+            ticker="AAPL34",
+            name="Apple bulk",
+            instrument_type=InstrumentType.unknown,
+            exchange="B3",
+            source="brapi_directory_complementary",
+            confidence="medium",
+            underlying_ticker="WRONG",
+        )
+    )
+    result = await service.search("aapl34")
+    assert result.results[0].instrument_type is InstrumentType.bdr
+    assert result.results[0].source == "b3"
+    assert result.results[0].underlying_ticker == "AAPL"
 
 
 @pytest.mark.asyncio

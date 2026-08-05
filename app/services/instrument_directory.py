@@ -171,12 +171,20 @@ def _directory_instrument_type(
         return InstrumentType.fi_infra
     if "FII" in text or "IMOBILI" in text or "REAL ESTATE" in text:
         return InstrumentType.fii
+    if (
+        raw_type
+        and raw_type.strip().upper() in {"FUND", "FUNDS", "FUNDOS"}
+        and ticker.endswith("11")
+    ):
+        return InstrumentType.fii
     if "UNIT" in text or " UNT" in f" {text}":
         return InstrumentType.unit
-    # Some brapi rows omit a type but retain the well-known B3 suffix.
-    if ticker.endswith("34"):
-        return InstrumentType.bdr
-    return InstrumentType.stock
+    if "STOCK" in text or "EQUITY" in text or "COMMON" in text:
+        return InstrumentType.stock
+    # A suffix alone is not authoritative: several B3 classes share suffixes
+    # and upstream list rows occasionally omit their type. Preserve that
+    # uncertainty instead of inventing a security class.
+    return InstrumentType.unknown
 
 
 __all__ = [

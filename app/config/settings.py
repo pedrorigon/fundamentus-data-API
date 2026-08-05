@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     # SEC EDGAR CompanyFacts is public and does not require an API key. SEC
     # asks clients to identify themselves with a descriptive User-Agent.
     sec_edgar_base_url: str = "https://data.sec.gov"
-    sec_company_tickers_url: str = "https://www.sec.gov/files/company_tickers.json"
+    sec_company_tickers_url: str = "https://www.sec.gov/files/company_tickers_exchange.json"
     sec_user_agent: str | None = None
     sec_request_timeout_seconds: float = 10.0
     sec_companyfacts_ttl_seconds: int = 86400

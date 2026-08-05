@@ -194,12 +194,10 @@ def _parse_ticker_directory(payload: Any) -> list[SecTickerRecord]:
             SecTickerRecord(
                 ticker=ticker,
                 cik=cik,
-                name=_directory_text(item, "name", "companyName", "company_name"),
+                name=_directory_text(item, "name", "companyName", "company_name", "title"),
                 exchange=_directory_text(item, "exchange", "Exchange"),
                 country=_directory_text(item, "country", "Country") or "US",
-                security_class=_directory_text(
-                    item, "security_class", "class", "securityClass", "title"
-                ),
+                security_class=_directory_text(item, "security_class", "class", "securityClass"),
             )
         )
     return records
