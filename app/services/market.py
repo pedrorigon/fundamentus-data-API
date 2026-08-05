@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import unicodedata
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -20,6 +21,11 @@ from app.models import (
     InstrumentType,
     InternationalFundamentals,
     MarketQuote,
+)
+from app.scrapers.sec_companyfacts import SEC_TICKER_DIRECTORY, SecCompanyFactsProvider
+from app.services.instrument_directory import (
+    SOURCE_BRAPI_DIRECTORY,
+    BrapiInstrumentDirectoryProvider,
 )
 from app.services.opportunity import B3InstrumentProvider
 
@@ -155,15 +161,64 @@ class InstrumentDataService:
         b3: B3InstrumentProvider | None = None,
         brapi: BrapiInstrumentDataProvider | None = None,
         alpha: AlphaVantageInstrumentDataProvider | None = None,
+        sec: SecCompanyFactsProvider | None = None,
+        brapi_directory: BrapiInstrumentDirectoryProvider | None = None,
+        directory_provider: BrapiInstrumentDirectoryProvider | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.settings = settings
-        self.b3 = b3 or B3InstrumentProvider(settings)
-        self.brapi = brapi or BrapiInstrumentDataProvider(settings)
-        self.alpha = alpha or AlphaVantageInstrumentDataProvider(settings)
+        self.b3 = b3 or B3InstrumentProvider(settings, transport)
+        self.brapi = brapi or BrapiInstrumentDataProvider(settings, transport)
+        self.alpha = alpha or AlphaVantageInstrumentDataProvider(settings, transport)
+        self.sec = sec or SecCompanyFactsProvider(settings, transport)
+        self.brapi_directory = (
+            brapi_directory
+            or directory_provider
+            or BrapiInstrumentDirectoryProvider(settings, transport)
+        )
         self._cache: dict[
             tuple[str, InstrumentType | None], tuple[datetime, InstrumentDataResponse]
         ] = {}
-        self._directory: dict[str, InstrumentMetadata] = {}
+        self._directory: dict[tuple[str, str], InstrumentMetadata] = {}
+        self._directory_lock = asyncio.Lock()
+        self._directory_task: asyncio.Task[None] | None = None
+        self._directory_refreshed_at = 0.0
+        self._directory_loaded = False
+        self._directory_warnings: list[str] = []
+
+    async def warm_directory(self, *, force: bool = False) -> None:
+        """Refresh bulk identity indexes without delaying application startup."""
+        now = asyncio.get_running_loop().time()
+        if (
+            not force
+            and self._directory_loaded
+            and now - self._directory_refreshed_at < self.settings.instrument_directory_ttl_seconds
+        ):
+            return
+        async with self._directory_lock:
+            task = self._directory_task
+            if task is None:
+                task = asyncio.create_task(self._refresh_directory())
+                self._directory_task = task
+        try:
+            await task
+        finally:
+            async with self._directory_lock:
+                if self._directory_task is task:
+                    self._directory_task = None
+
+    async def refresh_directory(self) -> None:
+        """Force a bounded bulk refresh, retaining the prior snapshot on failure."""
+        await self.warm_directory(force=True)
+
+    async def close(self) -> None:
+        """Cancel a still-running background warm-up during application shutdown."""
+        async with self._directory_lock:
+            task = self._directory_task
+            self._directory_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def get(
         self,
@@ -179,17 +234,11 @@ class InstrumentDataService:
         result = await self._load(normalized, instrument_type, now)
         self._cache[cache_key] = (now, result)
         if result.instrument is not None:
-            self._directory[normalized] = result.instrument
+            self._remember(result.instrument)
         return result
 
     async def search(self, query: str, *, limit: int = 20) -> InstrumentSearchResponse:
-        """Search the locally resolved instrument directory without network I/O.
-
-        The service deliberately does not issue a remote request per keystroke:
-        this directory is the bounded set observed by this process.  A caller
-        can prime it through normal instrument requests or use a future batch
-        directory import when B3 publishes a complete catalogue endpoint.
-        """
+        """Search the locally warmed/observed directory without network I/O."""
         normalized_query = _fold_search(query)
         bounded_limit = max(1, min(limit, 50))
         if not normalized_query:
@@ -199,37 +248,70 @@ class InstrumentDataService:
                 unavailable_reason="A non-empty search query is required",
             )
         matches = [
-            item
-            for item in self._directory.values()
-            if normalized_query
-            in _fold_search(
-                " ".join(
-                    value
-                    for value in (
-                        item.ticker,
-                        item.name,
-                        item.underlying_ticker,
-                        item.underlying_name,
-                    )
-                    if value
-                )
-            )
+            item for item in self._directory.values() if _search_match(item, normalized_query)
         ]
-        matches.sort(
-            key=lambda item: (
-                0 if _fold_search(item.ticker) == normalized_query else 1,
-                item.ticker,
-            )
-        )
+        matches.sort(key=lambda item: _search_rank(item, normalized_query))
         return InstrumentSearchResponse(
             query=query.strip(),
             results=matches[:bounded_limit],
             limited=True,
-            unavailable_reason=(
-                "Only instruments already resolved by this process are searchable"
-                if not matches
-                else "Results are limited to the locally observed instrument directory"
-            ),
+            unavailable_reason=self._directory_message(bool(matches)),
+        )
+
+    async def _refresh_directory(self) -> None:
+        sources: list[InstrumentMetadata] = []
+        warnings: list[str] = []
+        sec_task = asyncio.create_task(
+            _invoke_directory(cast(Any, self.sec), "ticker_directory", "directory")
+        )
+        brapi_task = asyncio.create_task(
+            _invoke_directory(cast(Any, self.brapi_directory), "directory", "instruments")
+        )
+        gathered: tuple[
+            list[Any] | BaseException, list[Any] | BaseException
+        ] = await asyncio.gather(sec_task, brapi_task, return_exceptions=True)
+        sec_result, brapi_result = gathered
+        if isinstance(sec_result, BaseException):
+            warnings.append(f"{SEC_TICKER_DIRECTORY} unavailable: {sec_result}")
+        else:
+            sources.extend(_metadata_from_sec(item) for item in sec_result)
+            if not sec_result:
+                warnings.append(f"{SEC_TICKER_DIRECTORY} returned no records")
+        if isinstance(brapi_result, BaseException):
+            warnings.append(f"{SOURCE_BRAPI_DIRECTORY} unavailable: {brapi_result}")
+        else:
+            sources.extend(brapi_result)
+            if not brapi_result:
+                reason = getattr(self.brapi_directory, "last_error", None) or "returned no records"
+                warnings.append(f"{SOURCE_BRAPI_DIRECTORY} unavailable: {reason}")
+        if sources:
+            for item in sources:
+                self._remember(item)
+            self._directory_loaded = True
+            self._directory_refreshed_at = asyncio.get_running_loop().time()
+        self._directory_warnings = warnings
+
+    def _remember(self, instrument: InstrumentMetadata) -> None:
+        key = (_fold_search(instrument.ticker), _fold_search(instrument.exchange) or "")
+        existing = self._directory.get(key)
+        self._directory[key] = _merge_instruments(existing, instrument)
+
+    def _directory_message(self, has_matches: bool) -> str:
+        if self._directory_warnings:
+            unavailable = "; ".join(self._directory_warnings)
+            return f"Coverage is limited to available local indexes; {unavailable}"
+        if not self._directory_loaded:
+            return (
+                "Directory warm-up is pending; results are limited to instruments "
+                "already resolved by this process"
+            )
+        return (
+            "Coverage is limited to SEC EDGAR and the complementary brapi B3 list"
+            if has_matches
+            else (
+                "No local directory match; coverage is limited to SEC EDGAR and the "
+                "complementary brapi B3 list"
+            )
         )
 
     def _cached(
@@ -427,3 +509,90 @@ def _international_instrument(
 def _fold_search(value: str | None) -> str:
     normalized = unicodedata.normalize("NFKD", value or "")
     return normalized.encode("ascii", "ignore").decode("ascii").upper().strip()
+
+
+def _metadata_from_sec(record: Any) -> InstrumentMetadata:
+    if isinstance(record, InstrumentMetadata):
+        return record
+    if isinstance(record, dict):
+        ticker = str(record.get("ticker") or "")
+        name = record.get("name")
+        security_class = record.get("security_class") or record.get("class")
+        exchange = record.get("exchange")
+        country = record.get("country") or "US"
+        cik = record.get("cik") or record.get("cik_str") or ""
+    else:
+        ticker = record.ticker
+        name = record.name
+        security_class = getattr(record, "security_class", None)
+        exchange = getattr(record, "exchange", None)
+        country = getattr(record, "country", None) or "US"
+        cik = getattr(record, "cik", "")
+    identifiers = {"cik": cik} if cik else {}
+    return InstrumentMetadata(
+        ticker=ticker,
+        name=name,
+        instrument_type=InstrumentType.stock,
+        category=security_class or "common_stock",
+        identifiers=identifiers,
+        exchange=exchange.upper() if exchange else None,
+        country=country.upper(),
+        source=SEC_TICKER_DIRECTORY,
+        confidence="high",
+    )
+
+
+async def _invoke_directory(provider: Any, preferred: str, fallback: str) -> list[Any]:
+    loader = getattr(provider, preferred, None) or getattr(provider, fallback, None)
+    if loader is None:
+        raise RuntimeError(f"Directory provider has no {preferred}/{fallback} method")
+    result = await loader()
+    return result if isinstance(result, list) else []
+
+
+def _merge_instruments(
+    existing: InstrumentMetadata | None,
+    incoming: InstrumentMetadata,
+) -> InstrumentMetadata:
+    if existing is None:
+        return incoming
+    values = incoming.model_dump()
+    previous = existing.model_dump()
+    for field, value in previous.items():
+        if field in {"ticker", "instrument_type", "source", "confidence"}:
+            continue
+        if value not in (None, "", {}, []):
+            if values.get(field) in (None, "", {}, []):
+                values[field] = value
+    # An observed BDR response can carry richer underlying metadata than a
+    # bulk index; preserve it while retaining the freshest directory identity.
+    return InstrumentMetadata(**values)
+
+
+def _search_match(item: InstrumentMetadata, query: str) -> bool:
+    fields = (
+        item.ticker,
+        item.name,
+        item.underlying_ticker,
+        item.underlying_name,
+    )
+    return any(query in _fold_search(value) for value in fields if value)
+
+
+def _search_rank(item: InstrumentMetadata, query: str) -> tuple[int, int, str, str]:
+    ticker = _fold_search(item.ticker)
+    name = _fold_search(item.name)
+    underlying = _fold_search(item.underlying_ticker)
+    if ticker == query:
+        rank = 0
+    elif ticker.startswith(query):
+        rank = 1
+    elif name.startswith(query):
+        rank = 2
+    elif underlying == query:
+        rank = 3
+    elif underlying.startswith(query):
+        rank = 4
+    else:
+        rank = 5
+    return rank, len(ticker), ticker, _fold_search(item.exchange)

@@ -120,6 +120,28 @@ class _CachedValue:
     value: Any
 
 
+@dataclass(frozen=True)
+class SecTickerRecord:
+    """The bounded identity fields published by SEC's ticker directory."""
+
+    ticker: str
+    cik: str
+    name: str | None = None
+    exchange: str | None = None
+    country: str = "US"
+    security_class: str | None = None
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "ticker": self.ticker,
+            "cik": self.cik,
+            "name": self.name,
+            "exchange": self.exchange,
+            "country": self.country,
+            "security_class": self.security_class,
+        }
+
+
 def normalize_sec_ticker(value: str) -> str:
     """Normalize a SEC ticker and reject B3 symbols or malformed input."""
     ticker = value.strip().upper()
@@ -134,6 +156,63 @@ def normalize_cik(value: str | int) -> str:
     if match is None:
         raise ValueError(f"Invalid SEC CIK: {value!r}")
     return match.group(1).zfill(10)
+
+
+def _parse_ticker_directory(payload: Any) -> list[SecTickerRecord]:
+    if not isinstance(payload, (dict, list)):
+        return []
+    values: list[Any]
+    if isinstance(payload, dict) and isinstance(payload.get("fields"), list):
+        fields = [str(field) for field in payload["fields"]]
+        raw_data = payload.get("data")
+        values = (
+            [dict(zip(fields, row, strict=False)) for row in raw_data if isinstance(row, list)]
+            if isinstance(raw_data, list)
+            else []
+        )
+    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        values = payload["data"]
+    else:
+        values = list(payload.values()) if isinstance(payload, dict) else list(payload)
+    records: list[SecTickerRecord] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, dict) or not isinstance(item.get("ticker"), str):
+            continue
+        try:
+            ticker = normalize_sec_ticker(item["ticker"])
+            raw_cik = item.get("cik_str", item.get("cik"))
+            if not isinstance(raw_cik, (str, int)):
+                continue
+            cik = normalize_cik(raw_cik)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        records.append(
+            SecTickerRecord(
+                ticker=ticker,
+                cik=cik,
+                name=_directory_text(item, "name", "companyName", "company_name"),
+                exchange=_directory_text(item, "exchange", "Exchange"),
+                country=_directory_text(item, "country", "Country") or "US",
+                security_class=_directory_text(
+                    item, "security_class", "class", "securityClass", "title"
+                ),
+            )
+        )
+    return records
+
+
+def _directory_text(item: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = item.get(key)
+        if value is not None:
+            cleaned = str(value).strip()
+            if cleaned:
+                return cleaned
+    return None
 
 
 class SecCompanyFactsProvider:
@@ -171,31 +250,28 @@ class SecCompanyFactsProvider:
         )
         return parse_company_facts(payload, normalized, cik, source_url)
 
-    async def _ticker_to_cik(self, ticker: str) -> str | None:
+    async def ticker_directory(self) -> list[SecTickerRecord]:
+        """Return all valid SEC ticker identities from the shared local cache.
+
+        The SEC file is a single bounded bulk request.  Parsing is deliberately
+        kept here so statement resolution and the instrument search directory
+        cannot disagree about ticker/CIK normalization.
+        """
         payload = await self._cached_json(
             "ticker-directory",
             lambda: self._fetch_json_url(self.settings.sec_company_tickers_url),
             self.settings.sec_ticker_map_ttl_seconds,
         )
-        if not isinstance(payload, (dict, list)):
-            return None
-        values = payload.values() if isinstance(payload, dict) else payload
-        for item in values:
-            if not isinstance(item, dict):
-                continue
-            raw_ticker = item.get("ticker")
-            if not isinstance(raw_ticker, str):
-                continue
-            try:
-                candidate = normalize_sec_ticker(raw_ticker)
-            except ValueError:
-                continue
-            if candidate != ticker:
-                continue
-            try:
-                return normalize_cik(item["cik_str"])
-            except (KeyError, TypeError, ValueError):
-                return None
+        return _parse_ticker_directory(payload)
+
+    async def directory(self) -> list[SecTickerRecord]:
+        """Alias used by directory consumers and startup warm-up code."""
+        return await self.ticker_directory()
+
+    async def _ticker_to_cik(self, ticker: str) -> str | None:
+        for item in await self.ticker_directory():
+            if item.ticker == ticker:
+                return item.cik
         return None
 
     async def _cached_json(

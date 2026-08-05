@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     bcb_ifdata_base_url: str = "https://olinda.bcb.gov.br/olinda/servico/IFDATA/versao/v1/odata"
     brapi_base_url: str = "https://brapi.dev"
     brapi_token: SecretStr | None = None
+    # The public brapi quote list is a complementary directory for B3 assets.
+    # It is fetched in one bounded refresh and never queried by search.
+    brapi_instrument_directory_path: str = "/api/quote/list"
+    instrument_directory_ttl_seconds: int = 86400
+    instrument_directory_max_rows: int = 1000
     alpha_vantage_base_url: str = "https://www.alphavantage.co"
     alpha_vantage_api_key: SecretStr | None = None
     # SEC EDGAR CompanyFacts is public and does not require an API key. SEC
