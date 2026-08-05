@@ -94,7 +94,6 @@ class InternationalStatements:
     """Everything two public pages state about one foreign listing."""
 
     ticker: str
-    company_name: str | None = None
     years: tuple[AnnualFigures, ...] = field(default_factory=tuple)
     equity: Decimal | None = None
     total_assets: Decimal | None = None
@@ -109,6 +108,9 @@ class InternationalStatements:
     market_capitalization: Decimal | None = None
     currency: str = "USD"
     source: str = SOURCE_STATEMENTS
+    # Optional identity/provenance fields are appended so callers using the
+    # original positional dataclass order remain compatible.
+    company_name: str | None = None
     source_url: str | None = None
     identifiers: dict[str, str] = field(default_factory=dict)
     fallbacks_attempted: tuple[str, ...] = field(default_factory=tuple)
