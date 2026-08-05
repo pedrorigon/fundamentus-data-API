@@ -98,18 +98,18 @@ class InternationalStatements:
     equity: Decimal | None = None
     total_assets: Decimal | None = None
     current_assets: Decimal | None = None
-    current_liabilities: Decimal | None = None
     gross_debt: Decimal | None = None
-    short_term_debt: Decimal | None = None
-    long_term_debt: Decimal | None = None
     net_debt: Decimal | None = None
     cash_and_equivalents: Decimal | None = None
-    shares_outstanding: Decimal | None = None
     market_capitalization: Decimal | None = None
     currency: str = "USD"
     source: str = SOURCE_STATEMENTS
     # Optional identity/provenance fields are appended so callers using the
     # original positional dataclass order remain compatible.
+    current_liabilities: Decimal | None = None
+    short_term_debt: Decimal | None = None
+    long_term_debt: Decimal | None = None
+    shares_outstanding: Decimal | None = None
     company_name: str | None = None
     source_url: str | None = None
     identifiers: dict[str, str] = field(default_factory=dict)
