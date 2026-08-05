@@ -2,6 +2,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -152,6 +153,36 @@ def test_companyfacts_maps_annual_history_and_amended_latest_value() -> None:
     assert result.shares_outstanding == Decimal("10")
     assert result.source == "sec_edgar_companyfacts"
     assert result.source_url and "CIK0000320193" in result.source_url
+
+
+def test_sec_annual_periods_ignore_newer_instant_facts() -> None:
+    payload = _facts_payload()
+    us_gaap = cast(dict[str, Any], cast(dict[str, object], payload["facts"])["us-gaap"])
+    us_gaap["Assets"]["units"]["USD"].append(_observation("999", "2025-12-31"))
+    us_gaap["EntityCommonStockSharesOutstanding"]["units"]["shares"].append(
+        _observation("999", "2025-12-31")
+    )
+
+    result = parse_company_facts(payload, "AAPL", "1", "url")
+
+    assert result is not None
+    assert result.years[-1].period_end == date(2024, 12, 31)
+    assert result.total_assets == Decimal("230")
+    assert result.shares_outstanding == Decimal("10")
+
+
+def test_sec_instant_only_payload_is_unavailable() -> None:
+    payload = {
+        "facts": {
+            "us-gaap": {
+                "Assets": {"units": {"USD": [_observation("100", "2025-12-31")]}},
+                "EntityCommonStockSharesOutstanding": {
+                    "units": {"shares": [_observation("10", "2025-12-31")]}
+                },
+            }
+        }
+    }
+    assert parse_company_facts(payload, "AAPL", "1", "url") is None
 
 
 @pytest.mark.asyncio

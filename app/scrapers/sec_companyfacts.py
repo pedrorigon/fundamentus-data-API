@@ -31,6 +31,18 @@ _CIK_PATTERN = re.compile(r"^(?:CIK)?(\d{1,10})$", re.IGNORECASE)
 _ANNUAL_FORMS = frozenset({"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"})
 _MAX_YEARS = 5
 _DAY_TOLERANCE = 20
+_DURATION_FIELDS = frozenset(
+    {
+        "revenue",
+        "gross_profit",
+        "ebit",
+        "net_income",
+        "operating_cash_flow",
+        "capex",
+        "depreciation",
+        "earnings_per_share",
+    }
+)
 
 _TAGS: dict[str, tuple[str, ...]] = {
     "revenue": (
@@ -272,7 +284,17 @@ def parse_company_facts(
             collected[field] = observations
     if not collected:
         return None
-    period_ends = sorted({item.end for values in collected.values() for item in values})
+    period_ends = sorted(
+        {
+            item.end
+            for field, values in collected.items()
+            if field in _DURATION_FIELDS
+            for item in values
+            if item.start is not None and _is_annual_form(item.form, item.start, item.end)
+        }
+    )
+    if not period_ends:
+        return None
     period_ends = period_ends[-_MAX_YEARS:]
     annuals: list[AnnualFigures] = []
     for period_end in period_ends:
@@ -302,16 +324,21 @@ def parse_company_facts(
             )
         )
     latest = annuals[-1]
-    equity = _latest_value(collected.get("equity", []))
-    total_assets = _latest_value(collected.get("total_assets", []))
-    current_assets = _latest_value(collected.get("current_assets", []))
-    current_liabilities = _latest_value(collected.get("current_liabilities", []))
-    cash = _latest_value(collected.get("cash_and_equivalents", []))
-    current_debt = _latest_value(collected.get("current_debt", []))
-    noncurrent_debt = _latest_value(collected.get("noncurrent_debt", []))
+    annual_endpoint = latest.period_end
+    equity = _latest_value(collected.get("equity", []), as_of=annual_endpoint)
+    total_assets = _latest_value(collected.get("total_assets", []), as_of=annual_endpoint)
+    current_assets = _latest_value(collected.get("current_assets", []), as_of=annual_endpoint)
+    current_liabilities = _latest_value(
+        collected.get("current_liabilities", []), as_of=annual_endpoint
+    )
+    cash = _latest_value(collected.get("cash_and_equivalents", []), as_of=annual_endpoint)
+    current_debt = _latest_value(collected.get("current_debt", []), as_of=annual_endpoint)
+    noncurrent_debt = _latest_value(
+        collected.get("noncurrent_debt", []), as_of=annual_endpoint
+    )
     gross_debt = _sum_optional(current_debt, noncurrent_debt)
     net_debt = gross_debt - cash if gross_debt is not None and cash is not None else None
-    shares = _latest_value(collected.get("shares_outstanding", []))
+    shares = _latest_value(collected.get("shares_outstanding", []), as_of=annual_endpoint)
     if shares is None:
         shares = _quotient(latest.net_income, latest.earnings_per_share)
     currency = _currency(facts, _TAGS)
@@ -369,7 +396,7 @@ def _parse_tag(raw_tag: Any, field: str) -> list[_Observation]:
             continue
         start = _as_date(entry.get("start"))
         form = str(entry.get("form") or "")
-        if field not in {"shares_outstanding"} and not _is_annual_form(entry, form, start, end):
+        if field not in {"shares_outstanding"} and not _is_annual_form(form, start, end):
             continue
         try:
             value = Decimal(str(entry["val"]))
@@ -402,7 +429,7 @@ def _choose_unit(units: dict[str, Any], field: str) -> tuple[str | None, Any]:
     return candidates[0]
 
 
-def _is_annual_form(entry: dict[str, Any], form: str, start: date | None, end: date) -> bool:
+def _is_annual_form(form: str, start: date | None, end: date) -> bool:
     if form in _ANNUAL_FORMS:
         return True
     if start is None:
@@ -422,9 +449,17 @@ def _select_for_end(
     return max(matching, key=lambda item: (item.filed, item.form.endswith("/A"), item.accn))
 
 
-def _latest_value(observations: list[_Observation]) -> Decimal | None:
+def _latest_value(
+    observations: list[_Observation],
+    *,
+    as_of: date | None = None,
+) -> Decimal | None:
     if not observations:
         return None
+    if as_of is not None:
+        observations = [item for item in observations if item.end <= as_of]
+        if not observations:
+            return None
     latest = max(
         observations,
         key=lambda item: (item.end, item.filed, item.form.endswith("/A"), item.accn),
