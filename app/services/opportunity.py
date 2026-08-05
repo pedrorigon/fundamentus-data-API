@@ -305,20 +305,15 @@ def _instrument_from_b3(payload: object, ticker: str) -> InstrumentMetadata | No
             country=_optional(row.get("CntryNm") or row.get("Country")),
             underlying_ticker=underlying[0],
             underlying_name=underlying[1],
-            underlying_exchange=_optional(
-                row.get("UnderlyingExchange") or row.get("UndrlyngXchg")
-            ),
-            underlying_country=_optional(
-                row.get("UnderlyingCountry") or row.get("UndrlyngCntry")
-            ),
+            underlying_exchange=_optional(row.get("UnderlyingExchange") or row.get("UndrlyngXchg")),
+            underlying_country=_optional(row.get("UnderlyingCountry") or row.get("UndrlyngCntry")),
             underlying_identifiers=_underlying_identifiers(row),
             underlying_source=underlying[2],
             underlying_unavailable_reason=(
                 None
                 if underlying[0] is not None
                 else (
-                    "B3 did not publish an authoritative underlying ticker and no safe alias "
-                    "exists"
+                    "B3 did not publish an authoritative underlying ticker and no safe alias exists"
                 )
                 if instrument_type is InstrumentType.bdr
                 else None

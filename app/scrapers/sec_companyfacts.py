@@ -113,6 +113,7 @@ class _Observation:
     form: str
     accn: str
 
+
 @dataclass(frozen=True)
 class _CachedValue:
     expires_at: float
@@ -299,8 +300,7 @@ def parse_company_facts(
     annuals: list[AnnualFigures] = []
     for period_end in period_ends:
         selected = {
-            field: _select_for_end(values, period_end)
-            for field, values in collected.items()
+            field: _select_for_end(values, period_end) for field, values in collected.items()
         }
         annuals.append(
             AnnualFigures(
@@ -333,9 +333,7 @@ def parse_company_facts(
     )
     cash = _latest_value(collected.get("cash_and_equivalents", []), as_of=annual_endpoint)
     current_debt = _latest_value(collected.get("current_debt", []), as_of=annual_endpoint)
-    noncurrent_debt = _latest_value(
-        collected.get("noncurrent_debt", []), as_of=annual_endpoint
-    )
+    noncurrent_debt = _latest_value(collected.get("noncurrent_debt", []), as_of=annual_endpoint)
     gross_debt = _sum_optional(current_debt, noncurrent_debt)
     net_debt = gross_debt - cash if gross_debt is not None and cash is not None else None
     shares = _latest_value(collected.get("shares_outstanding", []), as_of=annual_endpoint)

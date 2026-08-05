@@ -59,8 +59,10 @@ class FundamentalsService:
         self.international = international or InternationalStatementsProvider(settings)
         # Tests and callers that inject a custom HTML provider can opt out of
         # the default network adapter; the application path gets SEC first.
-        self.sec = sec if sec is not None else (
-            SecCompanyFactsProvider(settings) if international is None else None
+        self.sec = (
+            sec
+            if sec is not None
+            else (SecCompanyFactsProvider(settings) if international is None else None)
         )
         self._decoded_archives: dict[
             tuple[StatementKind, int],
@@ -723,8 +725,9 @@ def _international_snapshot(
             free_cash_flow=year.free_cash_flow,
             ebitda=year.ebitda,
             shares_outstanding=(
-                statements.shares_outstanding if year is latest else
-                _quotient(year.net_income, year.earnings_per_share)
+                statements.shares_outstanding
+                if year is latest
+                else _quotient(year.net_income, year.earnings_per_share)
             ),
             source=statements.source,
             source_url=statements.source_url,

@@ -201,7 +201,8 @@ class InstrumentDataService:
         matches = [
             item
             for item in self._directory.values()
-            if normalized_query in _fold_search(
+            if normalized_query
+            in _fold_search(
                 " ".join(
                     value
                     for value in (
