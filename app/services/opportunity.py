@@ -35,6 +35,7 @@ from app.scrapers.cvm_fund_reports import (
     FundReportSeries as CvmReportSeries,
 )
 from app.services.assets import AssetService
+from app.services.market_routing import should_query_b3
 
 SOURCE_FUNDAMENTUS = "fundamentus"
 SOURCE_STATUS_INVEST = "status_invest"
@@ -106,6 +107,15 @@ class B3InstrumentProvider:
         cached = self._cache.get(normalized)
         if cached and cached[0] > monotonic():
             return cached[1]
+        if not should_query_b3(normalized):
+            # A foreign symbol can never appear in B3's bulletin, and the
+            # session walk below would spend seven sequential requests proving
+            # it. Cache the negative answer and route elsewhere.
+            self._cache[normalized] = (
+                monotonic() + self.settings.opportunity_cache_ttl_seconds,
+                None,
+            )
+            return None
         encoded = base64.b64encode(normalized.encode()).decode()
         timeout = httpx.Timeout(self.settings.request_timeout_seconds)
         async with httpx.AsyncClient(
