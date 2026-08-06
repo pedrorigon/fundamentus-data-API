@@ -14,6 +14,7 @@ class FieldProvenance(BaseModel):
     field_name: str
     value: Decimal | None = None
     selected_source: str | None = None
+    source_url: str | None = None
     fallbacks_attempted: list[str] = Field(default_factory=list)
     reference_date: date | None = None
     retrieved_at: date | None = None
@@ -50,6 +51,7 @@ class FinancialPeriod(BaseModel):
     depreciation: Decimal | None = None
     shares_outstanding: Decimal | None = None
     source: str = "cvm"
+    source_url: str | None = None
 
 
 class FundamentalsSnapshot(BaseModel):

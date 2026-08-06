@@ -36,6 +36,7 @@ from app.models import (
     HistoricalQuoteResponse,
     InstrumentDataResponse,
     InstrumentMetadata,
+    InstrumentSearchResponse,
     InstrumentType,
     OpportunityResponse,
     QualityFactsRequest,
@@ -103,6 +104,16 @@ async def get_instrument(
     service: OpportunityServiceDep,
 ) -> InstrumentMetadata | None:
     return await service.instrument(ticker)
+
+
+@router.get("/v2/instruments/search", response_model=InstrumentSearchResponse, tags=["instruments"])
+async def search_instruments(
+    service: InstrumentDataServiceDep,
+    q: str = Query(min_length=1, max_length=80),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> InstrumentSearchResponse:
+    """Search the locally observed instrument directory without upstream calls."""
+    return await service.search(q, limit=limit)
 
 
 @router.get("/v2/instruments/{ticker}", tags=["instruments"])

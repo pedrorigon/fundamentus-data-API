@@ -92,7 +92,17 @@ class InstrumentMetadata(APIModel):
     category: str | None = None
     cfi_code: str | None = None
     isin: str | None = None
+    identifiers: dict[str, str] = Field(default_factory=dict)
     currency: str | None = None
+    exchange: str | None = None
+    country: str | None = None
+    underlying_ticker: str | None = None
+    underlying_name: str | None = None
+    underlying_exchange: str | None = None
+    underlying_country: str | None = None
+    underlying_identifiers: dict[str, str] = Field(default_factory=dict)
+    underlying_source: str | None = None
+    underlying_unavailable_reason: str | None = None
     reference_date: date | None = None
     source: str = "b3"
     confidence: str = "high"
@@ -152,7 +162,15 @@ class InstrumentDataResponse(APIModel):
     quote: MarketQuote | None = None
     fund_profile: FundProfile | None = None
     fundamentals: InternationalFundamentals | None = None
+    unavailable_reason: str | None = None
     refreshed_at: datetime
+
+
+class InstrumentSearchResponse(APIModel):
+    query: str
+    results: list[InstrumentMetadata] = Field(default_factory=list)
+    limited: bool = True
+    unavailable_reason: str | None = None
 
 
 class OpportunityMetric(APIModel):

@@ -136,7 +136,11 @@ class QualityFactsService:
         macro_task: asyncio.Task[MacroQualitySnapshot] | None,
     ) -> QualityAssetFacts:
         instrument = opportunity.instrument or instrument_data.instrument
-        if instrument is None or instrument.category == "INTERNATIONAL":
+        if (
+            instrument is None
+            or instrument.category == "INTERNATIONAL"
+            or instrument.instrument_type is InstrumentType.bdr
+        ):
             return await self._international_facts(asset, instrument_data, opportunity)
         metrics = opportunity.metrics
         snapshot = await self.fundamentals.snapshot(
@@ -191,9 +195,36 @@ class QualityFactsService:
         international equivalent, so those inputs stay absent and their weight
         is redistributed by the consumer.
         """
-        snapshot = await self.fundamentals.snapshot(asset.ticker)
+        instrument = opportunity.instrument or instrument_data.instrument
+        underlying_ticker = instrument.underlying_ticker if instrument else None
+        if instrument is not None and instrument.instrument_type is InstrumentType.bdr:
+            if not underlying_ticker:
+                return QualityAssetFacts(
+                    ticker=asset.ticker,
+                    kind=asset.kind,
+                    canonical_id=instrument.isin,
+                    unavailable_reason=(
+                        instrument.underlying_unavailable_reason
+                        or (
+                            "BDR underlying ticker is unresolved; international fundamentals "
+                            "were not queried"
+                        )
+                    ),
+                )
+            snapshot = await self.fundamentals.snapshot(
+                asset.ticker,
+                underlying_ticker=underlying_ticker,
+                underlying_name=instrument.underlying_name,
+                instrument=instrument,
+            )
+        else:
+            snapshot = await self.fundamentals.snapshot(asset.ticker)
         if snapshot.trailing_twelve_months is None:
-            return _international_stock_facts(asset, instrument_data)
+            return _international_stock_facts(
+                asset,
+                instrument_data,
+                snapshot.unavailable_reason,
+            )
         facts = _financial_facts(
             asset,
             snapshot,
@@ -387,14 +418,28 @@ def _financial_facts(
 def _international_stock_facts(
     request: QualityAssetRequest,
     data: InstrumentDataResponse,
+    unavailable_reason: str | None = None,
 ) -> QualityAssetFacts:
     fundamentals = data.fundamentals
+    if (
+        unavailable_reason
+        and data.instrument is not None
+        and data.instrument.instrument_type is InstrumentType.bdr
+    ):
+        return QualityAssetFacts(
+            ticker=request.ticker,
+            kind=request.kind,
+            canonical_id=data.instrument.isin,
+            unavailable_reason=unavailable_reason,
+        )
     if fundamentals is None:
         return QualityAssetFacts(
             ticker=request.ticker,
             kind=request.kind,
             canonical_id=data.instrument.isin if data.instrument else None,
-            unavailable_reason="No public international fundamentals were resolved",
+            unavailable_reason=(
+                unavailable_reason or "No public international fundamentals were resolved"
+            ),
         )
     reference = data.refreshed_at.date()
     facts = [

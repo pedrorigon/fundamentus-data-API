@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.opportunity_service = OpportunityService(asset_service, settings)
     instrument_data_service = InstrumentDataService(settings)
     app.state.instrument_data_service = instrument_data_service
+    # Bulk directory warming is deliberately detached from readiness. Search
+    # serves the current memory snapshot while SEC/brapi refresh in background.
+    app.state.instrument_directory_warm_task = asyncio.create_task(
+        instrument_data_service.warm_directory()
+    )
     app.state.fixed_income_valuation_service = FixedIncomeValuationService(settings, cache)
     app.state.historical_quote_service = HistoricalQuoteService(settings, cache)
     fundamentals_service = FundamentalsService(settings, cache)
@@ -52,6 +58,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await instrument_data_service.close()
         await client.shutdown()
         await cache.close()
 
