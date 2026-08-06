@@ -287,9 +287,31 @@ class InstrumentDataService:
         if sources:
             for item in sources:
                 self._remember(item)
+            self._link_underlying_names()
             self._directory_loaded = True
             self._directory_refreshed_at = asyncio.get_running_loop().time()
         self._directory_warnings = warnings
+
+    def _link_underlying_names(self) -> None:
+        """Give each depositary receipt the issuer name of its underlying.
+
+        The B3 list names a BDR after its own code, so nothing in that record
+        mentions the company and a search for "NVIDIA" could not reach NVDC34.
+        The underlying is indexed separately under the issuer's real name, so
+        borrowing it is enough — and only when the receipt has no name of its
+        own beyond the code.
+        """
+        names = {
+            _fold_search(item.ticker): item.name
+            for item in self._directory.values()
+            if item.name and _fold_search(item.name) != _fold_search(item.ticker)
+        }
+        for key, item in self._directory.items():
+            if item.underlying_name or not item.underlying_ticker:
+                continue
+            name = names.get(_fold_search(item.underlying_ticker))
+            if name:
+                self._directory[key] = item.model_copy(update={"underlying_name": name})
 
     def _remember(self, instrument: InstrumentMetadata) -> None:
         key = (_fold_search(instrument.ticker), _fold_search(instrument.exchange) or "")

@@ -413,3 +413,75 @@ def test_a_non_bdr_row_is_not_given_an_underlying() -> None:
     records = parse_brapi_directory([{"stock": "PETR4", "name": "Petrobras PN", "type": "stock"}])
 
     assert records[0].underlying_ticker is None
+
+
+@pytest.mark.asyncio
+async def test_searching_the_issuer_finds_its_bdr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A BDR named after its own code must still answer an issuer search."""
+    from app.services.market import InstrumentDataService
+
+    service = InstrumentDataService(Settings())
+
+    async def sec_directory() -> list[InstrumentMetadata]:
+        return [
+            InstrumentMetadata(
+                ticker="NVDA",
+                name="NVIDIA CORP",
+                instrument_type=InstrumentType.stock,
+                exchange="NASDAQ",
+                country="US",
+            )
+        ]
+
+    async def brapi_directory() -> list[InstrumentMetadata]:
+        return [
+            InstrumentMetadata(
+                ticker="NVDC34",
+                name="NVDC34",
+                instrument_type=InstrumentType.bdr,
+                exchange="B3",
+                country="BR",
+                underlying_ticker="NVDA",
+            )
+        ]
+
+    monkeypatch.setattr(service.sec, "ticker_directory", sec_directory, raising=False)
+    monkeypatch.setattr(service.brapi_directory, "directory", brapi_directory, raising=False)
+
+    await service.warm_directory(force=True)
+    response = await service.search("nvidia", limit=10)
+
+    assert {item.ticker for item in response.results} == {"NVDA", "NVDC34"}
+
+
+@pytest.mark.asyncio
+async def test_a_receipt_with_its_own_name_keeps_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.market import InstrumentDataService
+
+    service = InstrumentDataService(Settings())
+
+    async def sec_directory() -> list[InstrumentMetadata]:
+        return [
+            InstrumentMetadata(
+                ticker="NVDA", name="NVIDIA CORP", instrument_type=InstrumentType.stock
+            )
+        ]
+
+    async def brapi_directory() -> list[InstrumentMetadata]:
+        return [
+            InstrumentMetadata(
+                ticker="NVDC34",
+                name="NVDC34",
+                instrument_type=InstrumentType.bdr,
+                underlying_ticker="NVDA",
+                underlying_name="NVIDIA Corporation",
+            )
+        ]
+
+    monkeypatch.setattr(service.sec, "ticker_directory", sec_directory, raising=False)
+    monkeypatch.setattr(service.brapi_directory, "directory", brapi_directory, raising=False)
+
+    await service.warm_directory(force=True)
+    response = await service.search("NVDC34", limit=5)
+
+    assert response.results[0].underlying_name == "NVIDIA Corporation"
