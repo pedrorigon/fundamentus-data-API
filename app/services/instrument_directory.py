@@ -15,6 +15,7 @@ import httpx
 
 from app.config import Settings
 from app.models import InstrumentMetadata, InstrumentType
+from app.services.opportunity import resolve_bdr_underlying
 
 SOURCE_BRAPI_DIRECTORY = "brapi_directory_complementary"
 _TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,11}$")
@@ -76,12 +77,51 @@ class BrapiInstrumentDirectoryProvider:
         return records
 
 
+def _brapi_row_metadata(row: Any, ticker: str) -> InstrumentMetadata:
+    """Map one brapi directory row onto instrument metadata."""
+    raw_type = _text(row, "type", "assetType", "asset_type", "category")
+    name = _text(row, "name", "longName", "companyName", "company_name", "description")
+    instrument_type = _directory_instrument_type(raw_type, name, ticker)
+    exchange = _text(row, "exchange", "market", "exchangeName") or "B3"
+    country = _text(row, "country", "countryCode") or "BR"
+    isin = _text(row, "isin", "ISIN")
+    underlying_ticker = _text(
+        row,
+        "underlyingTicker",
+        "underlying_ticker",
+        "underlyingSymbol",
+        "referenceTicker",
+    )
+    if underlying_ticker is None and instrument_type is InstrumentType.bdr:
+        # The bulk index carries no underlying for depositary receipts, so a
+        # search for the issuer ("NVIDIA") could never reach its BDR. The curated
+        # map is exact and reviewed; an unlisted BDR stays unresolved rather than
+        # being guessed from its local code.
+        underlying_ticker = resolve_bdr_underlying(ticker)
+    return InstrumentMetadata(
+        ticker=ticker,
+        name=name,
+        instrument_type=instrument_type,
+        category=raw_type,
+        isin=isin,
+        identifiers={"isin": isin} if isin else {},
+        exchange=exchange.upper(),
+        country=country.upper(),
+        underlying_ticker=(underlying_ticker.upper() if underlying_ticker else None),
+        underlying_name=_text(row, "underlyingName", "underlying_name"),
+        underlying_exchange=(_text(row, "underlyingExchange", "underlying_exchange") or None),
+        underlying_country=(_text(row, "underlyingCountry", "underlying_country") or None),
+        underlying_source=SOURCE_BRAPI_DIRECTORY if underlying_ticker else None,
+        source=SOURCE_BRAPI_DIRECTORY,
+        confidence="medium",
+    )
+
+
 def parse_brapi_directory(payload: Any) -> list[InstrumentMetadata]:
     """Parse the several list shapes used by brapi's public API over time."""
-    rows = _rows(payload)
     result: list[InstrumentMetadata] = []
     seen: set[str] = set()
-    for row in rows:
+    for row in _rows(payload):
         ticker = _text(row, "stock", "ticker", "symbol", "code")
         if ticker is None:
             continue
@@ -89,42 +129,7 @@ def parse_brapi_directory(payload: Any) -> list[InstrumentMetadata]:
         if _TICKER_PATTERN.fullmatch(ticker) is None or ticker in seen:
             continue
         seen.add(ticker)
-        raw_type = _text(row, "type", "assetType", "asset_type", "category")
-        name = _text(row, "name", "longName", "companyName", "company_name", "description")
-        instrument_type = _directory_instrument_type(raw_type, name, ticker)
-        exchange = _text(row, "exchange", "market", "exchangeName") or "B3"
-        country = _text(row, "country", "countryCode") or "BR"
-        isin = _text(row, "isin", "ISIN")
-        underlying_ticker = _text(
-            row,
-            "underlyingTicker",
-            "underlying_ticker",
-            "underlyingSymbol",
-            "referenceTicker",
-        )
-        identifiers = {"isin": isin} if isin else {}
-        underlying_name = _text(row, "underlyingName", "underlying_name")
-        result.append(
-            InstrumentMetadata(
-                ticker=ticker,
-                name=name,
-                instrument_type=instrument_type,
-                category=raw_type,
-                isin=isin,
-                identifiers=identifiers,
-                exchange=exchange.upper(),
-                country=country.upper(),
-                underlying_ticker=(underlying_ticker.upper() if underlying_ticker else None),
-                underlying_name=underlying_name,
-                underlying_exchange=(
-                    _text(row, "underlyingExchange", "underlying_exchange") or None
-                ),
-                underlying_country=(_text(row, "underlyingCountry", "underlying_country") or None),
-                underlying_source=SOURCE_BRAPI_DIRECTORY if underlying_ticker else None,
-                source=SOURCE_BRAPI_DIRECTORY,
-                confidence="medium",
-            )
-        )
+        result.append(_brapi_row_metadata(row, ticker))
     return result
 
 

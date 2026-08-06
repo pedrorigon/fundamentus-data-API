@@ -375,3 +375,41 @@ async def test_directory_provider_fallback_and_sec_dict_shape() -> None:
 
     with pytest.raises(RuntimeError):
         await _invoke_directory(object(), "directory", "instruments")
+
+
+def test_bdr_row_without_underlying_uses_the_curated_map() -> None:
+    """Searching the issuer must reach its BDR, which the bulk index omits."""
+    records = parse_brapi_directory([{"stock": "NVDC34", "name": "NVIDIA CORP DRN", "type": "bdr"}])
+
+    assert len(records) == 1
+    assert records[0].underlying_ticker == "NVDA"
+    assert records[0].instrument_type is InstrumentType.bdr
+
+
+def test_a_provider_supplied_underlying_wins_over_the_curated_map() -> None:
+    records = parse_brapi_directory(
+        [
+            {
+                "stock": "NVDC34",
+                "name": "NVIDIA CORP DRN",
+                "type": "bdr",
+                "underlyingTicker": "NVDA.US",
+            }
+        ]
+    )
+
+    assert records[0].underlying_ticker == "NVDA.US"
+
+
+def test_an_unlisted_bdr_stays_unresolved_instead_of_being_guessed() -> None:
+    records = parse_brapi_directory(
+        [{"stock": "ZZZZ34", "name": "Unknown Corp DRN", "type": "bdr"}]
+    )
+
+    assert records[0].underlying_ticker is None
+
+
+def test_a_non_bdr_row_is_not_given_an_underlying() -> None:
+    records = parse_brapi_directory([{"stock": "PETR4", "name": "Petrobras PN", "type": "stock"}])
+
+    assert records[0].underlying_ticker is None
