@@ -15,6 +15,7 @@ from app.models.historical_quotes import (
     HistoricalQuoteResponse,
 )
 from app.scrapers.b3_historical_quotes import SOURCE_B3_COTAHIST, B3HistoricalQuoteProvider
+from app.services.singleflight import SingleFlight
 
 
 class HistoricalQuoteService:
@@ -27,6 +28,7 @@ class HistoricalQuoteService:
         self.settings = settings
         self.cache = cache
         self.provider = provider or B3HistoricalQuoteProvider(settings)
+        self.singleflight = SingleFlight()
 
     async def resolve(self, request: HistoricalQuoteRequest) -> HistoricalQuoteResponse:
         years = {target.year for target in request.dates}
@@ -67,7 +69,11 @@ class HistoricalQuoteService:
         if not missing:
             return result
         try:
-            loaded = await self.provider.prices(year, set(missing))
+            missing_set = set(missing)
+            loaded = await self.singleflight.run(
+                _load_key(year, missing_set),
+                lambda: self.provider.prices(year, missing_set),
+            )
         except (httpx.HTTPError, ValueError):
             loaded = {}
         for ticker in missing:
@@ -125,6 +131,10 @@ class HistoricalQuoteService:
 
 def _cache_key(year: int, ticker: str) -> str:
     return f"equity-history:b3-cotahist:{year}:{ticker}"
+
+
+def _load_key(year: int, tickers: set[str]) -> str:
+    return f"{year}:{','.join(sorted(tickers))}"
 
 
 def _cached_series(value: object) -> dict[date, Decimal]:

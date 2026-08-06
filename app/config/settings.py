@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     anbima_debenture_base_url: str = (
         "https://www.anbima.com.br/informacoes/merc-sec-debentures/arqs"
     )
+    # ANBIMA Data publishes the latest five business days of CRI/CRA
+    # indicative prices through this public page.  The page is intentionally
+    # kept separate from the authenticated ANBIMA Feed API.
+    anbima_credit_url: str = (
+        "https://www.anbima.com.br/pt_br/informar/precos-e-indices/precos/"
+        "taxas-de-cri-e-cra/taxas-de-cri-e-cra.htm"
+    )
     status_invest_base_url: str = "https://statusinvest.com.br"
     cvm_open_data_base_url: str = "https://dados.cvm.gov.br"
     bcb_sgs_base_url: str = "https://api.bcb.gov.br"

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from datetime import date, timedelta
 from decimal import Decimal
 from io import BytesIO
@@ -85,6 +86,28 @@ async def test_provider_downloads_public_annual_archive() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_provider_parses_annual_archive_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _archive(_record(date(2020, 5, 29), "AZUL4", price_cents=1234))
+    parse_threads: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    def parse(content: bytes, tickers: set[str]) -> dict[str, dict[date, Decimal]]:
+        parse_threads.append(threading.get_ident())
+        return parse_b3_historical_quotes(content, tickers)
+
+    monkeypatch.setattr("app.scrapers.b3_historical_quotes.parse_b3_historical_quotes", parse)
+    provider = B3HistoricalQuoteProvider(Settings(), httpx.MockTransport(handler))
+
+    await provider.prices(2020, {"AZUL4"})
+
+    assert parse_threads and parse_threads[0] != threading.get_ident()
+
+
 class _Provider:
     def __init__(self, data: dict[int, dict[str, dict[date, Decimal]]]) -> None:
         self.data = data
@@ -143,6 +166,27 @@ async def test_service_loads_missing_annual_archives_concurrently() -> None:
 
     assert provider.max_active == 2
     assert {year for year, _tickers in provider.calls} == {2019, 2020, 2021}
+
+
+@pytest.mark.asyncio
+async def test_service_coalesces_identical_concurrent_archive_loads() -> None:
+    class SlowProvider(_Provider):
+        async def prices(
+            self,
+            year: int,
+            tickers: set[str],
+        ) -> dict[str, dict[date, Decimal]]:
+            await asyncio.sleep(0.01)
+            return await super().prices(year, tickers)
+
+    provider = SlowProvider({2020: {"AZUL4": {date(2020, 5, 29): Decimal("12.34")}}})
+    service = HistoricalQuoteService(Settings(), _cache(), provider=provider)  # type: ignore[arg-type]
+    request = HistoricalQuoteRequest(tickers=["AZUL4"], dates=[date(2020, 5, 31)])
+
+    first, second = await asyncio.gather(service.resolve(request), service.resolve(request))
+
+    assert first == second
+    assert provider.calls == [(2019, {"AZUL4"}), (2020, {"AZUL4"})]
 
 
 def test_request_rejects_unsafe_ticker() -> None:

@@ -10,10 +10,12 @@ import httpx
 from app.config import Settings
 
 SOURCE_ANBIMA = "anbima"
-MISSING_VALUE = "--"
+UNAVAILABLE_VALUES = frozenset({"--", "n/d", "nd", "n/a", "na"})
 
 
 class AnbimaDebentureProvider:
+    identifier_scoped = False
+
     def __init__(
         self,
         settings: Settings,
@@ -36,6 +38,11 @@ class AnbimaDebentureProvider:
         response.raise_for_status()
         return parse_anbima_debenture_prices(response.content)
 
+    async def prices_for(self, reference: date, identifiers: set[str]) -> dict[str, Decimal]:
+        prices = await self.prices(reference)
+        wanted = {identifier.strip().upper() for identifier in identifiers}
+        return {identifier: price for identifier, price in prices.items() if identifier in wanted}
+
 
 def parse_anbima_debenture_prices(payload: bytes) -> dict[str, Decimal]:
     text = payload.decode("latin-1")
@@ -54,7 +61,7 @@ def parse_anbima_debenture_prices(payload: bytes) -> dict[str, Decimal]:
 
 def _decimal(value: str | None) -> Decimal | None:
     normalized = (value or "").strip()
-    if not normalized or normalized == MISSING_VALUE:
+    if not normalized or normalized.casefold() in UNAVAILABLE_VALUES:
         return None
     try:
         return Decimal(normalized.replace(".", "").replace(",", "."))

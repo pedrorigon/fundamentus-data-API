@@ -135,9 +135,17 @@ If `FUNDAMENTUS_API_CACHE_INVALIDATE_TOKEN` is set, callers must provide the tok
 # Fixed-income valuations
 
 `POST /v1/fixed-income/valuations/resolve` resolves public indicative unit prices for a
-bounded list of instrument identifiers and valuation dates. The service currently uses the
-official ANBIMA daily debenture publication, caches immutable historical files, and returns
-unavailable identifiers explicitly instead of inventing a price.
+bounded list of instrument identifiers and valuation dates. The service uses the following
+free sources, in order:
+
+- ANBIMA's official daily debenture publication;
+- the public ANBIMA Data CRI/CRA table (the last five business days);
+- B3's public BDI consolidated fixed-income trades (from the BDI history window).
+
+All observations are cached with their source and reference date. These feeds only provide a
+market PU when the instrument was priced or traded. They do not contain the contractual terms
+needed to accrue an untraded LCI, LCA, CDB or private note. Such instruments remain explicitly
+unavailable instead of receiving a synthetic price.
 
 ```json
 {
@@ -148,4 +156,6 @@ unavailable identifiers explicitly instead of inventing a price.
 
 The response preserves an empty list for instruments that no public source can value, allowing
 callers to retain the instrument and its transactions while calculating performance from the
-measurable part of a portfolio.
+measurable part of a portfolio. `unavailable_reasons` explains that a contractual accrual
+requires issuer, indexer/rate, acquisition and maturity terms; the service never substitutes a
+zero or an estimated price.

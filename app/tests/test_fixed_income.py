@@ -1,4 +1,5 @@
-from datetime import date
+import asyncio
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,9 +13,18 @@ from app.cache import CacheStore
 from app.config import Settings
 from app.main import create_app, lifespan
 from app.models import FixedIncomeValuationRequest
+from app.models.fixed_income import MAX_FIXED_INCOME_DATES
+from app.scrapers.anbima_credit import (
+    AnbimaCreditProvider,
+    parse_anbima_credit_prices,
+)
 from app.scrapers.anbima_fixed_income import (
     AnbimaDebentureProvider,
     parse_anbima_debenture_prices,
+)
+from app.scrapers.b3_fixed_income import (
+    B3FixedIncomeProvider,
+    parse_b3_reference_prices,
 )
 from app.services.fixed_income import FixedIncomeValuationService, _cached_prices
 
@@ -49,6 +59,195 @@ def test_parser_maps_positive_prices_and_ignores_invalid_rows() -> None:
 
     assert prices == {"AALM12": Decimal("1064.248862")}
     assert parse_anbima_debenture_prices(b"unexpected") == {}
+
+
+def test_parser_keeps_nd_rows_unavailable() -> None:
+    prices = parse_anbima_debenture_prices(
+        _payload(
+            _row("PEJA11", "N/D"),
+            _row("PEJA11", "--"),
+            _row("PEJA12", "1.000,00"),
+        )
+    )
+
+    assert prices == {"PEJA12": Decimal("1000")}
+
+
+def test_credit_parser_maps_reference_dates_and_ignores_unavailable_rows() -> None:
+    payload = """
+    <table class="custom-anbi-ui-table">
+      <thead><tr><th>Data de Referência</th><th>Código</th><th>PU</th></tr></thead>
+      <tbody>
+        <tr><td>31/07/2026</td><td>CRA019003V2</td><td>1.039,26916663</td></tr>
+        <tr><td>30/07/2026</td><td>CRI022001A1</td><td>--</td></tr>
+        <tr><td>31/07/2026</td><td>BAD1</td><td>invalid</td></tr>
+      </tbody>
+    </table>
+    """.encode()
+
+    assert parse_anbima_credit_prices(payload, date(2026, 7, 31)) == {
+        "CRA019003V2": Decimal("1039.26916663")
+    }
+    assert parse_anbima_credit_prices(payload, date(2026, 7, 30)) == {}
+
+
+@pytest.mark.asyncio
+async def test_credit_provider_caches_public_page_and_filters_identifiers() -> None:
+    calls = 0
+    payload = """
+    <table class="custom-anbi-ui-table">
+      <tr><th>Data de Referência</th><th>Código</th><th>PU</th></tr>
+      <tr><td>31/07/2026</td><td>CRA019003V2</td><td>1.000,50</td></tr>
+    </table>
+    """.encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.path.endswith("taxas-de-cri-e-cra.htm")
+        return httpx.Response(200, content=payload)
+
+    provider = AnbimaCreditProvider(Settings(), httpx.MockTransport(handler))
+    reference = date(2026, 7, 31)
+
+    assert await provider.prices_for(reference, {"cra019003v2", "MISSING1"}) == {
+        "CRA019003V2": Decimal("1000.50")
+    }
+    assert await provider.prices(reference) == {"CRA019003V2": Decimal("1000.50")}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_credit_provider_coalesces_concurrent_page_refreshes() -> None:
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"<html></html>")
+
+    provider = AnbimaCreditProvider(Settings(), httpx.MockTransport(handler))
+
+    await asyncio.gather(
+        provider.prices(date(2026, 7, 31)),
+        provider.prices(date(2026, 7, 30)),
+    )
+
+    assert calls == 1
+
+
+def test_b3_parser_prefers_reference_price_and_uses_safe_fallbacks() -> None:
+    payload = {
+        "table": {
+            "values": [
+                [
+                    None,
+                    None,
+                    "CRA019003V2",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "99",
+                    "100",
+                    "101",
+                    "102.5",
+                ],
+                [
+                    None,
+                    None,
+                    "CDB123",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "1.234,50",
+                    "0",
+                    "",
+                    None,
+                ],
+                [None, None, "BAD", None, None, None, None, None, None, "--", "", "", None],
+            ]
+        }
+    }
+
+    assert parse_b3_reference_prices(payload) == {
+        "CRA019003V2": Decimal("102.5"),
+        "CDB123": Decimal("1234.50"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_b3_provider_resolves_exact_identifier_and_caches_result() -> None:
+    calls = 0
+    reference = date(2026, 7, 31)
+    payload = {
+        "table": {
+            "values": [
+                [
+                    reference.isoformat(),
+                    reference.isoformat(),
+                    "CDB123",
+                    "CDB",
+                    None,
+                    None,
+                    reference.isoformat(),
+                    1,
+                    100,
+                    100,
+                    100,
+                    100,
+                    100,
+                ]
+            ]
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.params["filter"]
+        return httpx.Response(200, json=payload)
+
+    provider = B3FixedIncomeProvider(Settings(), httpx.MockTransport(handler))
+
+    assert await provider.prices_for(reference, {"CDB123", "MISSING1"}) == {
+        "CDB123": Decimal("100")
+    }
+    assert await provider.prices_for(reference, {"CDB123"}) == {"CDB123": Decimal("100")}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_service_marks_secondary_source_and_preserves_unavailable_ids() -> None:
+    class FallbackProvider:
+        source = "anbima_cri_cra"
+
+        async def prices_for(self, _reference: date, identifiers: set[str]) -> dict[str, Decimal]:
+            return {"CRA019003V2": Decimal("1000.50")} if "CRA019003V2" in identifiers else {}
+
+    service = FixedIncomeValuationService(
+        Settings(),
+        _cache(),
+        provider=_Provider({}),  # type: ignore[arg-type]
+        fallback_providers=(FallbackProvider(),),
+    )
+    result = await service.resolve(
+        FixedIncomeValuationRequest(
+            identifiers=["CRA019003V2", "LCI-MISSING"],
+            dates=[date(2026, 7, 31)],
+        )
+    )
+
+    valuation = result.valuations["CRA019003V2"][0]
+    assert valuation.source == "anbima_cri_cra"
+    assert valuation.unit_price == Decimal("1000.50")
+    assert result.unavailable == ["LCI-MISSING"]
 
 
 @pytest.mark.asyncio
@@ -133,17 +332,114 @@ async def test_service_returns_unavailable_when_source_fails() -> None:
     assert result.valuations == {"CDB925623O7": []}
 
 
+@pytest.mark.asyncio
+async def test_service_preserves_sparse_identifier_gaps() -> None:
+    friday = date(2026, 7, 17)
+    saturday = date(2026, 7, 18)
+    provider = _Provider(
+        {
+            friday: {"PEJA11": Decimal("100")},
+            saturday: {"OTHER1": Decimal("200")},
+        }
+    )
+    service = FixedIncomeValuationService(
+        Settings(),
+        _cache(),
+        provider=provider,  # type: ignore[arg-type]
+    )
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["PEJA11"], dates=[friday, saturday])
+    )
+
+    assert [item.requested_date for item in result.valuations["PEJA11"]] == [friday]
+    assert result.unavailable == []
+
+
+@pytest.mark.asyncio
+async def test_service_bounds_date_concurrency_and_reuses_full_source_cache() -> None:
+    class FullSourceProvider:
+        identifier_scoped = False
+
+        def __init__(self) -> None:
+            self.calls: list[date] = []
+            self.active = 0
+            self.max_active = 0
+
+        async def prices(self, reference: date) -> dict[str, Decimal]:
+            self.calls.append(reference)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return {"AAA1": Decimal("100"), "BBB1": Decimal("200")}
+
+    provider = FullSourceProvider()
+    service = FixedIncomeValuationService(
+        Settings(upstream_concurrency=2),
+        _cache(),
+        provider=provider,  # type: ignore[arg-type]
+    )
+    dates = [date(2026, 7, day) for day in range(14, 18)]
+
+    first = await service.resolve(FixedIncomeValuationRequest(identifiers=["AAA1"], dates=dates))
+    second = await service.resolve(FixedIncomeValuationRequest(identifiers=["BBB1"], dates=dates))
+
+    assert provider.max_active == 2
+    assert provider.calls == dates
+    assert len(first.valuations["AAA1"]) == len(dates)
+    assert len(second.valuations["BBB1"]) == len(dates)
+
+
+@pytest.mark.asyncio
+async def test_service_coalesces_identical_scoped_price_loads() -> None:
+    class ScopedProvider:
+        identifier_scoped = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def prices_for(
+            self,
+            _reference: date,
+            identifiers: set[str],
+        ) -> dict[str, Decimal]:
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            return {identifier: Decimal("100") for identifier in identifiers}
+
+    provider = ScopedProvider()
+    service = FixedIncomeValuationService(
+        Settings(),
+        _cache(),
+        provider=provider,  # type: ignore[arg-type]
+    )
+    request = FixedIncomeValuationRequest(identifiers=["AAA1"], dates=[date(2026, 7, 17)])
+
+    first, second = await asyncio.gather(service.resolve(request), service.resolve(request))
+
+    assert first == second
+    assert provider.calls == 1
+
+
 def test_request_rejects_unsafe_identifiers() -> None:
     with pytest.raises(ValidationError):
         FixedIncomeValuationRequest(
             identifiers=["../../secret"],
             dates=[date(2026, 7, 17)],
         )
+    dates = [date(2020, 1, 1)] * MAX_FIXED_INCOME_DATES
+    assert len(FixedIncomeValuationRequest(identifiers=["AAA1"], dates=dates).dates) == 1
+    with pytest.raises(ValidationError):
+        FixedIncomeValuationRequest(
+            identifiers=["AAA1"],
+            dates=[date(2020, 1, 1) + timedelta(days=index) for index in range(501)],
+        )
 
 
 def test_cached_prices_rejects_unexpected_payloads() -> None:
     assert _cached_prices([]) == {}
-    assert _cached_prices({"AALM12": None, 1: "2", "OK": 3}) == {"OK": Decimal("3")}
+    assert _cached_prices({"AALM12": None, 1: "2", "BAD": "N/D", "OK": 3}) == {"OK": Decimal("3")}
 
 
 @pytest.mark.asyncio
@@ -175,6 +471,7 @@ async def test_fixed_income_endpoint_returns_resolved_values() -> None:
         "source": "anbima",
         "method": "indicative",
     }
+    assert response.json()["unavailable_reasons"] == {}
 
 
 def test_fixed_income_dependency_reads_application_state() -> None:
