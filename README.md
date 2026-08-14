@@ -9,7 +9,7 @@ Local HTTP API for Fundamentus asset details and dividend events. It uses direct
 
 The service is designed for local consumption by portfolio tools, data pipelines and research scripts. It binds to `127.0.0.1` by default and does not use Selenium, Playwright or a headless browser.
 
-API version is resolved from package metadata at runtime. Release artifacts use the pushed Git tag as the build version.
+API version is resolved from package metadata at runtime. Release artifacts use the immutable Git tag created from the merged release pull request as the build version.
 
 ## What It Does
 
@@ -268,7 +268,7 @@ Releases follow semantic versioning:
 
 Release notes live in [CHANGELOG.md](CHANGELOG.md). The release process is documented in [RELEASING.md](RELEASING.md).
 
-Pushing a tag such as `vMAJOR.MINOR.PATCH` runs the release pipeline, injects that tag version into the build, creates a GitHub Release from the matching changelog section and uploads build artifacts.
+Running the `Release PR` workflow for `MAJOR.MINOR.PATCH` prepares the changelog and package version in a pull request. Merging that trusted pull request creates an immutable tag, builds the artifacts and publishes the matching GitHub Release.
 
 ## Documentation
 

@@ -14,12 +14,19 @@ permissions:
 
 jobs:
   release:
-    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/'))
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'github-actions[bot]' &&
+      github.event.pull_request.user.type == 'Bot' &&
+      startsWith(github.event.pull_request.head.ref, 'release/v'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.merge_commit_sha || 'main' }}
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -35,16 +42,11 @@ jobs:
           else
             VERSION="${HEAD_REF#release/v}"
           fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version must use MAJOR.MINOR.PATCH format." >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Move release tag to merged commit
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -fa "v$VERSION" -m "v$VERSION"
-          git push -f origin "refs/tags/v$VERSION"
 
       - name: Inject release version
         env:
@@ -81,6 +83,24 @@ jobs:
         run: |
           cd dist
           sha256sum * > SHA256SUMS
+
+      - name: Create immutable release tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            TAG_COMMIT="$(git rev-list -n 1 "v$VERSION")"
+            if [ "$TAG_COMMIT" != "$(git rev-parse HEAD)" ]; then
+              echo "Tag v$VERSION already points to a different commit." >&2
+              exit 1
+            fi
+            echo "Tag v$VERSION already points to this release commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin "refs/tags/v$VERSION"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

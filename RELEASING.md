@@ -2,7 +2,7 @@
 
 This project uses semantic versioning. Tags use the `vMAJOR.MINOR.PATCH` format.
 
-Releases are gated behind a pull request: pushing a tag opens a release PR with the changelog update, and merging that PR publishes the GitHub Release.
+Releases are gated behind a pull request: an authorized `Release PR` workflow run prepares the changelog and version update, and merging its pull request publishes the GitHub Release.
 
 ## Version Policy
 
@@ -20,14 +20,13 @@ Changelog quality therefore depends on commit message quality: write conventiona
 
 ## Version Locations
 
-The release workflow injects the pushed tag version into `pyproject.toml` before building artifacts. Runtime version is resolved from installed package metadata, with `FUNDAMENTUS_API_VERSION` available as an explicit environment override.
+The release preparation workflow updates `pyproject.toml` in the release pull request. Runtime version is resolved from installed package metadata, with `FUNDAMENTUS_API_VERSION` available as an explicit environment override.
 
 `app/main.py` and `/health` both expose the runtime version from `app.__version__`.
 
 ## Release Checklist
 
-1. Optional: update the local development version in `pyproject.toml` when you want local package metadata to show the new version before tagging. This is not required for release artifacts.
-2. Run the full validation suite:
+1. Run the full validation suite:
 
 ```bash
 uv run ruff format --check .
@@ -36,35 +35,30 @@ uv run mypy app
 uv run pytest
 ```
 
-3. Optional: build the Python distribution and Docker image locally:
+2. Optional: build the Python distribution and Docker image locally:
 
 ```bash
 uv build
 docker build -t fundamentus-data-api .
 ```
 
-4. Create and push the signed or annotated tag:
+3. Run the `Release PR` workflow from GitHub Actions with version `X.Y.Z`.
+4. Review the generated `release/vX.Y.Z` pull request. It contains the package version, generated `CHANGELOG.md` section and a release notes preview. CI does not run automatically on this bot-created PR (GitHub token limitation); the publish workflow re-validates everything before releasing.
+5. Approve and merge the PR. The `Release` workflow then creates immutable tag `vX.Y.Z` on the merge commit, builds the artifacts and publishes the GitHub Release.
 
-```bash
-git tag -a vX.Y.Z -m "vX.Y.Z"
-git push origin main --tags
-```
-
-5. Review the release PR opened by the `Release PR` workflow. It contains the generated `CHANGELOG.md` section and a release notes preview. CI does not run automatically on this bot-created PR (GitHub token limitation); the publish workflow re-validates everything before releasing.
-6. Approve and merge the PR. The `Release` workflow then moves the tag to the merge commit, builds the artifacts and publishes the GitHub Release.
-
-If a release PR is closed without merging, delete the tag to abort the release. The `Release` workflow can also be run manually (`workflow_dispatch`) with a version number to publish from the current `main` head.
+Closing a release PR without merging aborts the release without creating a tag. The `Release` workflow can also be run manually (`workflow_dispatch`) with a version number to publish from the current `main` head.
 
 ## Release Pipeline
 
-`release-pr.yml` (on tag push):
+`release-pr.yml` (on an authorized manual run):
 
 - Runs formatting, linting, type checking and tests.
-- Regenerates `CHANGELOG.md` with git-cliff and opens a `release/vX.Y.Z` pull request against `main`.
+- Updates `pyproject.toml`, regenerates `CHANGELOG.md` with git-cliff and opens a `release/vX.Y.Z` pull request against `main`.
 
 `release.yml` (on release PR merge):
 
-- Moves the tag to the merge commit.
+- Verifies that the merged pull request was opened by the trusted workflow in this repository.
+- Creates a new immutable tag on the merge commit and refuses to overwrite an existing tag.
 - Injects the tag version into `pyproject.toml` for the release build.
 - Re-runs the full validation suite.
 - Generates the release notes from the commit history with git-cliff.
