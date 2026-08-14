@@ -35,6 +35,7 @@ from app.scrapers.international_statements import (
 from app.scrapers.sec_companyfacts import SecCompanyFactsProvider
 from app.services.company_matching import CompanyMatch, match_company
 from app.services.fundamentals_math import build_period, ratio, trailing_twelve_months
+from app.services.singleflight import SingleFlight
 
 SOURCE_CVM = "cvm"
 STATUS_VALID = "valid"
@@ -68,6 +69,7 @@ class FundamentalsService:
             tuple[StatementKind, int],
             dict[str, list[StatementPeriod]] | None,
         ] = {}
+        self._archive_flights = SingleFlight()
 
     async def snapshot(
         self,
@@ -319,6 +321,14 @@ class FundamentalsService:
         return archives
 
     async def _archive(
+        self, kind: StatementKind, year: int
+    ) -> dict[str, list[StatementPeriod]] | None:
+        return await self._archive_flights.run(
+            f"{kind.value}:{year}",
+            lambda: self._load_archive(kind, year),
+        )
+
+    async def _load_archive(
         self, kind: StatementKind, year: int
     ) -> dict[str, list[StatementPeriod]] | None:
         archive_key = (kind, year)

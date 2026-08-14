@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -262,6 +263,28 @@ async def test_second_call_is_served_from_cache(tmp_path: Path) -> None:
 
     assert len(provider.statement_calls) == calls_after_first
     assert snapshot.cnpj == CNPJ
+
+
+async def test_concurrent_requests_share_each_archive_download(tmp_path: Path) -> None:
+    class SlowProvider(StubProvider):
+        async def statements(
+            self,
+            kind: StatementKind,
+            year: int,
+            cnpjs: set[str] | None = None,
+        ) -> StatementArchive | None:
+            await asyncio.sleep(0)
+            return await super().statements(kind, year, cnpjs)
+
+    provider = SlowProvider({("dfp", 2024): archive(2024, [period(date(2024, 12, 31))])})
+    service = await build(tmp_path, provider)
+
+    results = await asyncio.gather(
+        *(service._archive(StatementKind.ANNUAL, 2024) for _ in range(20))
+    )
+
+    assert all(result == results[0] for result in results)
+    assert provider.statement_calls == [("dfp", 2024)]
 
 
 async def test_registry_is_fetched_once_across_calls(tmp_path: Path) -> None:
