@@ -35,6 +35,7 @@ from app.scrapers.cvm_fund_reports import (
     FundReportSeries as CvmReportSeries,
 )
 from app.services.assets import AssetService
+from app.services.bounded_cache import BoundedTTLCache
 from app.services.market_routing import should_query_b3
 
 SOURCE_FUNDAMENTUS = "fundamentus"
@@ -100,18 +101,21 @@ class B3InstrumentProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._cache: dict[str, tuple[float, InstrumentMetadata | None]] = {}
+        self._cache: BoundedTTLCache[str, InstrumentMetadata | None] = BoundedTTLCache(
+            settings.ticker_cache_max_entries
+        )
 
     async def get(self, ticker: str) -> InstrumentMetadata | None:
         normalized = _normalized_ticker(ticker)
-        cached = self._cache.get(normalized)
-        if cached and cached[0] > monotonic():
-            return cached[1]
+        found, cached = self._cache.get(normalized, monotonic())
+        if found:
+            return cached
         if not should_query_b3(normalized):
             # A foreign symbol can never appear in B3's bulletin, and the
             # session walk below would spend seven sequential requests proving
             # it. Cache the negative answer and route elsewhere.
-            self._cache[normalized] = (
+            self._cache.set(
+                normalized,
                 monotonic() + self.settings.opportunity_cache_ttl_seconds,
                 None,
             )
@@ -138,12 +142,14 @@ class B3InstrumentProvider:
                     continue
                 result = _instrument_from_b3(payload, normalized)
                 if result is not None:
-                    self._cache[normalized] = (
+                    self._cache.set(
+                        normalized,
                         monotonic() + self.settings.opportunity_cache_ttl_seconds,
                         result,
                     )
                     return result
-        self._cache[normalized] = (
+        self._cache.set(
+            normalized,
             monotonic() + self.settings.opportunity_cache_ttl_seconds,
             None,
         )
@@ -158,10 +164,9 @@ class StatusInvestProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._cache: dict[
-            tuple[str, InstrumentType | None],
-            tuple[float, StatusInvestProfile],
-        ] = {}
+        self._cache: BoundedTTLCache[tuple[str, InstrumentType | None], StatusInvestProfile] = (
+            BoundedTTLCache(settings.ticker_cache_max_entries)
+        )
 
     async def get(
         self,
@@ -177,9 +182,9 @@ class StatusInvestProvider:
     ) -> StatusInvestProfile:
         normalized = _normalized_ticker(ticker).lower()
         cache_key = (normalized, instrument_type)
-        cached = self._cache.get(cache_key)
-        if cached and cached[0] > monotonic():
-            return cached[1]
+        found, cached = self._cache.get(cache_key, monotonic())
+        if found and cached is not None:
+            return cached
         paths = _status_paths(instrument_type)
         async with httpx.AsyncClient(
             base_url=self.settings.status_invest_base_url,
@@ -203,12 +208,14 @@ class StatusInvestProvider:
                     continue
                 profile = parse_status_invest_profile(response.text)
                 if profile.values or profile.cnpj or profile.distributions:
-                    self._cache[cache_key] = (
+                    self._cache.set(
+                        cache_key,
                         monotonic() + self.settings.opportunity_cache_ttl_seconds,
                         profile,
                     )
                     return profile
-        self._cache[cache_key] = (
+        self._cache.set(
+            cache_key,
             monotonic() + self.settings.opportunity_cache_ttl_seconds,
             StatusInvestProfile(values={}),
         )

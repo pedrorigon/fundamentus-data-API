@@ -23,6 +23,7 @@ from app.models import (
     MarketQuote,
 )
 from app.scrapers.sec_companyfacts import SEC_TICKER_DIRECTORY, SecCompanyFactsProvider
+from app.services.bounded_cache import BoundedMap, BoundedTTLCache
 from app.services.instrument_directory import (
     SOURCE_BRAPI_DIRECTORY,
     BrapiInstrumentDirectoryProvider,
@@ -176,10 +177,12 @@ class InstrumentDataService:
             or directory_provider
             or BrapiInstrumentDirectoryProvider(settings, transport)
         )
-        self._cache: dict[
-            tuple[str, InstrumentType | None], tuple[datetime, InstrumentDataResponse]
-        ] = {}
-        self._directory: dict[tuple[str, str], InstrumentMetadata] = {}
+        self._cache: BoundedTTLCache[tuple[str, InstrumentType | None], InstrumentDataResponse] = (
+            BoundedTTLCache(settings.ticker_cache_max_entries)
+        )
+        self._directory: BoundedMap[tuple[str, str], InstrumentMetadata] = BoundedMap(
+            settings.instrument_directory_max_entries
+        )
         self._directory_lock = asyncio.Lock()
         self._directory_task: asyncio.Task[None] | None = None
         self._directory_refreshed_at = 0.0
@@ -228,11 +231,16 @@ class InstrumentDataService:
         normalized = _normalized_instrument_ticker(ticker)
         cache_key = (normalized, instrument_type)
         now = datetime.now(UTC)
-        cached = self._cached(cache_key, now)
+        monotonic_now = asyncio.get_running_loop().time()
+        cached = self._cached(cache_key, monotonic_now)
         if cached is not None:
             return cached
         result = await self._load(normalized, instrument_type, now)
-        self._cache[cache_key] = (now, result)
+        self._cache.set(
+            cache_key,
+            monotonic_now + self.settings.instrument_data_ttl_seconds,
+            result,
+        )
         if result.instrument is not None:
             self._remember(result.instrument)
         return result
@@ -311,12 +319,12 @@ class InstrumentDataService:
                 continue
             name = names.get(_fold_search(item.underlying_ticker))
             if name:
-                self._directory[key] = item.model_copy(update={"underlying_name": name})
+                self._directory.set(key, item.model_copy(update={"underlying_name": name}))
 
     def _remember(self, instrument: InstrumentMetadata) -> None:
         key = (_fold_search(instrument.ticker), _fold_search(instrument.exchange) or "")
         existing = self._directory.get(key)
-        self._directory[key] = _merge_instruments(existing, instrument)
+        self._directory.set(key, _merge_instruments(existing, instrument))
 
     def _directory_message(self, has_matches: bool) -> str:
         if self._directory_warnings:
@@ -339,12 +347,10 @@ class InstrumentDataService:
     def _cached(
         self,
         cache_key: tuple[str, InstrumentType | None],
-        now: datetime,
+        now: float,
     ) -> InstrumentDataResponse | None:
-        cached = self._cache.get(cache_key)
-        if cached and (now - cached[0]).total_seconds() < self.settings.instrument_data_ttl_seconds:
-            return cached[1]
-        return None
+        found, cached = self._cache.get(cache_key, now)
+        return cached if found else None
 
     async def _load(
         self,

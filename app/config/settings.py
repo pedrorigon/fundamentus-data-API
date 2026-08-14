@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     brapi_instrument_directory_path: str = "/api/quote/list"
     instrument_directory_ttl_seconds: int = 86400
     instrument_directory_max_rows: int = 1000
+    instrument_directory_max_entries: int = 20000
     alpha_vantage_base_url: str = "https://www.alphavantage.co"
     alpha_vantage_api_key: SecretStr | None = None
     # SEC EDGAR CompanyFacts is public and does not require an API key. SEC
@@ -86,6 +87,7 @@ class Settings(BaseSettings):
     cache_headers_max_age_seconds: int = 60
     opportunity_cache_ttl_seconds: int = 900
     instrument_data_ttl_seconds: int = 86400
+    ticker_cache_max_entries: int = 1024
     fixed_income_current_ttl_seconds: int = 3600
     fixed_income_history_ttl_seconds: int = 2592000
     equity_history_ttl_seconds: int = 315360000

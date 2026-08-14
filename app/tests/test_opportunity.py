@@ -426,3 +426,23 @@ async def test_external_opportunity_providers_cache_successful_responses() -> No
 
     assert first == second == {"current_price": Decimal("10.00")}
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_status_invest_cache_bounds_attacker_selected_tickers() -> None:
+    provider = StatusInvestProvider(
+        Settings(ticker_cache_max_entries=1),
+        httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                text=(
+                    '<div title="Valor atual do ativo"><strong class="value">10,00</strong></div>'
+                ),
+            )
+        ),
+    )
+
+    await provider.get("TEST3", InstrumentType.stock)
+    await provider.get("NEXT3", InstrumentType.stock)
+
+    assert len(provider._cache) == 1

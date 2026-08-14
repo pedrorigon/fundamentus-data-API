@@ -84,3 +84,19 @@ async def test_the_foreign_negative_answer_is_cached() -> None:
     assert await provider.get("NVDA") is None
     assert await provider.get("NVDA") is None
     assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_the_ticker_cache_evicts_the_least_recently_used_answer() -> None:
+    provider = B3InstrumentProvider(
+        Settings(ticker_cache_max_entries=2),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+    )
+
+    await provider.get("NVDA")
+    await provider.get("AAPL")
+    await provider.get("NVDA")
+    await provider.get("MSFT")
+
+    assert len(provider._cache) == 2
+    assert provider._cache.get("AAPL", 0.0) == (False, None)

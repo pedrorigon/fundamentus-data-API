@@ -261,6 +261,24 @@ async def test_instrument_data_service_uses_brapi_for_b3_and_caches_result() -> 
 
 
 @pytest.mark.asyncio
+async def test_instrument_data_service_bounds_ticker_and_observed_directory_caches() -> None:
+    service = InstrumentDataService(
+        Settings(ticker_cache_max_entries=1, instrument_directory_max_entries=1),
+        b3=_B3(None),  # type: ignore[arg-type]
+        brapi=_Brapi(),  # type: ignore[arg-type]
+        alpha=_Alpha(),  # type: ignore[arg-type]
+    )
+
+    await service.get("AAPL")
+    await service.get("MSFT")
+
+    assert len(service._cache) == 1
+    assert len(service._directory) == 1
+    assert (await service.search("AAPL")).results == []
+    assert (await service.search("MSFT")).results[0].ticker == "MSFT"
+
+
+@pytest.mark.asyncio
 async def test_instrument_data_service_builds_international_instrument() -> None:
     alpha = _Alpha()
     service = InstrumentDataService(
