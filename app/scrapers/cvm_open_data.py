@@ -12,6 +12,7 @@ from enum import StrEnum
 import httpx
 
 from app.config import Settings
+from app.core.archive_safety import ArchiveSafetyError, read_bounded_body
 from app.parsers.cvm_statements import (
     CompanyRegistration,
     ShareCapital,
@@ -80,10 +81,12 @@ class CvmOpenDataProvider:
                 follow_redirects=True,
                 headers={"User-Agent": self.settings.user_agent},
             ) as client:
-                response = await client.get(path)
-                if response.status_code == 404:
-                    return None
-                response.raise_for_status()
-                return response.content
-        except httpx.HTTPError:
+                async with client.stream("GET", path) as response:
+                    if response.status_code == 404:
+                        return None
+                    response.raise_for_status()
+                    return await read_bounded_body(
+                        response, self.settings.archive_download_max_bytes
+                    )
+        except (ArchiveSafetyError, httpx.HTTPError):
             return None

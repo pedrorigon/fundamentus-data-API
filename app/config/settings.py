@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     # CVM archives are tens of megabytes, so they need a longer budget than
     # the HTML scrapers.
     cvm_request_timeout_seconds: float = 120.0
+    archive_download_max_bytes: int = 268435456
     max_connections: int = 8
     max_keepalive_connections: int = 4
     upstream_concurrency: int = 4

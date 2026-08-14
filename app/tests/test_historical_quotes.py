@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from app.api.dependencies import get_historical_quote_service
 from app.cache import CacheStore
 from app.config import Settings
+from app.core import archive_safety
 from app.main import create_app, lifespan
 from app.models.historical_quotes import (
     MAX_HISTORICAL_QUOTE_DATES,
@@ -84,6 +85,24 @@ async def test_provider_downloads_public_annual_archive() -> None:
     assert await provider.prices(2020, {"AZUL4"}) == {
         "AZUL4": {date(2020, 5, 29): Decimal("12.34")}
     }
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_an_archive_over_the_download_budget() -> None:
+    provider = B3HistoricalQuoteProvider(
+        Settings(archive_download_max_bytes=1),
+        httpx.MockTransport(lambda _request: httpx.Response(200, content=b"large")),
+    )
+
+    assert await provider.prices(2020, {"AZUL4"}) == {}
+
+
+def test_parser_rejects_an_archive_over_the_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(archive_safety, "MAX_ARCHIVE_MEMBER_BYTES", 1)
+
+    assert parse_b3_historical_quotes(_archive("large"), {"AZUL4"}) == {}
 
 
 @pytest.mark.asyncio

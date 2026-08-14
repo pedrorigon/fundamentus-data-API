@@ -12,8 +12,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from io import BytesIO, TextIOWrapper
+from io import TextIOWrapper
 from zipfile import BadZipFile, ZipFile
+
+from app.core.archive_safety import ArchiveSafetyError, open_validated_zip
 
 SOURCE_CVM = "cvm"
 
@@ -142,10 +144,10 @@ def parse_statement_archive(
     """
     wanted = _normalized_cnpjs(cnpjs)
     try:
-        with ZipFile(BytesIO(payload)) as archive:
+        with open_validated_zip(payload) as archive:
             names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
             periods = _collect_periods(archive, names, wanted)
-    except (BadZipFile, OSError, UnicodeError):
+    except (ArchiveSafetyError, BadZipFile, OSError, UnicodeError):
         return {}
     return _select_periods(periods, prefer_consolidated=prefer_consolidated)
 
@@ -157,7 +159,7 @@ def parse_share_capital(
     wanted = _normalized_cnpjs(cnpjs)
     results: dict[str, ShareCapital] = {}
     try:
-        with ZipFile(BytesIO(payload)) as archive:
+        with open_validated_zip(payload) as archive:
             names = [
                 name
                 for name in archive.namelist()
@@ -166,7 +168,7 @@ def parse_share_capital(
             for name in names:
                 for row in _iter_rows(archive, name):
                     _add_share_capital(results, row, wanted)
-    except (BadZipFile, OSError, UnicodeError):
+    except (ArchiveSafetyError, BadZipFile, OSError, UnicodeError):
         return {}
     return results
 

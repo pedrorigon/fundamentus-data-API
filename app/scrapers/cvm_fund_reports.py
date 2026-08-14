@@ -5,6 +5,7 @@ import csv
 import io
 import unicodedata
 import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -13,6 +14,11 @@ from difflib import SequenceMatcher
 import httpx
 
 from app.config import Settings
+from app.core.archive_safety import (
+    ArchiveSafetyError,
+    open_validated_zip,
+    read_bounded_body,
+)
 from app.models import InstrumentMetadata, InstrumentType
 
 SOURCE_CVM = "cvm"
@@ -164,12 +170,16 @@ class CvmFundReportProvider:
                 follow_redirects=True,
                 headers={"User-Agent": self.settings.user_agent},
             ) as client:
-                response = await client.get(path)
-                if response.status_code == 404:
-                    return None
-                response.raise_for_status()
-                return response.content
-        except httpx.HTTPError:
+                async with client.stream("GET", path) as response:
+                    if response.status_code == 404:
+                        return None
+                    response.raise_for_status()
+                    payload = await read_bounded_body(
+                        response, self.settings.archive_download_max_bytes
+                    )
+                    with open_validated_zip(payload):
+                        return payload
+        except (ArchiveSafetyError, httpx.HTTPError, zipfile.BadZipFile):
             return None
 
 
@@ -177,15 +187,14 @@ def parse_fii_reports(
     payload: bytes,
     instrument: InstrumentMetadata,
 ) -> FundReportSeries:
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+    with open_validated_zip(payload) as archive:
         general_name = _member(archive, "geral")
         complement_name = _member(archive, "complemento")
         if general_name is None or complement_name is None:
             return FundReportSeries()
         asset_name = _member(archive, "ativo_passivo")
-        general_rows = list(_rows(archive.read(general_name)))
         matches = []
-        for row in general_rows:
+        for row in _rows(archive, general_name):
             isin = _text(row.get("Codigo_ISIN"))
             if not _same_isin(isin, instrument.isin):
                 continue
@@ -198,14 +207,14 @@ def parse_fii_reports(
             return FundReportSeries()
         metadata = {
             _row_date_key(row): row
-            for row in general_rows
+            for row in _rows(archive, general_name)
             if _digits(row.get("CNPJ_Fundo_Classe") or row.get("CNPJ_Fundo")) == cnpj
             and _row_date_key(row) is not None
         }
         assets = (
             {
                 _row_date_key(row): row
-                for row in _rows(archive.read(asset_name))
+                for row in _rows(archive, asset_name)
                 if _digits(row.get("CNPJ_Fundo_Classe") or row.get("CNPJ_Fundo")) == cnpj
                 and _row_date_key(row) is not None
             }
@@ -214,7 +223,7 @@ def parse_fii_reports(
         )
         reports = [
             point
-            for row in _rows(archive.read(complement_name))
+            for row in _rows(archive, complement_name)
             if _digits(row.get("CNPJ_Fundo_Classe") or row.get("CNPJ_Fundo")) == cnpj
             and (
                 point := _monthly_report(
@@ -233,12 +242,12 @@ def parse_fiagro_reports(
     payload: bytes,
     instrument: InstrumentMetadata,
 ) -> FundReportSeries:
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+    with open_validated_zip(payload) as archive:
         member = _member(archive, "inf_mensal_fiagro_", exclude="subclasse")
         if member is None:
             return FundReportSeries()
         matches: list[tuple[Decimal, str, FundReportPoint]] = []
-        for row in _rows(archive.read(member)):
+        for row in _rows(archive, member):
             if not _same_isin(_text(row.get("Codigo_ISIN")), instrument.isin):
                 continue
             cnpj = _digits(row.get("CNPJ_Classe"))
@@ -259,12 +268,12 @@ def parse_fiagro_reports(
 
 
 def parse_daily_fund_reports(payload: bytes, cnpj: str) -> tuple[FundReportPoint, ...]:
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+    with open_validated_zip(payload) as archive:
         member = _member(archive, "inf_diario_fi_")
         if member is None:
             return ()
         points = []
-        for row in _rows(archive.read(member)):
+        for row in _rows(archive, member):
             if _digits(row.get("CNPJ_FUNDO_CLASSE")) != cnpj:
                 continue
             as_of = _date(row.get("DT_COMPTC"))
@@ -404,9 +413,10 @@ def _first_or_sum(
     return total if total is not None else _sum_fields(row, component_fields)
 
 
-def _rows(payload: bytes) -> csv.DictReader[str]:
-    text = payload.decode("latin-1")
-    return csv.DictReader(io.StringIO(text), delimiter=";")
+def _rows(archive: zipfile.ZipFile, member: str) -> Iterator[dict[str, str]]:
+    with archive.open(member) as raw:
+        with io.TextIOWrapper(raw, encoding="latin-1", newline="") as text:
+            yield from csv.DictReader(text, delimiter=";")
 
 
 def _member(

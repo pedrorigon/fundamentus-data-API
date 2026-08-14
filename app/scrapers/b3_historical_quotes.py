@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from io import BytesIO, TextIOWrapper
-from zipfile import BadZipFile, ZipFile
+from io import TextIOWrapper
+from zipfile import BadZipFile
 
 import httpx
 
 from app.config import Settings
+from app.core.archive_safety import (
+    ArchiveSafetyError,
+    open_validated_zip,
+    read_bounded_body,
+)
 
 SOURCE_B3_COTAHIST = "b3_cotahist"
 _RECORD_TYPE = "01"
@@ -37,11 +42,17 @@ class B3HistoricalQuoteProvider:
             transport=self.transport,
             headers={"User-Agent": self.settings.user_agent},
         ) as client:
-            response = await client.get(f"/{filename}")
-        if response.status_code == 404:
-            return {}
-        response.raise_for_status()
-        return await asyncio.to_thread(parse_b3_historical_quotes, response.content, tickers)
+            async with client.stream("GET", f"/{filename}") as response:
+                if response.status_code == 404:
+                    return {}
+                response.raise_for_status()
+                try:
+                    payload = await read_bounded_body(
+                        response, self.settings.archive_download_max_bytes
+                    )
+                except ArchiveSafetyError:
+                    return {}
+        return await asyncio.to_thread(parse_b3_historical_quotes, payload, tickers)
 
 
 def parse_b3_historical_quotes(payload: bytes, tickers: set[str]) -> dict[str, dict[date, Decimal]]:
@@ -51,12 +62,12 @@ def parse_b3_historical_quotes(payload: bytes, tickers: set[str]) -> dict[str, d
         return {}
     prices: dict[str, dict[date, Decimal]] = {ticker: {} for ticker in normalized}
     try:
-        with ZipFile(BytesIO(payload)) as archive:
+        with open_validated_zip(payload) as archive:
             filename = next(name for name in archive.namelist() if not name.endswith("/"))
             with archive.open(filename) as raw:
                 for line in TextIOWrapper(raw, encoding="latin-1"):
                     _add_price(prices, line)
-    except (BadZipFile, OSError, StopIteration, UnicodeError):
+    except (ArchiveSafetyError, BadZipFile, OSError, StopIteration, UnicodeError):
         return {}
     return {ticker: series for ticker, series in prices.items() if series}
 

@@ -106,6 +106,21 @@ def test_fii_parser_rejects_archives_without_required_members_or_matches() -> No
     assert parse_fii_reports(payload, _instrument()).reports == ()
 
 
+@pytest.mark.asyncio
+async def test_provider_rejects_oversized_or_invalid_archives() -> None:
+    oversized = CvmFundReportProvider(
+        Settings(archive_download_max_bytes=1),
+        httpx.MockTransport(lambda _request: httpx.Response(200, content=b"large")),
+    )
+    invalid = CvmFundReportProvider(
+        Settings(),
+        httpx.MockTransport(lambda _request: httpx.Response(200, content=b"not a zip")),
+    )
+
+    assert await oversized._request("/oversized.zip") is None
+    assert await invalid._request("/invalid.zip") is None
+
+
 def test_fiagro_parser_accepts_legacy_isin_check_digits() -> None:
     payload = _zip(
         {
