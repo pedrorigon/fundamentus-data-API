@@ -207,6 +207,14 @@ def test_request_supports_a_complete_multi_year_daily_history() -> None:
         )
 
 
+def test_request_rejects_unbounded_archive_year_fanout() -> None:
+    with pytest.raises(ValidationError, match="archive-year budget"):
+        HistoricalQuoteRequest(
+            tickers=["BBAS3"],
+            dates=[date(1900 + index, 1, 1) for index in range(26)],
+        )
+
+
 @pytest.mark.asyncio
 async def test_endpoint_returns_resolved_historical_quote() -> None:
     provider = _Provider({2020: {"AZUL4": {date(2020, 5, 29): Decimal("12.34")}}})

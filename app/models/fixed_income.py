@@ -2,9 +2,10 @@ from datetime import date
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-MAX_FIXED_INCOME_DATES = 500
+MAX_FIXED_INCOME_DATES = 100
+MAX_FIXED_INCOME_LOOKUPS = 500
 
 
 class ValuationMethod(StrEnum):
@@ -41,6 +42,12 @@ class FixedIncomeValuationRequest(BaseModel):
     @classmethod
     def unique_dates(cls, values: list[date]) -> list[date]:
         return list(dict.fromkeys(values))
+
+    @model_validator(mode="after")
+    def bounded_work(self) -> "FixedIncomeValuationRequest":
+        if len(self.identifiers) * len(self.dates) > MAX_FIXED_INCOME_LOOKUPS:
+            raise ValueError("fixed-income request exceeds the lookup budget")
+        return self
 
 
 class FixedIncomeValuationResponse(BaseModel):

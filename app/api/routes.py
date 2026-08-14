@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 from datetime import UTC, date, datetime
 from typing import Annotated
 
@@ -72,6 +73,18 @@ IncludeDetailsQuery = Annotated[bool, Query()]
 IncludeDividendsQuery = Annotated[bool, Query()]
 TickersQuery = Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")]
 CacheTokenHeader = Annotated[str | None, Header(alias="X-Cache-Token")]
+
+
+def _require_maintenance_token(provided: str | None) -> None:
+    configured_secret = get_settings().cache_invalidate_token
+    configured = configured_secret.get_secret_value() if configured_secret else None
+    if not configured or not provided or not hmac.compare_digest(provided, configured):
+        raise UnauthorizedCacheInvalidationError()
+
+
+def _authorize_force_refresh(force_refresh: bool, provided: str | None) -> None:
+    if force_refresh:
+        _require_maintenance_token(provided)
 
 
 @router.post(
@@ -280,7 +293,9 @@ async def get_asset(
     period: DividendPeriodQuery = DividendPeriod.all,
     as_of: AsOfQuery = None,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> AssetResponse:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("asset_endpoint_requests")
     return await service.get_asset(
@@ -299,7 +314,9 @@ async def get_details(
     response: Response,
     service: AssetServiceDep,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> AssetDetails:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("details_endpoint_requests")
     details, _cached = await service.get_details(ticker, force_refresh=force_refresh)
@@ -314,7 +331,9 @@ async def get_dividends(
     period: DividendPeriodQuery = DividendPeriod.all,
     as_of: AsOfQuery = None,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> list[Dividend]:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("dividends_endpoint_requests")
     dividends, _cached = await service.get_dividends(
@@ -336,7 +355,9 @@ async def get_assets_batch(
     period: DividendPeriodQuery = DividendPeriod.all,
     as_of: AsOfQuery = None,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> BatchAssetResponse:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("batch_endpoint_requests")
     ticker_list = [item.strip() for item in tickers.split(",") if item.strip()]
@@ -362,15 +383,8 @@ async def invalidate_cache(
     service: AssetServiceDep,
     x_cache_token: CacheTokenHeader = None,
 ) -> CacheInvalidationResponse:
-    settings = get_settings()
-    configured = (
-        settings.cache_invalidate_token.get_secret_value()
-        if settings.cache_invalidate_token
-        else None
-    )
     provided = x_cache_token or payload.token
-    if configured and provided != configured:
-        raise UnauthorizedCacheInvalidationError()
+    _require_maintenance_token(provided)
 
     if payload.ticker:
         ticker = service.normalize_ticker(payload.ticker)

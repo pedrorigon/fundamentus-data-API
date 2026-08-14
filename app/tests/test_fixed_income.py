@@ -433,7 +433,17 @@ def test_request_rejects_unsafe_identifiers() -> None:
     with pytest.raises(ValidationError):
         FixedIncomeValuationRequest(
             identifiers=["AAA1"],
-            dates=[date(2020, 1, 1) + timedelta(days=index) for index in range(501)],
+            dates=[
+                date(2020, 1, 1) + timedelta(days=index)
+                for index in range(MAX_FIXED_INCOME_DATES + 1)
+            ],
+        )
+    with pytest.raises(ValidationError, match="lookup budget"):
+        FixedIncomeValuationRequest(
+            identifiers=[f"ID{index}" for index in range(6)],
+            dates=[
+                date(2020, 1, 1) + timedelta(days=index) for index in range(MAX_FIXED_INCOME_DATES)
+            ],
         )
 
 
