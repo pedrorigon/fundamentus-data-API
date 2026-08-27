@@ -29,6 +29,20 @@ def test_maintenance_token_uses_the_configured_secret(
         routes._require_maintenance_token("wrong-token")
 
 
+def test_local_income_refresh_treats_an_empty_configured_token_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(environment="local", cache_invalidate_token="")
+    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+
+    routes._require_refresh_authorization(None)
+
+    production = Settings(environment="production", cache_invalidate_token="")
+    monkeypatch.setattr(routes, "get_settings", lambda: production)
+    with pytest.raises(UnauthorizedCacheInvalidationError):
+        routes._require_refresh_authorization(None)
+
+
 def test_force_refresh_requires_maintenance_authorization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

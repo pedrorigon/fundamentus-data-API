@@ -17,7 +17,7 @@ from app.api.dependencies import (
     get_opportunity_service,
     get_quality_facts_service,
 )
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.core.errors import UnauthorizedCacheInvalidationError
 from app.core.metrics import metrics
 from app.income import IncomeEventService
@@ -132,7 +132,7 @@ def _require_refresh_authorization(provided: str | None) -> None:
     settings = get_settings()
     if (
         settings.environment.lower() in {"local", "test"}
-        and settings.cache_invalidate_token is None
+        and not _configured_maintenance_token(settings)
     ):
         return
     _require_maintenance_token(provided)
@@ -144,10 +144,16 @@ def _income_cache_headers(response: Response, cursor: int) -> None:
 
 
 def _require_maintenance_token(provided: str | None) -> None:
-    configured_secret = get_settings().cache_invalidate_token
-    configured = configured_secret.get_secret_value() if configured_secret else None
+    configured = _configured_maintenance_token(get_settings())
     if not configured or not provided or not hmac.compare_digest(provided, configured):
         raise UnauthorizedCacheInvalidationError()
+
+
+def _configured_maintenance_token(settings: Settings) -> str | None:
+    configured_secret = settings.cache_invalidate_token
+    if configured_secret is None:
+        return None
+    return configured_secret.get_secret_value().strip() or None
 
 
 def _authorize_force_refresh(force_refresh: bool, provided: str | None) -> None:
