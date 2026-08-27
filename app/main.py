@@ -9,6 +9,13 @@ from app.api import router
 from app.cache import CacheStore
 from app.config import get_settings
 from app.core.errors import register_error_handlers
+from app.income import IncomeEventService, IncomeEventStore
+from app.income.sources import (
+    FundamentusIncomeSource,
+    FundosNetIncomeSource,
+    OfficialCompanyIncomeSource,
+    StatusInvestIncomeSource,
+)
 from app.scrapers import FundamentusClient, FundamentusScraper
 from app.services import (
     AssetService,
@@ -36,6 +43,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scraper = FundamentusScraper(client, settings)
     asset_service = AssetService(scraper, cache, settings)
     app.state.asset_service = asset_service
+    income_event_store = IncomeEventStore(settings.sqlite_cache_path)
+    await income_event_store.startup()
+    app.state.income_event_service = IncomeEventService(
+        income_event_store,
+        [
+            OfficialCompanyIncomeSource(settings),
+            FundosNetIncomeSource(settings),
+            FundamentusIncomeSource(asset_service),
+            StatusInvestIncomeSource(settings),
+        ],
+    )
     app.state.opportunity_service = OpportunityService(asset_service, settings)
     instrument_data_service = InstrumentDataService(settings)
     app.state.instrument_data_service = instrument_data_service
@@ -59,6 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await instrument_data_service.close()
+        await income_event_store.close()
         await client.shutdown()
         await cache.close()
 

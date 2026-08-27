@@ -36,6 +36,28 @@ Returns normalized fields and all parsed sections from the Fundamentus details p
 
 Returns all parsed dividends after applying the requested period filter.
 
+### `POST /v2/income-events/refresh`
+
+Refreshes a bounded list of instruments from independent public sources and publishes a canonical event revision. This maintenance endpoint requires `X-Cache-Token` outside local/test environments. It is intended for background jobs, not request-time reads.
+
+```json
+{
+  "instruments": [
+    {"ticker": "BBAS3", "isin": "BRBBASACNOR3", "name": "Banco do Brasil"},
+    {"ticker": "HGLG11", "isin": "BRHGLGCTF004", "name": "CSHG Logística"}
+  ],
+  "as_of": "2026-08-27"
+}
+```
+
+### `POST /v2/income-events/batch`
+
+Reads canonical events for at most 20 tickers from local SQLite storage. By default, only `corroborated` and `verified` events are returned; tentative and conflicting observations cannot inflate portfolio projections. Optional `from_date` and `to_date` fields filter payment dates. The response includes a cursor and ETag.
+
+### `GET /v2/income-events/changes`
+
+Returns semantic event changes after a monotonic `cursor`, with a bounded `limit` of 1 to 500. Consumers use this endpoint for incremental synchronization without repeatedly transferring the full event catalog.
+
 ### `GET /v1/assets/{ticker}/opportunity`
 
 Returns current price, P/L, P/VP, trailing dividend yield, Graham price,

@@ -25,6 +25,7 @@ dependencies = [
     "orjson>=3.10.0",
     "pydantic>=2.8.0",
     "pydantic-settings>=2.4.0",
+    "pypdf>=6.0.0",
     "selectolax>=0.3.21",
     "uvicorn[standard]>=0.30.0",
 ]

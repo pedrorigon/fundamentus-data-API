@@ -12,6 +12,7 @@ from app.api.dependencies import (
     get_fixed_income_valuation_service,
     get_fundamentals_service,
     get_historical_quote_service,
+    get_income_event_service,
     get_instrument_data_service,
     get_opportunity_service,
     get_quality_facts_service,
@@ -19,6 +20,7 @@ from app.api.dependencies import (
 from app.config import get_settings
 from app.core.errors import UnauthorizedCacheInvalidationError
 from app.core.metrics import metrics
+from app.income import IncomeEventService
 from app.models import (
     AssetDetails,
     AssetResponse,
@@ -35,6 +37,11 @@ from app.models import (
     HealthResponse,
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
+    IncomeEventBatchRequest,
+    IncomeEventBatchResponse,
+    IncomeEventChangesResponse,
+    IncomeEventRefreshRequest,
+    IncomeEventRefreshResponse,
     InstrumentDataResponse,
     InstrumentMetadata,
     InstrumentSearchResponse,
@@ -66,6 +73,7 @@ FixedIncomeServiceDep = Annotated[
     Depends(get_fixed_income_valuation_service),
 ]
 HistoricalQuoteServiceDep = Annotated[HistoricalQuoteService, Depends(get_historical_quote_service)]
+IncomeEventServiceDep = Annotated[IncomeEventService, Depends(get_income_event_service)]
 ForceRefreshQuery = Annotated[bool, Query()]
 AsOfQuery = Annotated[date | None, Query()]
 DividendPeriodQuery = Annotated[DividendPeriod, Query()]
@@ -73,6 +81,66 @@ IncludeDetailsQuery = Annotated[bool, Query()]
 IncludeDividendsQuery = Annotated[bool, Query()]
 TickersQuery = Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")]
 CacheTokenHeader = Annotated[str | None, Header(alias="X-Cache-Token")]
+
+
+@router.post(
+    "/v2/income-events/refresh",
+    response_model=IncomeEventRefreshResponse,
+    tags=["income-events"],
+)
+async def refresh_income_events(
+    payload: IncomeEventRefreshRequest,
+    service: IncomeEventServiceDep,
+    x_cache_token: CacheTokenHeader = None,
+) -> IncomeEventRefreshResponse:
+    _require_refresh_authorization(x_cache_token)
+    return await service.refresh(payload)
+
+
+@router.post(
+    "/v2/income-events/batch",
+    response_model=IncomeEventBatchResponse,
+    tags=["income-events"],
+)
+async def resolve_income_events_batch(
+    payload: IncomeEventBatchRequest,
+    service: IncomeEventServiceDep,
+    response: Response,
+) -> IncomeEventBatchResponse:
+    result = await service.batch(payload)
+    _income_cache_headers(response, result.cursor)
+    return result
+
+
+@router.get(
+    "/v2/income-events/changes",
+    response_model=IncomeEventChangesResponse,
+    tags=["income-events"],
+)
+async def income_event_changes(
+    service: IncomeEventServiceDep,
+    response: Response,
+    cursor: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> IncomeEventChangesResponse:
+    result = await service.changes(cursor, limit)
+    _income_cache_headers(response, result.cursor)
+    return result
+
+
+def _require_refresh_authorization(provided: str | None) -> None:
+    settings = get_settings()
+    if (
+        settings.environment.lower() in {"local", "test"}
+        and settings.cache_invalidate_token is None
+    ):
+        return
+    _require_maintenance_token(provided)
+
+
+def _income_cache_headers(response: Response, cursor: int) -> None:
+    _cache_headers(response)
+    response.headers["ETag"] = f'W/"income-{cursor}"'
 
 
 def _require_maintenance_token(provided: str | None) -> None:

@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     )
     status_invest_base_url: str = "https://statusinvest.com.br"
     cvm_open_data_base_url: str = "https://dados.cvm.gov.br"
+    b3_listed_companies_base_url: str = (
+        "https://sistemaswebb3-listados.b3.com.br/listedCompaniesProxy"
+    )
+    fundos_net_base_url: str = "https://fnet.bmfbovespa.com.br"
     bcb_sgs_base_url: str = "https://api.bcb.gov.br"
     bcb_ifdata_base_url: str = "https://olinda.bcb.gov.br/olinda/servico/IFDATA/versao/v1/odata"
     brapi_base_url: str = "https://brapi.dev"
@@ -72,6 +76,10 @@ class Settings(BaseSettings):
     # the HTML scrapers.
     cvm_request_timeout_seconds: float = 120.0
     archive_download_max_bytes: int = 268435456
+    income_document_max_bytes: int = 10 * 1024 * 1024
+    income_source_index_ttl_seconds: int = 1800
+    fundos_net_scan_limit: int = 300
+    fundos_net_fallback_documents: int = 30
     max_connections: int = 8
     max_keepalive_connections: int = 4
     upstream_concurrency: int = 4

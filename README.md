@@ -13,7 +13,7 @@ API version is resolved from package metadata at runtime. Release artifacts use 
 
 ## What It Does
 
-- Exposes a typed HTTP API for asset details and dividend events from Fundamentus.
+- Exposes typed asset data and canonical income events resolved from independent public sources.
 - Preserves raw table values while also returning normalized Brazilian dates, numbers, percentages and monetary values.
 - Supports stocks, banks, FIIs, BDRs and other asset classes by preserving all parsed detail sections.
 - Classifies B3 ETFs and exposes quotes and market data through brapi.
@@ -22,6 +22,8 @@ API version is resolved from package metadata at runtime. Release artifacts use 
 - Exposes profiles, holdings and fundamentals for international ETFs and stocks through Alpha Vantage, with SEC EDGAR CompanyFacts as the keyless official filing source when an issuer is SEC-covered.
 - Keeps BDR identity separate from its foreign issuer and routes quality facts through a verified underlying ticker; unresolved BDRs return an actionable unavailable reason instead of querying the local code abroad.
 - Filters dividends by `all`, `past`, `future` and `upcoming_ex_date`.
+- Resolves stock income from official B3/CVM publications and listed-fund income from Fundos.NET, with Fundamentus and Status Invest as lower-authority complements.
+- Keeps canonical events in SQLite and serves batched and incremental reads without waiting for an upstream website.
 - Uses local caching to reduce repeated upstream requests.
 - Provides OpenAPI docs, Prometheus-compatible metrics and consistent JSON errors.
 - Ships fixture-based tests that do not require internet access.
@@ -75,6 +77,9 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
 | `GET /v1/assets/{ticker}/fundamentals` | Multi-year financial statements resolved from CVM open data. |
 | `POST /v1/quality/facts:resolve` | Batched, normalized quality evidence for stocks, listed funds and ETFs. |
+| `POST /v2/income-events/refresh` | Protected background refresh from public income sources. |
+| `POST /v2/income-events/batch` | Low-latency local read of canonical income events. |
+| `GET /v2/income-events/changes` | Cursor-based incremental event changes. |
 | `GET /v1/instruments/{ticker}` | B3 instrument classification, including funds outside Fundamentus. |
 | `GET /v2/instruments/{ticker}` | ETF and stock data from B3, brapi and Alpha Vantage. |
 | `GET /v1/assets` | Batch query for multiple tickers. |
@@ -183,8 +188,13 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `UPSTREAM_CONCURRENCY` | `4` | Maximum concurrent Fundamentus requests. |
 | `UPSTREAM_MIN_INTERVAL_SECONDS` | `0.15` | Minimum interval between upstream requests. |
 | `CACHE_INVALIDATE_TOKEN` | empty | Optional token for cache invalidation. |
+| `INCOME_SOURCE_INDEX_TTL_SECONDS` | `1800` | TTL for CVM and Fundos.NET indexes and parsed Fundos.NET documents. |
+| `FUNDOS_NET_SCAN_LIMIT` | `300` | Maximum recent Fundos.NET documents considered per index refresh. |
+| `FUNDOS_NET_FALLBACK_DOCUMENTS` | `30` | Bounded fallback scan when fund names do not identify a document. |
 
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
+
+Canonical income resolution is independent from the legacy dividend route. A maintenance worker refreshes bounded instrument batches through `/v2/income-events/refresh`; production calls require `X-Cache-Token`. Official B3/CVM and Fundos.NET observations outrank complementary HTML sources. Conflicting official observations are retained with a non-projectable `conflicted` status instead of being guessed. `/v2/income-events/batch` and `/v2/income-events/changes` read only SQLite, so user requests never depend on upstream latency.
 
 The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. SEC-covered issuers are resolved from the official [EDGAR CompanyFacts API](https://www.sec.gov/edgar/sec-api-documentation), then the existing public HTML statements are tried as a bounded fallback. Keep provider keys on the server and review their terms before production use.
 
