@@ -619,6 +619,42 @@ async def test_official_company_source_uses_b3_without_cvm_code() -> None:
 
 
 @pytest.mark.asyncio
+async def test_official_company_source_requires_isin_for_multiple_share_classes() -> None:
+    common = {
+        "label": "JRS CAP PROPRIO",
+        "lastDatePrior": "11/05/2026",
+        "paymentDate": "26/08/2026",
+    }
+    rows = [
+        {**common, "isinCode": "BRTAEEACNOR9", "rate": "0,08000000000"},
+        {**common, "isinCode": "BRTAEECDAM10", "rate": "0,55899814398"},
+    ]
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+
+    ambiguous = await source.collect(
+        [IncomeInstrumentRequest(ticker="TAEE11")],
+        date(2026, 8, 27),
+    )
+    identified = await source.collect(
+        [IncomeInstrumentRequest(ticker="TAEE11", isin="BRTAEECDAM10")],
+        date(2026, 8, 27),
+    )
+
+    assert ambiguous.observations == []
+    assert ambiguous.coverage[0].complete is False
+    assert ambiguous.coverage[0].detail == "B3 returned multiple ISINs for TAEE11"
+    assert len(identified.observations) == 1
+    assert identified.observations[0].isin == "BRTAEECDAM10"
+    assert identified.observations[0].unit_price == Decimal("0.55899814398")
+
+
+@pytest.mark.asyncio
 async def test_official_company_source_isolates_transport_failure() -> None:
     source = OfficialCompanyIncomeSource(
         Settings(b3_listed_companies_base_url="https://b3.test"),

@@ -236,6 +236,8 @@ class OfficialCompanyIncomeSource:
         as_of: date,
     ) -> list[IncomeEventObservation]:
         b3_payload = await self._b3_payload(client, instrument.ticker)
+        if instrument.isin is None and _distinct_b3_isins(b3_payload) > 1:
+            raise ValueError(f"B3 returned multiple ISINs for {instrument.ticker}")
         b3_events, cvm_code = parse_b3_income_events(
             b3_payload,
             ticker=instrument.ticker,
@@ -683,6 +685,21 @@ def _instrument_results(
 def _issuer_code(ticker: str) -> str:
     match = re.match(r"[A-Z]+", ticker.upper())
     return (match.group(0) if match else ticker.upper())[:4]
+
+
+def _distinct_b3_isins(payload: Any) -> int:
+    rows = payload if isinstance(payload, list) else []
+    company = next((row for row in rows if isinstance(row, dict)), None)
+    if company is None:
+        return 0
+    return len(
+        {
+            isin
+            for row in company.get("cashDividends") or []
+            if isinstance(row, dict)
+            and (isin := str(row.get("isinCode") or row.get("assetIssued") or "").strip().upper())
+        }
+    )
 
 
 def _limits(settings: Settings) -> httpx.Limits:
