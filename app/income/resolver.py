@@ -70,7 +70,8 @@ def _resolve_group(
     ]
     selected = active or observations
     ordered = sorted(selected, key=lambda item: (item.authority, item.source_version), reverse=True)
-    payment = _best_value(ordered, "payment_date")
+    authoritative = [item for item in active if item.authority >= OFFICIAL_AUTHORITY]
+    payment = _best_payment_date(ordered, authoritative)
     amount = _best_value(ordered, "unit_price")
     assert isinstance(payment, date)
     assert isinstance(amount, Decimal)
@@ -78,7 +79,6 @@ def _resolve_group(
     reference_period = _best_value(ordered, "reference_period")
     sources = sorted({item.source for item in observations})
     lineages = {item.lineage for item in active}
-    authoritative = [item for item in active if item.authority >= OFFICIAL_AUTHORITY]
     status = _status(observations, authoritative, lineages)
     confidence = _confidence(status)
     field_source = _field_sources(ordered)
@@ -124,7 +124,11 @@ def _status(
     if authoritative:
         return IncomeEventStatus.verified
     if len(lineages) >= 2:
-        return IncomeEventStatus.corroborated
+        return (
+            IncomeEventStatus.corroborated
+            if _secondary_payment_consensus(observations) is not None
+            else IncomeEventStatus.conflicted
+        )
     return IncomeEventStatus.tentative
 
 
@@ -150,6 +154,33 @@ def _best_value(observations: list[IncomeEventObservation], field: str) -> objec
         if value not in {None, ""}:
             return cast(object, value)
     return None
+
+
+def _best_payment_date(
+    observations: list[IncomeEventObservation],
+    authoritative: list[IncomeEventObservation],
+) -> date | None:
+    if not authoritative and (consensus := _secondary_payment_consensus(observations)) is not None:
+        return consensus
+    value = _best_value(observations, "payment_date")
+    return value if isinstance(value, date) else None
+
+
+def _secondary_payment_consensus(
+    observations: list[IncomeEventObservation],
+) -> date | None:
+    support: dict[date, set[str]] = defaultdict(set)
+    for item in observations:
+        if item.payment_date is not None and item.source_status.lower() not in {
+            "cancelled",
+            "canceled",
+        }:
+            support[item.payment_date].add(item.lineage)
+    if not support:
+        return None
+    best = max(len(lineages) for lineages in support.values())
+    winners = [payment for payment, lineages in support.items() if len(lineages) == best]
+    return winners[0] if best >= 2 and len(winners) == 1 else None
 
 
 def _field_sources(observations: list[IncomeEventObservation]) -> dict[str, str]:

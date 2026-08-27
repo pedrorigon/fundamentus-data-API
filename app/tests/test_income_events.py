@@ -224,6 +224,29 @@ def test_resolver_requires_independent_lineages_and_detects_official_conflict() 
     assert resolve_income_events([_observation("invalid", amount="0")]) == []
 
 
+def test_resolver_requires_secondary_payment_consensus_and_uses_unique_majority() -> None:
+    first = _observation("first", lineage="independent:first")
+    disagreement = _observation(
+        "second",
+        lineage="independent:second",
+        payment_date=date(2026, 9, 12),
+    )
+
+    conflicted = resolve_income_events([first, disagreement])[0]
+    assert conflicted.status is IncomeEventStatus.conflicted
+    assert conflicted.projectable is False
+
+    majority = resolve_income_events(
+        [
+            first,
+            disagreement,
+            _observation("third", lineage="independent:third"),
+        ]
+    )[0]
+    assert majority.status is IncomeEventStatus.corroborated
+    assert majority.payment_date == first.payment_date
+
+
 @pytest.mark.asyncio
 async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path) -> None:
     store = IncomeEventStore(tmp_path / "income.sqlite3")
