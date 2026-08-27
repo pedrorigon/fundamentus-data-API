@@ -11,7 +11,7 @@ import time
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 
 import httpx
@@ -31,6 +31,7 @@ from app.models.income_events import (
     IncomeInstrumentRequest,
     IncomeSourceCoverage,
 )
+from app.parsers.status_invest import parse_status_invest_cnpj
 from app.services.assets import AssetService
 
 
@@ -95,6 +96,9 @@ class StatusInvestIncomeSource:
     ) -> None:
         self.settings = settings
         self.transport = transport
+        self._profiles: dict[str, tuple[float, str]] = {}
+        self._profile_tasks: dict[str, asyncio.Task[str]] = {}
+        self._profile_lock = asyncio.Lock()
 
     async def collect(
         self,
@@ -102,42 +106,92 @@ class StatusInvestIncomeSource:
         as_of: date,
     ) -> IncomeSourceResult:
         del as_of
-        headers = {
-            "Accept": "text/html",
-            "Accept-Language": "pt-BR,pt;q=0.9",
-            "User-Agent": self.settings.user_agent,
-        }
-        async with httpx.AsyncClient(
-            base_url=self.settings.status_invest_base_url,
-            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
-            limits=_limits(self.settings),
-            follow_redirects=True,
-            headers=headers,
-            transport=self.transport,
-        ) as client:
+        async with self._client() as client:
             results = await asyncio.gather(
                 *(self._instrument(client, item) for item in instruments),
                 return_exceptions=True,
             )
         return _instrument_results(self.name, instruments, results)
 
+    async def fund_cnpjs(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+    ) -> dict[str, str]:
+        funds = [item for item in instruments if item.ticker.upper().endswith("11")]
+        if not funds:
+            return {}
+        async with self._client() as client:
+            pages = await asyncio.gather(
+                *(self._profile_html(client, item) for item in funds),
+                return_exceptions=True,
+            )
+        return {
+            instrument.ticker: cnpj
+            for instrument, page in zip(funds, pages, strict=True)
+            if isinstance(page, str) and (cnpj := parse_status_invest_cnpj(page)) is not None
+        }
+
     async def _instrument(
         self,
         client: httpx.AsyncClient,
         instrument: IncomeInstrumentRequest,
     ) -> list[IncomeEventObservation]:
+        html = await self._profile_html(client, instrument)
+        return parse_status_invest_income_events(html, ticker=instrument.ticker) if html else []
+
+    async def _profile_html(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+    ) -> str:
+        ticker = instrument.ticker.upper()
+        async with self._profile_lock:
+            cached = self._profiles.get(ticker)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._profile_tasks.get(ticker)
+            if task is None:
+                task = asyncio.create_task(self._fetch_profile_html(client, instrument))
+                self._profile_tasks[ticker] = task
+        try:
+            html = await task
+            async with self._profile_lock:
+                self._profiles[ticker] = (time.monotonic(), html)
+                _trim_ttl_cache(self._profiles, self.settings.ticker_cache_max_entries)
+            return html
+        finally:
+            async with self._profile_lock:
+                if self._profile_tasks.get(ticker) is task:
+                    self._profile_tasks.pop(ticker, None)
+
+    async def _fetch_profile_html(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+    ) -> str:
         for asset_type in ("fundos-imobiliarios", "acoes"):
             response = await client.get(f"/{asset_type}/{instrument.ticker.lower()}")
             if response.status_code == 404:
                 continue
             response.raise_for_status()
-            observations = parse_status_invest_income_events(
-                response.text,
-                ticker=instrument.ticker,
-            )
-            if observations:
-                return observations
-        return []
+            return response.text
+        return ""
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.settings.status_invest_base_url,
+            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
+            limits=_limits(self.settings),
+            follow_redirects=True,
+            headers={
+                "Accept": "text/html",
+                "Accept-Language": "pt-BR,pt;q=0.9",
+                "User-Agent": self.settings.user_agent,
+            },
+            transport=self.transport,
+        )
 
 
 class OfficialCompanyIncomeSource:
@@ -288,40 +342,62 @@ class FundosNetIncomeSource:
         self,
         settings: Settings,
         transport: httpx.AsyncBaseTransport | None = None,
+        status_source: StatusInvestIncomeSource | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport
+        self.status_source = status_source
         self._index: tuple[float, list[dict[str, Any]]] | None = None
         self._index_lock = asyncio.Lock()
         self._documents: dict[tuple[str, int], tuple[float, list[IncomeEventObservation]]] = {}
         self._document_tasks: dict[tuple[str, int], asyncio.Task[list[IncomeEventObservation]]] = {}
         self._document_lock = asyncio.Lock()
+        self._fund_rows: dict[
+            tuple[str, date],
+            tuple[float, tuple[list[dict[str, Any]], bool]],
+        ] = {}
+        self._fund_row_tasks: dict[
+            tuple[str, date],
+            asyncio.Task[tuple[list[dict[str, Any]], bool]],
+        ] = {}
+        self._fund_row_lock = asyncio.Lock()
 
     async def collect(
         self,
         instruments: Sequence[IncomeInstrumentRequest],
         as_of: date,
     ) -> IncomeSourceResult:
-        del as_of
         requested = {item.ticker: item for item in instruments}
         try:
-            observations = await self._load(requested)
+            observations, complete_tickers = await self._load(requested, as_of)
         except (httpx.HTTPError, ValueError) as exc:
-            coverage = [
+            failed_coverage = [
                 _coverage(self.name, ticker, "failed", False, str(exc)) for ticker in requested
             ]
-            return IncomeSourceResult([], coverage)
+            return IncomeSourceResult([], failed_coverage)
         found = {item.ticker for item in observations}
-        coverage = [
-            _coverage(self.name, ticker, "complete" if ticker in found else "empty", True)
-            for ticker in requested
-        ]
+        coverage: list[IncomeSourceCoverage] = []
+        for ticker in requested:
+            complete = ticker in complete_tickers
+            status = (
+                "complete" if complete and ticker in found else "empty" if complete else "partial"
+            )
+            coverage.append(
+                _coverage(
+                    self.name,
+                    ticker,
+                    status,
+                    complete,
+                    None if complete else "fund-specific snapshot unavailable",
+                )
+            )
         return IncomeSourceResult(observations, coverage)
 
     async def _load(
         self,
         requested: dict[str, IncomeInstrumentRequest],
-    ) -> list[IncomeEventObservation]:
+        as_of: date,
+    ) -> tuple[list[IncomeEventObservation], set[str]]:
         headers = {
             "Accept": "application/json,application/xml,text/xml",
             "User-Agent": self.settings.user_agent,
@@ -335,8 +411,40 @@ class FundosNetIncomeSource:
             transport=self.transport,
         ) as client:
             rows = await self._rows(client)
-            candidates = _fundos_net_candidates(
-                rows, requested, self.settings.fundos_net_fallback_documents
+            targeted_candidates: list[dict[str, Any]] = []
+            complete_tickers: set[str] = set()
+            if self.status_source is not None:
+                cnpjs = await self.status_source.fund_cnpjs(list(requested.values()))
+                targeted = await asyncio.gather(
+                    *(
+                        self._rows_for_cnpj(
+                            client,
+                            cnpj,
+                            as_of - timedelta(days=self.settings.income_snapshot_overlap_days),
+                        )
+                        for ticker, cnpj in cnpjs.items()
+                    ),
+                    return_exceptions=True,
+                )
+                for (ticker, _cnpj), result in zip(cnpjs.items(), targeted, strict=True):
+                    if isinstance(result, BaseException):
+                        continue
+                    targeted_rows, complete = result
+                    targeted_candidates.extend(targeted_rows)
+                    if complete:
+                        complete_tickers.add(ticker)
+            candidates = list(
+                {
+                    str(row["id"]): row
+                    for row in [
+                        *targeted_candidates,
+                        *_fundos_net_candidates(
+                            rows,
+                            requested,
+                            self.settings.fundos_net_fallback_documents,
+                        ),
+                    ]
+                }.values()
             )
             semaphore = asyncio.Semaphore(self.settings.upstream_concurrency)
 
@@ -350,13 +458,14 @@ class FundosNetIncomeSource:
             failure = next((result for result in parsed if isinstance(result, BaseException)), None)
             if failure is not None:
                 raise RuntimeError("Fundos.NET document refresh was incomplete") from failure
-        return [
+        observations = [
             event
             for result in parsed
             if isinstance(result, list)
             for event in result
             if event.ticker in requested
         ]
+        return observations, complete_tickers
 
     async def _rows(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
         async with self._index_lock:
@@ -381,6 +490,73 @@ class FundosNetIncomeSource:
             self._index = (time.monotonic(), rows)
             return rows
 
+    async def _rows_for_cnpj(
+        self,
+        client: httpx.AsyncClient,
+        cnpj: str,
+        snapshot_from: date,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        key = (cnpj, snapshot_from)
+        async with self._fund_row_lock:
+            cached = self._fund_rows.get(key)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._fund_row_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(self._fetch_rows_for_cnpj(client, cnpj, snapshot_from))
+                self._fund_row_tasks[key] = task
+        try:
+            result = await task
+            async with self._fund_row_lock:
+                self._fund_rows[key] = (time.monotonic(), result)
+                _trim_ttl_cache(self._fund_rows, self.settings.ticker_cache_max_entries)
+            return result
+        finally:
+            async with self._fund_row_lock:
+                if self._fund_row_tasks.get(key) is task:
+                    self._fund_row_tasks.pop(key, None)
+
+    async def _fetch_rows_for_cnpj(
+        self,
+        client: httpx.AsyncClient,
+        cnpj: str,
+        snapshot_from: date,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        rows: list[dict[str, Any]] = []
+        page_size = max(self.settings.fundos_net_page_size, 1)
+        scan_limit = max(self.settings.fundos_net_scan_limit, page_size)
+        for offset in range(0, scan_limit, page_size):
+            response = await client.get(
+                "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+                params={
+                    "d": 1,
+                    "s": offset,
+                    "l": min(page_size, scan_limit - offset),
+                    "o[0][dataEntrega]": "desc",
+                    "idCategoriaDocumento": 14,
+                    "idTipoDocumento": 41,
+                    "idEspecieDocumento": 0,
+                    "tipoFundo": 1,
+                    "cnpj": cnpj,
+                    "cnpjFundo": cnpj,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            page = _fundos_net_rows(payload)
+            rows.extend(page)
+            total = _positive_int(payload.get("recordsFiltered"))
+            exhausted = not page or offset + len(page) >= total
+            covered = any(
+                delivered is not None and delivered < snapshot_from
+                for delivered in (_fundos_net_delivery_date(row) for row in page)
+            )
+            if exhausted or covered:
+                return rows, True
+        return rows, False
+
     async def _document(
         self,
         client: httpx.AsyncClient,
@@ -401,7 +577,7 @@ class FundosNetIncomeSource:
             events = await task
             async with self._document_lock:
                 self._documents[key] = (time.monotonic(), events)
-                _trim_document_cache(self._documents, self.settings.fundos_net_scan_limit)
+                _trim_ttl_cache(self._documents, self.settings.fundos_net_scan_limit)
             return events
         finally:
             async with self._document_lock:
@@ -561,6 +737,14 @@ def _fundos_net_rows(payload: Any) -> list[dict[str, Any]]:
     return [row for row in payload["data"] if isinstance(row, dict) and row.get("id")]
 
 
+def _fundos_net_delivery_date(row: dict[str, Any]) -> date | None:
+    raw = str(row.get("dataEntrega") or "").strip().split(" ", maxsplit=1)[0]
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
 def _fundos_net_candidates(
     rows: list[dict[str, Any]],
     requested: dict[str, IncomeInstrumentRequest],
@@ -619,8 +803,8 @@ def _fresh(stored_at: float, ttl_seconds: int) -> bool:
     return time.monotonic() - stored_at < max(ttl_seconds, 0)
 
 
-def _trim_document_cache(
-    cache: dict[tuple[str, int], tuple[float, list[IncomeEventObservation]]],
+def _trim_ttl_cache[CacheKey, CacheValue](
+    cache: dict[CacheKey, tuple[float, CacheValue]],
     maximum: int,
 ) -> None:
     overflow = len(cache) - max(maximum, 1)

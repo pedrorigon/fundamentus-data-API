@@ -34,6 +34,7 @@ class IncomeEventStore:
                 source_event_id TEXT NOT NULL,
                 source_version INTEGER NOT NULL,
                 ticker TEXT NOT NULL,
+                payment_date TEXT,
                 payload TEXT NOT NULL,
                 observed_at TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
@@ -73,6 +74,7 @@ class IncomeEventStore:
             """
         )
         await self._ensure_observation_active_column()
+        await self._ensure_observation_payment_date_column()
         await self._db.commit()
 
     async def close(self) -> None:
@@ -90,8 +92,10 @@ class IncomeEventStore:
                 item.source_event_id,
                 item.source_version,
                 item.ticker.upper(),
+                item.payment_date.isoformat() if item.payment_date is not None else None,
                 _dump(item),
                 item.observed_at.isoformat(),
+                1,
             )
             for item in observations
         ]
@@ -99,12 +103,15 @@ class IncomeEventStore:
             await db.executemany(
                 """
                 INSERT INTO income_event_observations (
-                    source, source_event_id, source_version, ticker, payload, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    source, source_event_id, source_version, ticker,
+                    payment_date, payload, observed_at, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
                     ticker = excluded.ticker,
+                    payment_date = excluded.payment_date,
                     payload = excluded.payload,
-                    observed_at = excluded.observed_at
+                    observed_at = excluded.observed_at,
+                    active = excluded.active
                 """,
                 rows,
             )
@@ -117,6 +124,7 @@ class IncomeEventStore:
         *,
         snapshot_sources: tuple[str, ...],
         complete_tickers: list[str],
+        snapshot_from: date,
     ) -> int:
         """Atomically replace complete source/ticker snapshots and retain failed ones."""
         if not snapshot_sources or not complete_tickers:
@@ -129,6 +137,7 @@ class IncomeEventStore:
                 item.source_event_id,
                 item.source_version,
                 item.ticker.upper(),
+                item.payment_date.isoformat() if item.payment_date is not None else None,
                 _dump(item),
                 item.observed_at.isoformat(),
                 1,
@@ -140,19 +149,24 @@ class IncomeEventStore:
         ticker_placeholders = ",".join("?" for _ in normalized_tickers)
         deactivate = (
             "UPDATE income_event_observations SET active = 0 "
-            f"WHERE source IN ({source_placeholders}) AND ticker IN ({ticker_placeholders})"
+            f"WHERE source IN ({source_placeholders}) AND ticker IN ({ticker_placeholders}) "
+            "AND payment_date >= ?"
         )  # noqa: S608 - placeholders are generated, never user-controlled
         async with self._lock:
-            await db.execute(deactivate, [*snapshot_sources, *normalized_tickers])
+            await db.execute(
+                deactivate,
+                [*snapshot_sources, *normalized_tickers, snapshot_from.isoformat()],
+            )
             if rows:
                 await db.executemany(
                     """
                     INSERT INTO income_event_observations (
-                        source, source_event_id, source_version, ticker,
+                        source, source_event_id, source_version, ticker, payment_date,
                         payload, observed_at, active
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
                         ticker = excluded.ticker,
+                        payment_date = excluded.payment_date,
                         payload = excluded.payload,
                         observed_at = excluded.observed_at,
                         active = excluded.active
@@ -203,6 +217,30 @@ class IncomeEventStore:
                 ],
             )
             await db.commit()
+
+    async def fresh_coverage(
+        self,
+        source: str,
+        tickers: list[str],
+        *,
+        not_before: datetime,
+    ) -> set[str]:
+        if not tickers:
+            return set()
+        db = self._require_db()
+        placeholders = ",".join("?" for _ in tickers)
+        query = (
+            "SELECT payload FROM income_source_coverage "
+            f"WHERE source = ? AND ticker IN ({placeholders})"
+        )  # noqa: S608 - placeholders are generated, never user-controlled
+        async with db.execute(query, [source, *(ticker.upper() for ticker in tickers)]) as cursor:
+            coverage = [
+                IncomeSourceCoverage.model_validate_json(row["payload"])
+                for row in await cursor.fetchall()
+            ]
+        return {
+            item.ticker for item in coverage if item.complete and item.observed_at >= not_before
+        }
 
     async def publish(
         self,
@@ -395,6 +433,13 @@ class IncomeEventStore:
             await db.execute(
                 "ALTER TABLE income_event_observations ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
             )
+
+    async def _ensure_observation_payment_date_column(self) -> None:
+        db = self._require_db()
+        async with db.execute("PRAGMA table_info(income_event_observations)") as cursor:
+            columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "payment_date" not in columns:
+            await db.execute("ALTER TABLE income_event_observations ADD COLUMN payment_date TEXT")
 
 
 def _dump(value: object) -> str:

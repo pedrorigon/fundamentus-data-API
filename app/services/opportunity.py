@@ -28,6 +28,7 @@ from app.models import (
     OpportunityResponse,
 )
 from app.parsers.normalizers import clean_text, normalize_ticker, parse_br_decimal
+from app.parsers.status_invest import status_invest_cnpj
 from app.scrapers.cvm_fund_reports import (
     CvmFundReportProvider,
 )
@@ -479,31 +480,13 @@ def parse_status_invest_profile(html: str) -> StatusInvestProfile:
         value = parse_br_decimal(value_node.text() if value_node else None)
         if key is not None and value is not None:
             values.setdefault(key, value)
-    cnpj = _status_cnpj(tree)
+    cnpj = status_invest_cnpj(tree)
     distributions = _status_distributions(tree)
     return StatusInvestProfile(
         values=values,
         cnpj=cnpj,
         distributions=distributions,
     )
-
-
-def _status_cnpj(tree: HTMLParser) -> str | None:
-    for node in tree.css("h3.title, strong"):
-        if _fold(node.text()) != "CNPJ":
-            continue
-        container = node.parent
-        value_node = (
-            container.css_first("strong.value, .span-item") if container is not None else None
-        )
-        digits = (
-            "".join(character for character in value_node.text() if character.isdigit())
-            if value_node
-            else ""
-        )
-        if len(digits) == 14:
-            return digits
-    return None
 
 
 def _status_distributions(tree: HTMLParser) -> tuple[FundDistribution, ...]:

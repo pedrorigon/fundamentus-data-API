@@ -45,14 +45,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.asset_service = asset_service
     income_event_store = IncomeEventStore(settings.sqlite_cache_path)
     await income_event_store.startup()
+    status_income_source = StatusInvestIncomeSource(settings)
     app.state.income_event_service = IncomeEventService(
         income_event_store,
         [
             OfficialCompanyIncomeSource(settings),
-            FundosNetIncomeSource(settings),
+            FundosNetIncomeSource(settings, status_source=status_income_source),
             FundamentusIncomeSource(asset_service),
-            StatusInvestIncomeSource(settings),
+            status_income_source,
         ],
+        snapshot_overlap_days=settings.income_snapshot_overlap_days,
+        refresh_ttl_seconds=settings.income_refresh_ttl_seconds,
     )
     app.state.opportunity_service = OpportunityService(asset_service, settings)
     instrument_data_service = InstrumentDataService(settings)

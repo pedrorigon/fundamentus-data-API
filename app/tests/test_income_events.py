@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sqlite3
 from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal
@@ -269,6 +270,62 @@ async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path
         await store.events(["BBAS3"])
 
 
+@pytest.mark.asyncio
+async def test_store_migrates_legacy_observation_columns(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE income_event_observations (
+                source TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                source_version INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (source, source_event_id, source_version)
+            )
+            """
+        )
+    store = IncomeEventStore(path)
+
+    await store.startup()
+
+    assert await store.save_observations([_observation("cvm", authority=100)]) == 1
+    assert await store.observations(["BBAS3"])
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_replacement_retires_only_the_mutable_overlap(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    historical = _observation("cvm", authority=100).model_copy(
+        update={
+            "source_event_id": "historical",
+            "ex_date": date(2024, 6, 19),
+            "payment_date": date(2024, 7, 10),
+        }
+    )
+    current = _observation("cvm", authority=100)
+    await store.replace_observations(
+        [historical, current],
+        snapshot_sources=("cvm",),
+        complete_tickers=["BBAS3"],
+        snapshot_from=date(2025, 8, 27),
+    )
+
+    await store.replace_observations(
+        [],
+        snapshot_sources=("cvm",),
+        complete_tickers=["BBAS3"],
+        snapshot_from=date(2025, 8, 27),
+    )
+
+    assert await store.observations(["BBAS3"]) == [historical]
+    await store.close()
+
+
 class _Source:
     name = "fake"
     snapshot_sources: tuple[str, ...] = ("official",)
@@ -324,6 +381,24 @@ async def test_service_singleflight_batch_and_failed_source(tmp_path: Path) -> N
     refreshed = await service.refresh(request)
     assert refreshed.published == 1
     assert (await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))).events == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_reuses_fresh_complete_source_coverage(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+    )
+
+    await service.refresh(request)
+    await service.refresh(request)
+
+    assert source.calls == 1
+    assert len((await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))).events) == 1
     await store.close()
 
 
@@ -546,7 +621,7 @@ async def test_fundos_net_source_filters_requested_ticker() -> None:
     <DataPagamento>2026-08-14</DataPagamento></Rendimento></Provento></InformeRendimentos>
     </DadosEconomicoFinanceiros>"""
 
-    requests = {"index": 0, "document": 0}
+    requests = {"index": 0, "document": 0, "status": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         key = "index" if "pesquisar" in request.url.path else "document"
@@ -557,9 +632,25 @@ async def test_fundos_net_source_filters_requested_ticker() -> None:
             else httpx.Response(200, content=xml)
         )
 
+    def status_handler(_request: httpx.Request) -> httpx.Response:
+        requests["status"] += 1
+        return httpx.Response(
+            200,
+            text='<h3 class="title">CNPJ</h3><strong class="value">11.728.688/0001-47</strong>',
+        )
+
+    settings = Settings(
+        fundos_net_base_url="https://fnet.test",
+        status_invest_base_url="https://status.test",
+    )
+    status_source = StatusInvestIncomeSource(
+        settings,
+        httpx.MockTransport(status_handler),
+    )
     source = FundosNetIncomeSource(
-        Settings(fundos_net_base_url="https://fnet.test"),
+        settings,
         httpx.MockTransport(handler),
+        status_source=status_source,
     )
     result = await source.collect(
         [IncomeInstrumentRequest(ticker="HGLG11", name="CSHG Logística")],
@@ -578,7 +669,8 @@ async def test_fundos_net_source_filters_requested_ticker() -> None:
         ),
     )
     assert all(item.observations for item in repeated)
-    assert requests == {"index": 1, "document": 1}
+    assert result.coverage[0].complete is True
+    assert requests == {"index": 2, "document": 1, "status": 1}
 
 
 @pytest.mark.asyncio
@@ -591,7 +683,8 @@ async def test_fundos_net_source_preserves_empty_and_failed_coverage() -> None:
         [IncomeInstrumentRequest(ticker="HGLG11")],
         date(2026, 8, 27),
     )
-    assert result.coverage[0].status == "empty"
+    assert result.coverage[0].status == "partial"
+    assert result.coverage[0].complete is False
 
     invalid = FundosNetIncomeSource(
         Settings(fundos_net_base_url="https://fnet.test"),

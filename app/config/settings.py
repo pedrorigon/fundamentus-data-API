@@ -77,9 +77,12 @@ class Settings(BaseSettings):
     cvm_request_timeout_seconds: float = 120.0
     archive_download_max_bytes: int = 268435456
     income_document_max_bytes: int = 10 * 1024 * 1024
+    income_refresh_ttl_seconds: int = 1800
     income_source_index_ttl_seconds: int = 1800
+    income_snapshot_overlap_days: int = 365
     fundos_net_scan_limit: int = 300
     fundos_net_fallback_documents: int = 30
+    fundos_net_page_size: int = 36
     max_connections: int = 8
     max_keepalive_connections: int = 4
     upstream_concurrency: int = 4
