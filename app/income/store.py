@@ -36,6 +36,7 @@ class IncomeEventStore:
                 ticker TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 observed_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (source, source_event_id, source_version)
             );
             CREATE INDEX IF NOT EXISTS ix_income_observation_ticker
@@ -71,6 +72,7 @@ class IncomeEventStore:
             INSERT OR IGNORE INTO income_event_sequence (singleton, value) VALUES (1, 0);
             """
         )
+        await self._ensure_observation_active_column()
         await self._db.commit()
 
     async def close(self) -> None:
@@ -109,6 +111,57 @@ class IncomeEventStore:
             await db.commit()
         return len(rows)
 
+    async def replace_observations(
+        self,
+        observations: list[IncomeEventObservation],
+        *,
+        snapshot_sources: tuple[str, ...],
+        complete_tickers: list[str],
+    ) -> int:
+        """Atomically replace complete source/ticker snapshots and retain failed ones."""
+        if not snapshot_sources or not complete_tickers:
+            return 0
+        db = self._require_db()
+        normalized_tickers = list(dict.fromkeys(ticker.upper() for ticker in complete_tickers))
+        rows = [
+            (
+                item.source,
+                item.source_event_id,
+                item.source_version,
+                item.ticker.upper(),
+                _dump(item),
+                item.observed_at.isoformat(),
+                1,
+            )
+            for item in observations
+            if item.source in snapshot_sources and item.ticker.upper() in normalized_tickers
+        ]
+        source_placeholders = ",".join("?" for _ in snapshot_sources)
+        ticker_placeholders = ",".join("?" for _ in normalized_tickers)
+        deactivate = (
+            "UPDATE income_event_observations SET active = 0 "
+            f"WHERE source IN ({source_placeholders}) AND ticker IN ({ticker_placeholders})"
+        )  # noqa: S608 - placeholders are generated, never user-controlled
+        async with self._lock:
+            await db.execute(deactivate, [*snapshot_sources, *normalized_tickers])
+            if rows:
+                await db.executemany(
+                    """
+                    INSERT INTO income_event_observations (
+                        source, source_event_id, source_version, ticker,
+                        payload, observed_at, active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
+                        ticker = excluded.ticker,
+                        payload = excluded.payload,
+                        observed_at = excluded.observed_at,
+                        active = excluded.active
+                    """,
+                    rows,
+                )
+            await db.commit()
+        return len(rows)
+
     async def observations(self, tickers: list[str]) -> list[IncomeEventObservation]:
         if not tickers:
             return []
@@ -122,7 +175,7 @@ class IncomeEventStore:
                            ORDER BY source_version DESC, observed_at DESC
                        ) AS version_rank
                 FROM income_event_observations
-                WHERE ticker IN ({placeholders})
+                WHERE ticker IN ({placeholders}) AND active = 1
             ) latest
             WHERE version_rank = 1
             ORDER BY observed_at, source, source_event_id
@@ -333,6 +386,15 @@ class IncomeEventStore:
         if self._db is None:
             raise RuntimeError("IncomeEventStore was not started")
         return self._db
+
+    async def _ensure_observation_active_column(self) -> None:
+        db = self._require_db()
+        async with db.execute("PRAGMA table_info(income_event_observations)") as cursor:
+            columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "active" not in columns:
+            await db.execute(
+                "ALTER TABLE income_event_observations ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
+            )
 
 
 def _dump(value: object) -> str:

@@ -271,6 +271,7 @@ async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path
 
 class _Source:
     name = "fake"
+    snapshot_sources: tuple[str, ...] = ("official",)
 
     def __init__(self, *, delay: float = 0, fail: bool = False) -> None:
         self.delay = delay
@@ -317,7 +318,33 @@ async def test_service_singleflight_batch_and_failed_source(tmp_path: Path) -> N
     assert len(batch.events) == 1
     changed = await service.changes(0, 100)
     assert changed.events == batch.events
+
+    source.fail = False
+    source.collect = _empty_source_collect.__get__(source, _Source)  # type: ignore[method-assign]
+    refreshed = await service.refresh(request)
+    assert refreshed.published == 1
+    assert (await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))).events == []
     await store.close()
+
+
+async def _empty_source_collect(
+    self: _Source,
+    instruments: Sequence[IncomeInstrumentRequest],
+    as_of: date,
+) -> IncomeSourceResult:
+    del as_of
+    self.calls += 1
+    return IncomeSourceResult(
+        [],
+        [
+            IncomeSourceCoverage(
+                source=self.name,
+                ticker=instruments[0].ticker,
+                status="empty",
+                complete=True,
+            )
+        ],
+    )
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,7 @@ class IncomeSourceResult:
 
 class IncomeSource(Protocol):
     name: str
+    snapshot_sources: tuple[str, ...]
 
     async def collect(
         self,
@@ -52,6 +53,7 @@ class IncomeSource(Protocol):
 
 class FundamentusIncomeSource:
     name = "fundamentus"
+    snapshot_sources: tuple[str, ...] = ("fundamentus",)
 
     def __init__(self, assets: AssetService) -> None:
         self.assets = assets
@@ -84,6 +86,7 @@ class FundamentusIncomeSource:
 
 class StatusInvestIncomeSource:
     name = "status_invest"
+    snapshot_sources: tuple[str, ...] = ("status_invest",)
 
     def __init__(
         self,
@@ -139,6 +142,7 @@ class StatusInvestIncomeSource:
 
 class OfficialCompanyIncomeSource:
     name = "official_companies"
+    snapshot_sources: tuple[str, ...] = ("b3", "cvm")
 
     def __init__(
         self,
@@ -226,9 +230,10 @@ class OfficialCompanyIncomeSource:
             *(self._cvm_document(client, instrument, row) for row in latest),
             return_exceptions=True,
         )
-        return [
-            event for result in results if not isinstance(result, BaseException) for event in result
-        ]
+        failure = next((result for result in results if isinstance(result, BaseException)), None)
+        if failure is not None:
+            raise RuntimeError("CVM income document refresh was incomplete") from failure
+        return [event for result in results if isinstance(result, list) for event in result]
 
     async def _cvm_rows(self, client: httpx.AsyncClient, year: int) -> list[dict[str, str]]:
         async with self._cvm_lock:
@@ -277,6 +282,7 @@ class OfficialCompanyIncomeSource:
 
 class FundosNetIncomeSource:
     name = "fundos_net"
+    snapshot_sources: tuple[str, ...] = ("fundos_net",)
 
     def __init__(
         self,
@@ -341,10 +347,13 @@ class FundosNetIncomeSource:
             parsed = await asyncio.gather(
                 *(download(row) for row in candidates), return_exceptions=True
             )
+            failure = next((result for result in parsed if isinstance(result, BaseException)), None)
+            if failure is not None:
+                raise RuntimeError("Fundos.NET document refresh was incomplete") from failure
         return [
             event
             for result in parsed
-            if not isinstance(result, BaseException)
+            if isinstance(result, list)
             for event in result
             if event.ticker in requested
         ]

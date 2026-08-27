@@ -60,9 +60,14 @@ class IncomeEventService:
                 continue
             observations.extend(result.observations)
             coverage.extend(result.coverage)
+            complete_tickers = [item.ticker for item in result.coverage if item.complete]
+            await self.store.replace_observations(
+                result.observations,
+                snapshot_sources=source.snapshot_sources,
+                complete_tickers=complete_tickers,
+            )
             if any(not item.complete for item in result.coverage):
                 failed_sources.append(source.name)
-        await self.store.save_observations(observations)
         await self.store.save_coverage(coverage)
         tickers = [item.ticker for item in instruments]
         resolved = resolve_income_events(await self.store.observations(tickers))
