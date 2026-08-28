@@ -484,6 +484,45 @@ async def test_fixed_income_endpoint_returns_resolved_values() -> None:
     assert response.json()["unavailable_reasons"] == {}
 
 
+@pytest.mark.asyncio
+async def test_fixed_income_endpoint_serializes_identifier_validation_errors() -> None:
+    app = create_app()
+    app.dependency_overrides[get_fixed_income_valuation_service] = object
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/fixed-income/valuations/resolve",
+            json={
+                "identifiers": [
+                    "PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"
+                ],
+                "dates": ["2026-08-28"],
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Invalid request parameters.",
+            "retryable": False,
+            "details": [
+                {
+                    "type": "value_error",
+                    "loc": ["body", "identifiers"],
+                    "msg": "Value error, invalid fixed-income identifier",
+                    "input": [
+                        "PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"
+                    ],
+                    "ctx": {"error": "invalid fixed-income identifier"},
+                }
+            ],
+        }
+    }
+
+
 def test_fixed_income_dependency_reads_application_state() -> None:
     service = object()
     request = SimpleNamespace(
