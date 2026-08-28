@@ -766,6 +766,9 @@ async def test_official_company_source_loads_and_caches_income_adjustments(
         nonlocal document_requests
         if request.url.host == "cvm.test":
             document_requests += 1
+            assert request.headers["referer"] == (
+                "https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx"
+            )
             return httpx.Response(200, content=b"pdf")
         if "ipe_cia_aberta_2026" in request.url.path:
             return httpx.Response(200, content=archive)

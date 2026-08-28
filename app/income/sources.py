@@ -211,6 +211,7 @@ class OfficialCompanyIncomeSource:
         self._cvm_documents: dict[str, tuple[float, str]] = {}
         self._cvm_document_tasks: dict[str, asyncio.Task[str]] = {}
         self._cvm_document_lock = asyncio.Lock()
+        self._cvm_download_semaphore = asyncio.Semaphore(settings.upstream_concurrency)
 
     async def collect(
         self,
@@ -371,9 +372,16 @@ class OfficialCompanyIncomeSource:
                     self._cvm_document_tasks.pop(link, None)
 
     async def _fetch_cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
-        response = await client.get(link)
-        response.raise_for_status()
-        content = await read_bounded_body(response, self.settings.income_document_max_bytes)
+        async with self._cvm_download_semaphore:
+            response = await client.get(
+                link,
+                headers={"Referer": "https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx"},
+            )
+            response.raise_for_status()
+            content = await read_bounded_body(
+                response,
+                self.settings.income_document_max_bytes,
+            )
         return _pdf_text(content)
 
 
