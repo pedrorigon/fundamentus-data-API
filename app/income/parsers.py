@@ -236,7 +236,7 @@ def parse_cvm_income_adjustment_text(
         return []
 
     matches = re.finditer(
-        r"ATUALIZACAO\s+PELA\s+TAXA\s+SELIC\s*\(([^)]{1,80})\)\s*"
+        r"ATUALIZACAO\s+PELA\s+TAXA\s+SELIC(?:\s*\(([^)]{1,80})\))?\s*"
         r"(?:R\$\s*)?([0-9]+(?:[.,][0-9]+)?)(?:\s*R\$)?",
         folded,
     )
@@ -255,7 +255,7 @@ def parse_cvm_income_adjustment_text(
                 ex_date=ex_date,
                 payment_date=payment_date,
                 unit_price=amount,
-                reference_period=match.group(1).strip().title(),
+                reference_period=(match.group(1) or "Proventos").strip().title(),
                 source_version=max(version, 1),
                 authority=100,
                 payload_hash=hashlib.sha256(text.encode()).hexdigest(),

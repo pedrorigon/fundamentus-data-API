@@ -257,6 +257,15 @@ def test_cvm_adjustment_parser_reads_each_taxable_selic_update() -> None:
         version=1,
     )
 
+    first_installment = parse_cvm_income_adjustment_text(
+        """efetuará, no dia 20/02/2026, o pagamento da primeira parcela,
+        data base para o pagamento a posição acionária de 22/12/2025.
+        Atualização pela taxa Selic R$ 0,00892089""",
+        ticker="PETR4",
+        document_id="1476807",
+        version=1,
+    )
+
     assert [event.unit_price for event in events] == [
         Decimal("0.00895486"),
         Decimal("0.00529224"),
@@ -265,6 +274,9 @@ def test_cvm_adjustment_parser_reads_each_taxable_selic_update() -> None:
     assert all(event.payment_date == date(2026, 3, 20) for event in events)
     assert all(event.event_type == "Rendimento" for event in events)
     assert len({event.source_event_id for event in events}) == 2
+    assert first_installment[0].unit_price == Decimal("0.00892089")
+    assert first_installment[0].payment_date == date(2026, 2, 20)
+    assert first_installment[0].reference_period == "Proventos"
     assert (
         parse_cvm_income_adjustment_text(
             "Atualização pela taxa Selic (JCP) R$ 0,01",

@@ -211,7 +211,9 @@ class OfficialCompanyIncomeSource:
         self._cvm_documents: dict[str, tuple[float, str]] = {}
         self._cvm_document_tasks: dict[str, asyncio.Task[str]] = {}
         self._cvm_document_lock = asyncio.Lock()
-        self._cvm_download_semaphore = asyncio.Semaphore(settings.upstream_concurrency)
+        self._cvm_download_semaphore = asyncio.Semaphore(
+            min(max(settings.upstream_concurrency, 1), 2)
+        )
 
     async def collect(
         self,
