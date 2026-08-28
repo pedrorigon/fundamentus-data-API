@@ -299,6 +299,40 @@ def test_resolver_preserves_installments_confirmed_by_one_lineage() -> None:
     assert events[0].event_id != events[1].event_id
 
 
+def test_resolver_replaces_stale_payment_date_only_when_revision_is_confirmed() -> None:
+    stale = _observation(
+        "cvm-stale",
+        lineage="official:cvm",
+        authority=100,
+        payment_date=date(2026, 8, 31),
+        version=1,
+    )
+    corrected = _observation(
+        "cvm-corrected",
+        lineage="official:cvm",
+        authority=100,
+        payment_date=date(2026, 8, 28),
+        version=2,
+    )
+    b3 = _observation(
+        "b3",
+        lineage="official:b3",
+        authority=90,
+        payment_date=date(2026, 8, 28),
+    )
+
+    confirmed = resolve_income_events([stale, corrected, b3])
+    unconfirmed = resolve_income_events([stale, corrected])
+
+    assert len(confirmed) == 1
+    assert confirmed[0].payment_date == date(2026, 8, 28)
+    assert confirmed[0].status is IncomeEventStatus.verified
+    assert len(unconfirmed) == 1
+    assert unconfirmed[0].payment_date == date(2026, 8, 28)
+    assert unconfirmed[0].status is IncomeEventStatus.conflicted
+    assert unconfirmed[0].projectable is False
+
+
 def test_resolver_requires_secondary_payment_consensus_and_uses_unique_majority() -> None:
     first = _observation("first", lineage="independent:first")
     disagreement = _observation(

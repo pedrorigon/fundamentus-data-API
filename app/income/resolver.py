@@ -67,6 +67,9 @@ def _resolve_occurrences(
     key: tuple[str, str, date, str],
     observations: list[IncomeEventObservation],
 ) -> list[CanonicalIncomeEvent]:
+    observations, unresolved_revision = _reconcile_payment_revisions(observations)
+    if unresolved_revision:
+        return [_resolve_group(key, observations)]
     dates_by_lineage: dict[str, set[date]] = defaultdict(set)
     for item in observations:
         assert item.payment_date is not None
@@ -81,6 +84,56 @@ def _resolve_occurrences(
     return [
         _resolve_group(key, occurrence) for _payment_date, occurrence in sorted(occurrences.items())
     ]
+
+
+def _reconcile_payment_revisions(
+    observations: list[IncomeEventObservation],
+) -> tuple[list[IncomeEventObservation], bool]:
+    """Discard superseded dates only when an independent lineage confirms the revision."""
+    active = [
+        item
+        for item in observations
+        if item.source_status.lower() not in {"cancelled", "canceled"}
+        and item.payment_date is not None
+    ]
+    support: dict[date, set[str]] = defaultdict(set)
+    by_lineage: dict[str, list[IncomeEventObservation]] = defaultdict(list)
+    for item in active:
+        assert item.payment_date is not None
+        support[item.payment_date].add(item.lineage)
+        by_lineage[item.lineage].append(item)
+
+    superseded_ids: set[int] = set()
+    unresolved_revision = False
+    for lineage, lineage_items in by_lineage.items():
+        versions = {item.source_version for item in lineage_items}
+        if len(versions) < 2:
+            continue
+        latest_version = max(versions)
+        latest_dates = {
+            item.payment_date
+            for item in lineage_items
+            if item.source_version == latest_version and item.payment_date is not None
+        }
+        revised_items = [
+            item
+            for item in lineage_items
+            if item.source_version < latest_version and item.payment_date not in latest_dates
+        ]
+        for item in revised_items:
+            assert item.payment_date is not None
+            revised_date_confirmed = any(
+                any(other != lineage for other in support[payment_date])
+                for payment_date in latest_dates
+            )
+            old_date_confirmed = any(other != lineage for other in support[item.payment_date])
+            if revised_date_confirmed and not old_date_confirmed:
+                superseded_ids.add(id(item))
+            elif not old_date_confirmed:
+                unresolved_revision = True
+
+    reconciled = [item for item in observations if id(item) not in superseded_ids]
+    return reconciled, unresolved_revision
 
 
 def _resolve_group(
