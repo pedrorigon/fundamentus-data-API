@@ -207,6 +207,63 @@ def parse_cvm_income_report_text(
     return observations
 
 
+def parse_cvm_income_adjustment_text(
+    text: str,
+    *,
+    ticker: str,
+    document_id: str,
+    version: int,
+) -> list[IncomeEventObservation]:
+    normalized = _normalize_pdf_text(text)
+    folded = _fold(normalized).upper()
+    ex_date = _first_date_after(
+        folded,
+        (
+            r"DATA BASE PARA O PAGAMENTO.{0,80}?POSICAO ACIONARIA",
+            r"POSICAO ACIONARIA",
+            r"DATA BASE",
+        ),
+    )
+    payment_date = _first_date_after(
+        folded,
+        (
+            r"EFETUARA.{0,30}?NO DIA",
+            r"PAGAMENTO.{0,30}?NO DIA",
+            r"PAGA.{0,30}?EM",
+        ),
+    )
+    if ex_date is None or payment_date is None:
+        return []
+
+    matches = re.finditer(
+        r"ATUALIZACAO\s+PELA\s+TAXA\s+SELIC\s*\(([^)]{1,80})\)\s*"
+        r"(?:R\$\s*)?([0-9]+(?:[.,][0-9]+)?)(?:\s*R\$)?",
+        folded,
+    )
+    observations: list[IncomeEventObservation] = []
+    for ordinal, match in enumerate(matches):
+        amount = _decimal(match.group(2))
+        if amount is None or amount <= 0:
+            continue
+        observations.append(
+            IncomeEventObservation(
+                source="cvm",
+                lineage="official:cvm",
+                source_event_id=f"cvm:{document_id}:adjustment:{ordinal}",
+                ticker=ticker,
+                event_type="Rendimento",
+                ex_date=ex_date,
+                payment_date=payment_date,
+                unit_price=amount,
+                reference_period=match.group(1).strip().title(),
+                source_version=max(version, 1),
+                authority=100,
+                payload_hash=hashlib.sha256(text.encode()).hexdigest(),
+            )
+        )
+    return observations
+
+
 def _fnet_event_nodes(provento: ET.Element) -> list[tuple[str, ET.Element]]:
     aliases = (("Rendimento", "Rendimento"), ("Amortizacao", "Amortização"))
     return [(label, node) for tag, label in aliases if (node := provento.find(tag)) is not None]
@@ -240,6 +297,14 @@ def _dates(value: str) -> list[date]:
         for token in re.findall(r"\b\d{2}/\d{2}/\d{4}\b", value)
         if (parsed := _br_date(token))
     ]
+
+
+def _first_date_after(text: str, markers: tuple[str, ...]) -> date | None:
+    for marker in markers:
+        match = re.search(rf"{marker}[^0-9]{{0,40}}(\d{{2}}/\d{{2}}/\d{{4}})", text)
+        if match and (parsed := _br_date(match.group(1))) is not None:
+            return parsed
+    return None
 
 
 def _xml_text(node: ET.Element, tag: str) -> str | None:
@@ -301,6 +366,7 @@ def _fold(value: str) -> str:
 
 __all__ = [
     "parse_b3_income_events",
+    "parse_cvm_income_adjustment_text",
     "parse_cvm_income_report_text",
     "parse_fundos_net_xml",
     "parse_status_invest_income_events",

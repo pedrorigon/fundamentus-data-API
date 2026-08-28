@@ -21,6 +21,7 @@ from app.config import Settings
 from app.core.archive_safety import open_validated_zip, read_bounded_body
 from app.income.parsers import (
     parse_b3_income_events,
+    parse_cvm_income_adjustment_text,
     parse_cvm_income_report_text,
     parse_fundos_net_xml,
     parse_status_invest_income_events,
@@ -207,6 +208,9 @@ class OfficialCompanyIncomeSource:
         self.transport = transport
         self._cvm_index: dict[int, tuple[float, list[dict[str, str]]]] = {}
         self._cvm_lock = asyncio.Lock()
+        self._cvm_documents: dict[str, tuple[float, str]] = {}
+        self._cvm_document_tasks: dict[str, asyncio.Task[str]] = {}
+        self._cvm_document_lock = asyncio.Lock()
 
     async def collect(
         self,
@@ -275,13 +279,17 @@ class OfficialCompanyIncomeSource:
         rows: list[dict[str, str]] = []
         for year in years:
             rows.extend(await self._cvm_rows(client, year))
-        matches = [
-            row
-            for row in rows
-            if row.get("Codigo_CVM", "").lstrip("0") == cvm_code.lstrip("0")
-            and _fold(row.get("Categoria", "")) == "RELATORIO PROVENTOS"
+        company_rows = [
+            row for row in rows if row.get("Codigo_CVM", "").lstrip("0") == cvm_code.lstrip("0")
         ]
-        latest = _latest_cvm_documents(matches)
+        reports = [
+            row for row in company_rows if _fold(row.get("Categoria", "")) == "RELATORIO PROVENTOS"
+        ]
+        adjustments = [row for row in company_rows if _cvm_income_adjustment(row)]
+        latest = [
+            *_latest_cvm_documents(reports, limit=24),
+            *_latest_cvm_documents(adjustments, limit=12),
+        ]
         results = await asyncio.gather(
             *(self._cvm_document(client, instrument, row) for row in latest),
             return_exceptions=True,
@@ -321,19 +329,52 @@ class OfficialCompanyIncomeSource:
         link = row.get("Link_Download", "").strip()
         if not link:
             return []
-        response = await client.get(link)
-        response.raise_for_status()
-        content = await read_bounded_body(response, self.settings.income_document_max_bytes)
-        text = _pdf_text(content)
-        events = parse_cvm_income_report_text(
+        text = await self._cvm_document_text(client, link)
+        parser = (
+            parse_cvm_income_adjustment_text
+            if _cvm_income_adjustment(row)
+            else parse_cvm_income_report_text
+        )
+        events = parser(
             text,
             ticker=instrument.ticker,
             document_id=_cvm_document_id(row),
             version=_positive_int(row.get("Versao")),
         )
         if instrument.isin:
-            return [item for item in events if item.isin == instrument.isin]
+            return [item for item in events if item.isin in {None, instrument.isin}]
         return events
+
+    async def _cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
+        async with self._cvm_document_lock:
+            cached = self._cvm_documents.get(link)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._cvm_document_tasks.get(link)
+            if task is None:
+                task = asyncio.create_task(self._fetch_cvm_document_text(client, link))
+                self._cvm_document_tasks[link] = task
+        try:
+            text = await task
+            async with self._cvm_document_lock:
+                self._cvm_documents[link] = (time.monotonic(), text)
+                _trim_ttl_cache(
+                    self._cvm_documents,
+                    self.settings.ticker_cache_max_entries,
+                )
+            return text
+        finally:
+            async with self._cvm_document_lock:
+                if self._cvm_document_tasks.get(link) is task:
+                    self._cvm_document_tasks.pop(link, None)
+
+    async def _fetch_cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
+        response = await client.get(link)
+        response.raise_for_status()
+        content = await read_bounded_body(response, self.settings.income_document_max_bytes)
+        return _pdf_text(content)
 
 
 class FundosNetIncomeSource:
@@ -719,7 +760,11 @@ def _read_cvm_zip(payload: bytes) -> list[dict[str, str]]:
             return list(csv.DictReader(wrapper, delimiter=";"))
 
 
-def _latest_cvm_documents(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+def _latest_cvm_documents(
+    rows: list[dict[str, str]],
+    *,
+    limit: int = 24,
+) -> list[dict[str, str]]:
     latest: dict[str, dict[str, str]] = {}
     for row in rows:
         protocol = _cvm_document_id(row)
@@ -728,7 +773,18 @@ def _latest_cvm_documents(rows: list[dict[str, str]]) -> list[dict[str, str]]:
             existing.get("Versao")
         ):
             latest[protocol] = row
-    return sorted(latest.values(), key=lambda row: row.get("Data_Entrega", ""), reverse=True)[:24]
+    return sorted(latest.values(), key=lambda row: row.get("Data_Entrega", ""), reverse=True)[
+        : max(limit, 0)
+    ]
+
+
+def _cvm_income_adjustment(row: dict[str, str]) -> bool:
+    if _fold(row.get("Categoria", "")) != "COMUNICADO AO MERCADO":
+        return False
+    subject = _fold(row.get("Assunto", ""))
+    return "ATUALIZACAO MONETARIA" in subject and any(
+        term in subject for term in ("REMUNERACAO", "PROVENT", "DIVID", "JUROS")
+    )
 
 
 def _cvm_document_id(row: dict[str, str]) -> str:

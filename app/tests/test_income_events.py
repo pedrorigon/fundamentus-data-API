@@ -17,6 +17,7 @@ from app.api.dependencies import get_income_event_service
 from app.config import Settings
 from app.income.parsers import (
     parse_b3_income_events,
+    parse_cvm_income_adjustment_text,
     parse_cvm_income_report_text,
     parse_fundos_net_xml,
     parse_status_invest_income_events,
@@ -237,6 +238,42 @@ def test_cvm_parser_assigns_each_installment_its_payment_date() -> None:
     events = parse_cvm_income_report_text(text, ticker="PETR4", document_id="1506014", version=1)
 
     assert [event.payment_date for event in events] == [date(2026, 5, 20), date(2026, 6, 22)]
+
+
+def test_cvm_adjustment_parser_reads_each_taxable_selic_update() -> None:
+    text = """Petrobras informa sobre atualização monetária da remuneração aos acionistas
+    informa que efetuará, no dia 20/03/2026, o pagamento da segunda parcela,
+    tendo como data base para o pagamento a posição acionária de 22/12/2025.
+    Dividendos R$ 0,29642144
+    Atualização pela taxa Selic (Dividendos) R$ 0,00895486
+    Juros sobre Capital Próprio (JCP) R$ 0,17518233
+    Atualização pela taxa Selic (JCP) 0,00529224R$
+    """
+
+    events = parse_cvm_income_adjustment_text(
+        text,
+        ticker="PETR4",
+        document_id="1490561",
+        version=1,
+    )
+
+    assert [event.unit_price for event in events] == [
+        Decimal("0.00895486"),
+        Decimal("0.00529224"),
+    ]
+    assert all(event.ex_date == date(2025, 12, 22) for event in events)
+    assert all(event.payment_date == date(2026, 3, 20) for event in events)
+    assert all(event.event_type == "Rendimento" for event in events)
+    assert len({event.source_event_id for event in events}) == 2
+    assert (
+        parse_cvm_income_adjustment_text(
+            "Atualização pela taxa Selic (JCP) R$ 0,01",
+            ticker="PETR4",
+            document_id="invalid",
+            version=1,
+        )
+        == []
+    )
 
 
 def test_resolver_prefers_authority_and_attaches_generic_official_type() -> None:
@@ -702,6 +739,56 @@ async def test_official_company_source_combines_b3_and_cvm(
         date(2026, 8, 27),
     )
     assert archive_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_loads_and_caches_income_adjustments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;"
+        "Assunto;Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;PETROBRAS;9512;2026-03-16;Comunicado ao Mercado;;;"
+        "Petrobras informa sobre atualização monetária da remuneração aos acionistas;"
+        "2026-03-16;AP;;1;https://cvm.test/adjustment.pdf\n"
+        "00;PETROBRAS;9512;2026-03-16;Comunicado ao Mercado;;;Operational update;"
+        "2026-03-16;AP;;1;https://cvm.test/unrelated.pdf\n"
+    ).encode("iso-8859-1")
+    archive = _zip(csv_payload)
+    b3 = [{"codeCVM": "9512", "cashDividends": []}]
+    adjustment = (
+        "efetuará, no dia 20/03/2026, o pagamento; data base para o pagamento a posição "
+        "acionária de 22/12/2025; Atualização pela taxa Selic (JCP) R$ 0,00529224"
+    )
+    document_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal document_requests
+        if request.url.host == "cvm.test":
+            document_requests += 1
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: adjustment)
+    source = OfficialCompanyIncomeSource(
+        Settings(
+            b3_listed_companies_base_url="https://b3.test",
+            cvm_open_data_base_url="https://dados.test",
+        ),
+        httpx.MockTransport(handler),
+    )
+    instrument = IncomeInstrumentRequest(ticker="PETR4", isin="BRPETRACNPR6")
+
+    first = await source.collect([instrument], date(2026, 8, 28))
+    second = await source.collect([instrument], date(2026, 8, 28))
+
+    assert [item.unit_price for item in first.observations] == [Decimal("0.00529224")]
+    assert second.observations
+    assert document_requests == 1
 
 
 @pytest.mark.asyncio
