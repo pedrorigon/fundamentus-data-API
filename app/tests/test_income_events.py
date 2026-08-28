@@ -122,6 +122,24 @@ def test_b3_parser_keeps_equal_installments_paid_on_different_dates() -> None:
     assert events[0].source_event_id != events[1].source_event_id
 
 
+def test_b3_parser_rejects_unknown_payment_date_sentinel() -> None:
+    row = {
+        "isinCode": "BREGIEACNOR9",
+        "label": "DIVIDENDO",
+        "lastDatePrior": "20/08/2026",
+        "paymentDate": "31/12/9999",
+        "rate": "0,54420748",
+    }
+
+    events, _code = parse_b3_income_events(
+        [{"cashDividends": [row]}],
+        ticker="EGIE3",
+        requested_isin="BREGIEACNOR9",
+    )
+
+    assert events == []
+
+
 def test_fundos_net_parser_reads_income_and_amortization() -> None:
     xml = b"""<?xml version="1.0" encoding="UTF-8"?>
     <DadosEconomicoFinanceiros><InformeRendimentos><Provento>

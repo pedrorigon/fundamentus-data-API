@@ -14,6 +14,8 @@ from selectolax.parser import HTMLParser
 from app.income.resolver import canonical_event_type
 from app.models.income_events import IncomeEventObservation
 
+MAX_SUPPORTED_INCOME_YEAR = 2099
+
 
 def parse_b3_income_events(
     payload: Any,
@@ -250,7 +252,8 @@ def _br_date(value: Any) -> date | None:
     if text is None:
         return None
     try:
-        return datetime.strptime(text, "%d/%m/%Y").date()
+        parsed = datetime.strptime(text, "%d/%m/%Y").date()
+        return parsed if parsed.year <= MAX_SUPPORTED_INCOME_YEAR else None
     except ValueError:
         return None
 
@@ -260,7 +263,8 @@ def _iso_date(value: Any) -> date | None:
     if text is None:
         return None
     try:
-        return date.fromisoformat(text[:10])
+        parsed = date.fromisoformat(text[:10])
+        return parsed if parsed.year <= MAX_SUPPORTED_INCOME_YEAR else None
     except ValueError:
         return None
 
