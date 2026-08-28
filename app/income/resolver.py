@@ -54,10 +54,33 @@ def resolve_income_events(
         compatible = [key for key in grouped if (key[0], key[2], key[3]) == base]
         key = compatible[0] if len(compatible) == 1 else (base[0], "Provento", base[1], base[2])
         grouped[key].append(item)
+    resolved = [
+        event for key, group in grouped.items() for event in _resolve_occurrences(key, group)
+    ]
     return sorted(
-        (_resolve_group(key, group) for key, group in grouped.items()),
+        resolved,
         key=lambda item: (item.ticker, item.payment_date, item.event_type, item.event_id),
     )
+
+
+def _resolve_occurrences(
+    key: tuple[str, str, date, str],
+    observations: list[IncomeEventObservation],
+) -> list[CanonicalIncomeEvent]:
+    dates_by_lineage: dict[str, set[date]] = defaultdict(set)
+    for item in observations:
+        assert item.payment_date is not None
+        dates_by_lineage[item.lineage].add(item.payment_date)
+    if not any(len(payment_dates) > 1 for payment_dates in dates_by_lineage.values()):
+        return [_resolve_group(key, observations)]
+
+    occurrences: dict[date, list[IncomeEventObservation]] = defaultdict(list)
+    for item in observations:
+        assert item.payment_date is not None
+        occurrences[item.payment_date].append(item)
+    return [
+        _resolve_group(key, occurrence) for _payment_date, occurrence in sorted(occurrences.items())
+    ]
 
 
 def _resolve_group(
@@ -82,7 +105,9 @@ def _resolve_group(
     status = _status(observations, authoritative, lineages)
     confidence = _confidence(status)
     field_source = _field_sources(ordered)
-    identity = "|".join((ticker, event_type, ex_date.isoformat(), _amount_bucket(amount)))
+    identity = "|".join(
+        (ticker, event_type, ex_date.isoformat(), payment.isoformat(), _amount_bucket(amount))
+    )
     return CanonicalIncomeEvent(
         event_id=f"income:{hashlib.sha256(identity.encode()).hexdigest()[:32]}",
         ticker=ticker,

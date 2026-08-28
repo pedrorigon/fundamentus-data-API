@@ -44,6 +44,7 @@ def parse_b3_income_events(
             isin or ticker,
             canonical_event_type(_text(row.get("label")) or "Provento"),
             ex_date.isoformat(),
+            payment_date.isoformat(),
             str(amount),
         )
         if source_id in seen:
@@ -164,9 +165,7 @@ def parse_cvm_income_report_text(
     normalized = _normalize_pdf_text(text)
     ex_date = _cvm_ex_date(normalized)
     table = _after_label(normalized, "Código ISIN")
-    payment_dates = _dates(table)
-    payment_date = payment_dates[0] if payment_dates else None
-    if ex_date is None or payment_date is None:
+    if ex_date is None:
         return []
     matches = list(
         re.finditer(
@@ -180,6 +179,12 @@ def parse_cvm_income_report_text(
         amount = _decimal(match.group(2))
         if amount is None or amount <= 0:
             continue
+        next_match_start = (
+            matches[ordinal + 1].start() if ordinal + 1 < len(matches) else len(table)
+        )
+        payment_dates = _dates(table[match.end() : next_match_start])
+        if not payment_dates:
+            continue
         isin = match.group(1).upper()
         observations.append(
             IncomeEventObservation(
@@ -190,7 +195,7 @@ def parse_cvm_income_report_text(
                 isin=isin,
                 event_type="Provento",
                 ex_date=ex_date,
-                payment_date=payment_date,
+                payment_date=payment_dates[0],
                 unit_price=amount,
                 source_version=max(version, 1),
                 authority=100,

@@ -103,6 +103,25 @@ def test_b3_parser_filters_isin_deduplicates_and_returns_cvm_code() -> None:
     assert invalid == []
 
 
+def test_b3_parser_keeps_equal_installments_paid_on_different_dates() -> None:
+    row = {
+        "isinCode": "BRPETRACNPR6",
+        "label": "JRS CAP PROPRIO",
+        "lastDatePrior": "22/04/2026",
+        "paymentDate": "20/05/2026",
+        "rate": "0,31311454000",
+    }
+
+    events, _code = parse_b3_income_events(
+        [{"cashDividends": [row, {**row, "paymentDate": "22/06/2026"}]}],
+        ticker="PETR4",
+        requested_isin="BRPETRACNPR6",
+    )
+
+    assert [event.payment_date for event in events] == [date(2026, 5, 20), date(2026, 6, 22)]
+    assert events[0].source_event_id != events[1].source_event_id
+
+
 def test_fundos_net_parser_reads_income_and_amortization() -> None:
     xml = b"""<?xml version="1.0" encoding="UTF-8"?>
     <DadosEconomicoFinanceiros><InformeRendimentos><Provento>
@@ -189,6 +208,19 @@ def test_cvm_parser_repairs_wrapped_isin_and_amount() -> None:
     )
 
 
+def test_cvm_parser_assigns_each_installment_its_payment_date() -> None:
+    text = """Provento
+    Ultimo dia de negociação com Direitos 22/04/2026
+    Código ISIN Valor Bruto (R$/Unidade) Data Pagamento
+    BRPETRACNPR6 0,31311454000 Anual 2025 20/05/2026
+    BRPETRACNPR6 0,31311454000 Anual 2025 22/06/2026
+    """
+
+    events = parse_cvm_income_report_text(text, ticker="PETR4", document_id="1506014", version=1)
+
+    assert [event.payment_date for event in events] == [date(2026, 5, 20), date(2026, 6, 22)]
+
+
 def test_resolver_prefers_authority_and_attaches_generic_official_type() -> None:
     observations = [
         _observation("cvm", event_type="Provento", authority=100),
@@ -222,6 +254,31 @@ def test_resolver_requires_independent_lineages_and_detects_official_conflict() 
     ]
     assert resolve_income_events(conflicting)[0].status is IncomeEventStatus.conflicted
     assert resolve_income_events([_observation("invalid", amount="0")]) == []
+
+
+def test_resolver_preserves_installments_confirmed_by_one_lineage() -> None:
+    observations = [
+        _observation("b3-may", lineage="official:b3", authority=90),
+        _observation(
+            "b3-june",
+            lineage="official:b3",
+            authority=90,
+            payment_date=date(2026, 10, 11),
+        ),
+        _observation("cvm-may", lineage="official:cvm", authority=100),
+        _observation(
+            "cvm-june",
+            lineage="official:cvm",
+            authority=100,
+            payment_date=date(2026, 10, 11),
+        ),
+    ]
+
+    events = resolve_income_events(observations)
+
+    assert [event.payment_date for event in events] == [date(2026, 9, 11), date(2026, 10, 11)]
+    assert all(event.status is IncomeEventStatus.verified for event in events)
+    assert events[0].event_id != events[1].event_id
 
 
 def test_resolver_requires_secondary_payment_consensus_and_uses_unique_majority() -> None:
