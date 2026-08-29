@@ -539,9 +539,7 @@ async def test_fixed_income_endpoint_serializes_identifier_validation_errors() -
         response = await client.post(
             "/v1/fixed-income/valuations/resolve",
             json={
-                "identifiers": [
-                    "PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"
-                ],
+                "identifiers": ["PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"],
                 "dates": ["2026-08-28"],
             },
         )
@@ -557,9 +555,7 @@ async def test_fixed_income_endpoint_serializes_identifier_validation_errors() -
                     "type": "value_error",
                     "loc": ["body", "identifiers"],
                     "msg": "Value error, invalid fixed-income identifier",
-                    "input": [
-                        "PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"
-                    ],
+                    "input": ["PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"],
                     "ctx": {"error": "invalid fixed-income identifier"},
                 }
             ],
