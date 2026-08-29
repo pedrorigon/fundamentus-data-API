@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 
     fundamentus_base_url: str = "https://www.fundamentus.com.br"
     b3_bdi_base_url: str = "https://arquivos.b3.com.br/bdi"
+    fixed_income_public_history_months: int = 18
     b3_historical_quote_base_url: str = "https://bvmf.bmfbovespa.com.br/InstDados/SerHist"
     anbima_debenture_base_url: str = (
         "https://www.anbima.com.br/informacoes/merc-sec-debentures/arqs"

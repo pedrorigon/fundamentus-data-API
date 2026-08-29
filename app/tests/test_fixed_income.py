@@ -355,6 +355,25 @@ async def test_service_uses_previous_business_day_and_caches_files() -> None:
     assert provider.calls == [friday]
 
 
+@pytest.mark.asyncio
+async def test_service_skips_dates_outside_the_public_history_window() -> None:
+    class Provider:
+        async def prices(self, _reference: date) -> dict[str, Decimal]:
+            raise AssertionError("an unavailable archive date must not reach a provider")
+
+    settings = Settings(fixed_income_public_history_months=18)
+    service = FixedIncomeValuationService(settings, _cache(), Provider())
+    reference = date.today()
+    old_date = date(reference.year - 2, reference.month, 1)
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["AALM12"], dates=[old_date])
+    )
+
+    assert result.valuations == {"AALM12": []}
+    assert result.unavailable == ["AALM12"]
+
+
 class _FailingProvider:
     async def prices(self, _reference: date) -> dict[str, Decimal]:
         raise httpx.ConnectError("offline")

@@ -63,8 +63,14 @@ class FixedIncomeValuationService:
             identifier: [] for identifier in request.identifiers
         }
         semaphore = asyncio.Semaphore(max(1, self.settings.upstream_concurrency))
+        public_history_start = _month_start_before(
+            date.today(),
+            self.settings.fixed_income_public_history_months,
+        )
 
         async def resolve_target(target: date) -> dict[str, _ResolvedPrice]:
+            if target < public_history_start:
+                return {}
             async with semaphore:
                 return await self._latest_prices(target, set(request.identifiers))
 
@@ -174,6 +180,11 @@ def _is_identifier_scoped(provider: object) -> bool:
     if isinstance(configured, bool):
         return configured
     return callable(getattr(provider, "prices_for", None))
+
+
+def _month_start_before(reference: date, months: int) -> date:
+    month_index = reference.year * 12 + reference.month - 1 - max(months, 0)
+    return date(month_index // 12, month_index % 12 + 1, 1)
 
 
 def _cached_prices(value: object) -> dict[str, Decimal]:
