@@ -308,7 +308,7 @@ async def test_service_uses_previous_business_day_and_caches_files() -> None:
     assert first.valuations["CDB925623O7"] == []
     assert first.unavailable == ["CDB925623O7"]
     assert second == first
-    assert provider.calls == [sunday, date(2026, 7, 18), friday]
+    assert provider.calls == [friday]
 
 
 class _FailingProvider:
@@ -352,7 +352,7 @@ async def test_service_preserves_sparse_identifier_gaps() -> None:
         FixedIncomeValuationRequest(identifiers=["PEJA11"], dates=[friday, saturday])
     )
 
-    assert [item.requested_date for item in result.valuations["PEJA11"]] == [friday]
+    assert [item.requested_date for item in result.valuations["PEJA11"]] == [friday, saturday]
     assert result.unavailable == []
 
 

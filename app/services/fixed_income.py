@@ -116,6 +116,8 @@ class FixedIncomeValuationService:
             scoped = _is_identifier_scoped(provider)
             for days_ago in range(LOOKBACK_DAYS + 1):
                 reference = target - timedelta(days=days_ago)
+                if reference.weekday() >= 5:
+                    continue
                 prices = await self._prices(provider, source, reference, remaining)
                 for identifier, unit_price in prices.items():
                     if identifier in remaining:
