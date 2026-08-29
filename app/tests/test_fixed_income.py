@@ -251,6 +251,50 @@ async def test_service_marks_secondary_source_and_preserves_unavailable_ids() ->
 
 
 @pytest.mark.asyncio
+async def test_service_uses_scoped_b3_before_the_credit_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PrimaryProvider:
+        identifier_scoped = False
+
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def prices(self, _reference: date) -> dict[str, Decimal]:
+            return {}
+
+    class B3Provider:
+        source = "b3_bdi_consolidated"
+        identifier_scoped = True
+
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def prices_for(self, _reference: date, identifiers: set[str]) -> dict[str, Decimal]:
+            return {identifier: Decimal("100") for identifier in identifiers}
+
+    class CreditProvider:
+        source = "anbima_cri_cra"
+
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def prices(self, _reference: date) -> dict[str, Decimal]:
+            raise AssertionError("the broader credit table should not be called")
+
+    monkeypatch.setattr("app.services.fixed_income.AnbimaDebentureProvider", PrimaryProvider)
+    monkeypatch.setattr("app.services.fixed_income.B3FixedIncomeProvider", B3Provider)
+    monkeypatch.setattr("app.services.fixed_income.AnbimaCreditProvider", CreditProvider)
+    service = FixedIncomeValuationService(Settings(), _cache(), provider=None)
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["PEJA13"], dates=[date(2026, 7, 31)])
+    )
+
+    assert result.valuations["PEJA13"][0].source == "b3_bdi_consolidated"
+
+
+@pytest.mark.asyncio
 async def test_provider_downloads_the_official_daily_file() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/db260717.txt")

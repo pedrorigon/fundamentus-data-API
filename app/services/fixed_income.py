@@ -46,8 +46,8 @@ class FixedIncomeValuationService:
             self.fallback_providers = fallback_providers
         elif provider is None:
             self.fallback_providers = (
-                AnbimaCreditProvider(settings),
                 B3FixedIncomeProvider(settings),
+                AnbimaCreditProvider(settings),
             )
         else:
             # Tests and callers that provide a primary source explicitly should

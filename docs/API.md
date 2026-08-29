@@ -161,8 +161,8 @@ bounded list of instrument identifiers and valuation dates. The service uses the
 free sources, in order:
 
 - ANBIMA's official daily debenture publication;
-- the public ANBIMA Data CRI/CRA table (the last five business days);
-- B3's public BDI consolidated fixed-income trades (from the BDI history window).
+- B3's public BDI consolidated fixed-income trades (from the BDI history window);
+- the public ANBIMA Data CRI/CRA table (the last five business days).
 
 All observations are cached with their source and reference date. These feeds only provide a
 market PU when the instrument was priced or traded. They do not contain the contractual terms
