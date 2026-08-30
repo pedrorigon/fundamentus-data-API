@@ -20,6 +20,7 @@ from app.scrapers.anbima_credit import AnbimaCreditProvider
 from app.scrapers.anbima_feed import AnbimaFeedProvider
 from app.scrapers.anbima_fixed_income import SOURCE_ANBIMA, AnbimaDebentureProvider
 from app.scrapers.b3_fixed_income import B3FixedIncomeProvider
+from app.scrapers.snd_fixed_income import SndDebentureTradeProvider
 from app.services.singleflight import SingleFlight
 
 LOOKBACK_DAYS = 7
@@ -52,6 +53,7 @@ class FixedIncomeValuationService:
         elif provider is None:
             self.fallback_providers = (
                 B3FixedIncomeProvider(settings),
+                SndDebentureTradeProvider(settings),
                 AnbimaCreditProvider(settings),
             )
         else:
@@ -80,8 +82,6 @@ class FixedIncomeValuationService:
 
         async def resolve_target(target: date) -> dict[str, _ResolvedPrice]:
             requires_full_history = target < public_history_start
-            if requires_full_history and not _has_full_history(self.history_provider):
-                return {}
             async with semaphore:
                 return await self._latest_prices(
                     target,
@@ -109,8 +109,8 @@ class FixedIncomeValuationService:
         unavailable = [identifier for identifier, values in resolved.items() if not values]
         unavailable_reasons = {
             identifier: (
-                "No official indicative price was found in ANBIMA or B3 sources for the requested "
-                "date; contractual terms are required to calculate an accrued value."
+                "No observed market price was found in ANBIMA, B3, or SND sources for the "
+                "requested date; contractual terms are required to calculate an accrued value."
             )
             for identifier in unavailable
         }

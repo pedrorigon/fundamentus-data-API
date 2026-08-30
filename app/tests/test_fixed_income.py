@@ -27,6 +27,10 @@ from app.scrapers.b3_fixed_income import (
     B3FixedIncomeProvider,
     parse_b3_reference_prices,
 )
+from app.scrapers.snd_fixed_income import (
+    SndDebentureTradeProvider,
+    parse_snd_debenture_trade_prices,
+)
 from app.services.fixed_income import FixedIncomeValuationService, _cached_prices
 
 
@@ -304,6 +308,104 @@ def test_b3_parser_prefers_reference_price_and_uses_safe_fallbacks() -> None:
     }
 
 
+def test_snd_parser_maps_average_traded_prices_without_using_contractual_pu() -> None:
+    payload = (
+        "Mercado Secundário de Debêntures - Gerado em 29/08/2026 22:23:30\r\n\r\n"
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "7/6/2024\tCONCESSIONARIA\tCRMG15\tBRRDVIDBS061\t29\t3\t"
+        "1.057,963329\t1.071,479196\t1.080,971579\t113,21\r\n"
+        "6/6/2024\tORIGEM\torig21\tBR0HJ5DBS018\t6063\t92\t"
+        "1.036,533823\t1.092,947826\t1.140,442294\t103,21\r\n"
+        "invalid\tEMISSOR\tBAD1\t--\t1\t1\t1\t100\t100\t100\r\n"
+        "6/6/2024\tEMISSOR\tZERO1\t--\t1\t1\t0\t0\t0\t100\r\n"
+    ).encode("latin-1")
+
+    assert parse_snd_debenture_trade_prices(payload) == {
+        "CRMG15": {date(2024, 6, 7): Decimal("1071.479196")},
+        "ORIG21": {date(2024, 6, 6): Decimal("1092.947826")},
+    }
+    assert parse_snd_debenture_trade_prices(b"unexpected") == {}
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_downloads_one_public_year_per_identifier() -> None:
+    calls = 0
+    payload = (
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "14/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t100\t101,25\t102\t100\r\n"
+        "13/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t99\t100,50\t101\t100\r\n"
+    ).encode("latin-1")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        assert request.url.path.endswith("/precosdenegociacao_e.asp")
+        assert request.url.params["ativo"] == "CRMG15"
+        assert request.url.params["dt_ini"] == "20240101"
+        assert request.url.params["dt_fim"] == "20241231"
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(Settings(), httpx.MockTransport(handler))
+    first, second = await asyncio.gather(
+        provider.prices_for(date(2024, 8, 14), {" crmg15 "}),
+        provider.prices_for(date(2024, 8, 13), {"CRMG15"}),
+    )
+
+    assert first == {"CRMG15": Decimal("101.25")}
+    assert second == {"CRMG15": Decimal("100.50")}
+    assert await provider.prices_for(date(2024, 8, 14), {"CRMG15"}) == first
+    assert await provider.prices(date(2024, 8, 14)) == {}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_keeps_missing_and_unsafe_downloads_unavailable() -> None:
+    responses = iter(
+        (
+            httpx.Response(404),
+            httpx.Response(200, content=b"x" * 65),
+        )
+    )
+    provider = SndDebentureTradeProvider(
+        Settings(income_document_max_bytes=64),
+        httpx.MockTransport(lambda _request: next(responses)),
+    )
+
+    assert await provider.prices_for(date(2024, 1, 1), {"MISS11"}) == {}
+    assert await provider.prices_for(date(2024, 1, 1), {"LARGE1"}) == {}
+    assert await provider.prices_for(date(date.today().year + 1, 1, 1), {"FUTURE1"}) == {}
+    assert await provider.prices_for(date(2024, 1, 1), set()) == {}
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_bounds_the_annual_series_cache() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        identifier = request.url.params["ativo"]
+        calls.append(identifier)
+        payload = (
+            "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+            "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+            f"2/1/2024\tEMISSOR\t{identifier}\tISIN\t1\t1\t99\t100,50\t101\t100\r\n"
+        ).encode("latin-1")
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(
+        Settings(fixed_income_series_cache_max_entries=1),
+        httpx.MockTransport(handler),
+    )
+    reference = date(2024, 1, 2)
+
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100.50")}
+    assert await provider.prices_for(reference, {"BBB1"}) == {"BBB1": Decimal("100.50")}
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100.50")}
+    assert calls == ["AAA1", "BBB1", "AAA1"]
+
+
 @pytest.mark.asyncio
 async def test_b3_provider_resolves_exact_identifier_and_caches_result() -> None:
     calls = 0
@@ -536,6 +638,49 @@ async def test_service_uses_only_authenticated_history_for_retained_dates(
     assert valuation.reference_date == old_reference
     assert valuation.unit_price == Decimal("1045.80")
     assert valuation.source == "anbima_feed"
+
+
+@pytest.mark.asyncio
+async def test_service_uses_public_snd_history_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_reference = date(2024, 8, 14)
+    previous_trade = old_reference - timedelta(days=1)
+
+    class PublicHistoryProvider:
+        source = "snd_secondary_market"
+        identifier_scoped = True
+        full_history = True
+
+        def __init__(self, _settings: Settings) -> None:
+            self.calls: list[date] = []
+            instances.append(self)
+
+        async def prices_for(
+            self,
+            reference: date,
+            identifiers: set[str],
+        ) -> dict[str, Decimal]:
+            self.calls.append(reference)
+            if reference == previous_trade and "CRMG15" in identifiers:
+                return {"CRMG15": Decimal("1058.771747")}
+            return {}
+
+    instances: list[PublicHistoryProvider] = []
+    monkeypatch.setattr(
+        "app.services.fixed_income.SndDebentureTradeProvider", PublicHistoryProvider
+    )
+    service = FixedIncomeValuationService(Settings(), _cache())
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["CRMG15"], dates=[old_reference])
+    )
+
+    valuation = result.valuations["CRMG15"][0]
+    assert instances[0].calls == [old_reference, previous_trade]
+    assert valuation.reference_date == previous_trade
+    assert valuation.unit_price == Decimal("1058.771747")
+    assert valuation.source == "snd_secondary_market"
 
 
 @pytest.mark.asyncio

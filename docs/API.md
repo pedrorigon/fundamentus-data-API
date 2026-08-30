@@ -162,12 +162,16 @@ free sources, in order:
 
 - ANBIMA's official daily debenture publication;
 - B3's public BDI consolidated fixed-income trades (from the BDI history window);
+- SND's public retained secondary-market trade download, using the average PU
+  actually registered for each debenture and date;
 - the public ANBIMA Data CRI/CRA table (the last five business days).
 
-All observations are cached with their source and reference date. These feeds only provide a
-market PU when the instrument was priced or traded. They do not contain the contractual terms
-needed to accrue an untraded LCI, LCA, CDB or private note. Such instruments remain explicitly
-unavailable instead of receiving a synthetic price.
+The optional authenticated ANBIMA Feed remains the highest-authority retained source when it is
+configured, but it is not required for debentures covered by the public SND trade history. All
+observations are cached with their source and reference date. These feeds only provide a market
+PU when the instrument was priced or traded. They do not contain the contractual terms needed to
+accrue an untraded LCI, LCA, CDB or private note. Such instruments remain explicitly unavailable
+instead of receiving a synthetic price.
 
 ```json
 {

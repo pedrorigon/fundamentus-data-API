@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     anbima_debenture_base_url: str = (
         "https://www.anbima.com.br/informacoes/merc-sec-debentures/arqs"
     )
+    snd_debenture_base_url: str = "https://www.debentures.com.br"
     anbima_feed_base_url: str = "https://api.anbima.com.br"
     anbima_feed_client_id: SecretStr | None = None
     anbima_feed_client_secret: SecretStr | None = None
@@ -106,6 +107,7 @@ class Settings(BaseSettings):
     ticker_cache_max_entries: int = 1024
     fixed_income_current_ttl_seconds: int = 3600
     fixed_income_history_ttl_seconds: int = 2592000
+    fixed_income_series_cache_max_entries: int = 2048
     equity_history_ttl_seconds: int = 315360000
     # Statements only change when a new filing is published.
     fundamentals_statements_ttl_seconds: int = 86400
