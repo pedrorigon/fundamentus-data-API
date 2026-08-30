@@ -130,9 +130,8 @@ async def income_event_changes(
 
 def _require_refresh_authorization(provided: str | None) -> None:
     settings = get_settings()
-    if (
-        settings.environment.lower() in {"local", "test"}
-        and not _configured_maintenance_token(settings)
+    if settings.environment.lower() in {"local", "test"} and not _configured_maintenance_token(
+        settings
     ):
         return
     _require_maintenance_token(provided)
