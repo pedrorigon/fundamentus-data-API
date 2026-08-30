@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     anbima_debenture_base_url: str = (
         "https://www.anbima.com.br/informacoes/merc-sec-debentures/arqs"
     )
+    anbima_feed_base_url: str = "https://api.anbima.com.br"
+    anbima_feed_client_id: SecretStr | None = None
+    anbima_feed_client_secret: SecretStr | None = None
     # ANBIMA Data publishes the latest five business days of CRI/CRA
     # indicative prices through this public page.  The page is intentionally
     # kept separate from the authenticated ANBIMA Feed API.
@@ -125,6 +128,15 @@ class Settings(BaseSettings):
     @property
     def details_ttl_seconds(self) -> int:
         return min(self.market_data_ttl_seconds, self.fundamentals_ttl_seconds)
+
+    @property
+    def anbima_feed_configured(self) -> bool:
+        return bool(
+            self.anbima_feed_client_id
+            and self.anbima_feed_client_id.get_secret_value()
+            and self.anbima_feed_client_secret
+            and self.anbima_feed_client_secret.get_secret_value()
+        )
 
 
 @lru_cache

@@ -65,7 +65,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.instrument_directory_warm_task = asyncio.create_task(
         instrument_data_service.warm_directory()
     )
-    app.state.fixed_income_valuation_service = FixedIncomeValuationService(settings, cache)
+    fixed_income_valuation_service = FixedIncomeValuationService(settings, cache)
+    app.state.fixed_income_valuation_service = fixed_income_valuation_service
     app.state.historical_quote_service = HistoricalQuoteService(settings, cache)
     fundamentals_service = FundamentalsService(settings, cache)
     app.state.fundamentals_service = fundamentals_service
@@ -79,6 +80,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await fixed_income_valuation_service.close()
         await instrument_data_service.close()
         await income_event_store.close()
         await client.shutdown()

@@ -17,6 +17,7 @@ from app.models import (
     ValuationMethod,
 )
 from app.scrapers.anbima_credit import AnbimaCreditProvider
+from app.scrapers.anbima_feed import AnbimaFeedProvider
 from app.scrapers.anbima_fixed_income import SOURCE_ANBIMA, AnbimaDebentureProvider
 from app.scrapers.b3_fixed_income import B3FixedIncomeProvider
 from app.services.singleflight import SingleFlight
@@ -38,10 +39,14 @@ class FixedIncomeValuationService:
         cache: CacheStore,
         provider: AnbimaDebentureProvider | None = None,
         fallback_providers: tuple[object, ...] | None = None,
+        history_provider: object | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache
         self.provider = provider or AnbimaDebentureProvider(settings)
+        self.history_provider = history_provider
+        if history_provider is None and provider is None and settings.anbima_feed_configured:
+            self.history_provider = AnbimaFeedProvider(settings)
         if fallback_providers is not None:
             self.fallback_providers = fallback_providers
         elif provider is None:
@@ -54,6 +59,11 @@ class FixedIncomeValuationService:
             # not trigger additional network sources unless they opt in.
             self.fallback_providers = ()
         self.singleflight = SingleFlight()
+
+    async def close(self) -> None:
+        close = getattr(self.history_provider, "close", None)
+        if callable(close):
+            await close()
 
     async def resolve(
         self,
@@ -69,10 +79,15 @@ class FixedIncomeValuationService:
         )
 
         async def resolve_target(target: date) -> dict[str, _ResolvedPrice]:
-            if target < public_history_start:
+            requires_full_history = target < public_history_start
+            if requires_full_history and not _has_full_history(self.history_provider):
                 return {}
             async with semaphore:
-                return await self._latest_prices(target, set(request.identifiers))
+                return await self._latest_prices(
+                    target,
+                    set(request.identifiers),
+                    full_history_only=requires_full_history,
+                )
 
         prices_by_target = await asyncio.gather(
             *(resolve_target(target) for target in request.dates)
@@ -94,7 +109,7 @@ class FixedIncomeValuationService:
         unavailable = [identifier for identifier, values in resolved.items() if not values]
         unavailable_reasons = {
             identifier: (
-                "No public indicative price was found in ANBIMA or B3 sources for the requested "
+                "No official indicative price was found in ANBIMA or B3 sources for the requested "
                 "date; contractual terms are required to calculate an accrued value."
             )
             for identifier in unavailable
@@ -109,11 +124,26 @@ class FixedIncomeValuationService:
         self,
         target: date,
         identifiers: set[str],
+        *,
+        full_history_only: bool,
     ) -> dict[str, _ResolvedPrice]:
         resolved: dict[str, _ResolvedPrice] = {}
-        providers = ((self.provider, SOURCE_ANBIMA),) + tuple(
-            (provider, getattr(provider, "source", SOURCE_ANBIMA))
-            for provider in self.fallback_providers
+        configured_providers = (
+            (
+                ((self.history_provider, getattr(self.history_provider, "source", SOURCE_ANBIMA)),)
+                if self.history_provider is not None
+                else ()
+            )
+            + ((self.provider, SOURCE_ANBIMA),)
+            + tuple(
+                (provider, getattr(provider, "source", SOURCE_ANBIMA))
+                for provider in self.fallback_providers
+            )
+        )
+        providers = (
+            tuple(item for item in configured_providers if _has_full_history(item[0]))
+            if full_history_only
+            else configured_providers
         )
         for provider, source in providers:
             remaining = identifiers - resolved.keys()
@@ -180,6 +210,10 @@ def _is_identifier_scoped(provider: object) -> bool:
     if isinstance(configured, bool):
         return configured
     return callable(getattr(provider, "prices_for", None))
+
+
+def _has_full_history(provider: object | None) -> bool:
+    return bool(provider is not None and getattr(provider, "full_history", False) is True)
 
 
 def _month_start_before(reference: date, months: int) -> date:

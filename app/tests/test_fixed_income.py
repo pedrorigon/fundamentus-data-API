@@ -18,6 +18,7 @@ from app.scrapers.anbima_credit import (
     AnbimaCreditProvider,
     parse_anbima_credit_prices,
 )
+from app.scrapers.anbima_feed import AnbimaFeedProvider, parse_anbima_feed_prices
 from app.scrapers.anbima_fixed_income import (
     AnbimaDebentureProvider,
     parse_anbima_debenture_prices,
@@ -89,6 +90,127 @@ def test_credit_parser_maps_reference_dates_and_ignores_unavailable_rows() -> No
         "CRA019003V2": Decimal("1039.26916663")
     }
     assert parse_anbima_credit_prices(payload, date(2026, 7, 30)) == {}
+
+
+def test_feed_parser_prefers_rectified_prices_and_rejects_invalid_rows() -> None:
+    payload = [
+        {"codigo_ativo": " alar13 ", "pu": 900, "pu_retificado": "901.25"},
+        {"codigo_ativo": "CBAN32", "pu": "1421.07939094", "pu_retificado": None},
+        {"codigo_ativo": "ZERO1", "pu": 0},
+        {"codigo_ativo": "NAN1", "pu": "NaN"},
+        {"codigo_ativo": "BAD1", "pu": "invalid"},
+        {"codigo_ativo": "", "pu": 100},
+        {"pu": 100},
+        "invalid",
+    ]
+
+    assert parse_anbima_feed_prices(payload) == {
+        "ALAR13": Decimal("901.25"),
+        "CBAN32": Decimal("1421.07939094"),
+    }
+    assert parse_anbima_feed_prices({"items": payload}) == {}
+
+
+@pytest.mark.asyncio
+async def test_feed_provider_authenticates_once_and_reuses_token() -> None:
+    token_calls = 0
+    price_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls, price_calls
+        if request.url.path == "/oauth/access-token":
+            token_calls += 1
+            await asyncio.sleep(0.01)
+            assert request.headers["authorization"] == "Basic Y2xpZW50OnNlY3JldA=="
+            assert request.read() == b'{"grant_type":"client_credentials"}'
+            return httpx.Response(200, json={"access_token": "official-token", "expires_in": 3600})
+        price_calls += 1
+        assert request.url.path.endswith("/debentures/mercado-secundario")
+        assert request.url.params["data"] == "2024-01-31"
+        assert request.headers["client_id"] == "client"
+        assert request.headers["access_token"] == "official-token"
+        return httpx.Response(200, json=[{"codigo_ativo": "CRMG15", "pu": 1045.8}])
+
+    provider = AnbimaFeedProvider(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        httpx.MockTransport(handler),
+    )
+    try:
+        first, second = await asyncio.gather(
+            provider.prices(date(2024, 1, 31)),
+            provider.prices(date(2024, 1, 31)),
+        )
+    finally:
+        await provider.close()
+
+    assert first == second == {"CRMG15": Decimal("1045.8")}
+    assert token_calls == 1
+    assert price_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_feed_provider_refreshes_rejected_and_expired_tokens() -> None:
+    now = 100.0
+    tokens = iter(("rejected-token", "short-token", "fresh-token"))
+    token_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls
+        if request.url.path == "/oauth/access-token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={"access_token": next(tokens), "expires_in": 20 if token_calls == 2 else 3600},
+            )
+        if request.headers["access_token"] == "rejected-token":
+            return httpx.Response(401)
+        return httpx.Response(200, json=[])
+
+    provider = AnbimaFeedProvider(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        httpx.MockTransport(handler),
+        clock=lambda: now,
+    )
+    try:
+        assert await provider.prices(date(2024, 1, 31)) == {}
+        now += 2
+        assert await provider.prices(date(2024, 2, 1)) == {}
+    finally:
+        await provider.close()
+
+    assert token_calls == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [[], {}, {"access_token": "token"}, {"access_token": "", "expires_in": 3600}],
+)
+async def test_feed_provider_rejects_invalid_token_payloads(payload: object) -> None:
+    provider = AnbimaFeedProvider(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload)),
+    )
+    try:
+        with pytest.raises(ValueError, match="invalid"):
+            await provider.prices(date(2024, 1, 31))
+    finally:
+        await provider.close()
+
+
+def test_feed_provider_requires_complete_non_empty_credentials() -> None:
+    with pytest.raises(ValueError, match="required"):
+        AnbimaFeedProvider(Settings())
+    with pytest.raises(ValueError, match="cannot be empty"):
+        AnbimaFeedProvider(Settings(anbima_feed_client_id="", anbima_feed_client_secret="secret"))
+    assert Settings().anbima_feed_configured is False
+    assert (
+        Settings(
+            anbima_feed_client_id="client",
+            anbima_feed_client_secret="secret",
+        ).anbima_feed_configured
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -362,7 +484,7 @@ async def test_service_skips_dates_outside_the_public_history_window() -> None:
             raise AssertionError("an unavailable archive date must not reach a provider")
 
     settings = Settings(fixed_income_public_history_months=18)
-    service = FixedIncomeValuationService(settings, _cache(), Provider())
+    service = FixedIncomeValuationService(settings, _cache(), Provider())  # type: ignore[arg-type]
     reference = date.today()
     old_date = date(reference.year - 2, reference.month, 1)
 
@@ -372,6 +494,55 @@ async def test_service_skips_dates_outside_the_public_history_window() -> None:
 
     assert result.valuations == {"AALM12": []}
     assert result.unavailable == ["AALM12"]
+
+
+@pytest.mark.asyncio
+async def test_service_uses_only_authenticated_history_for_retained_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HistoryProvider:
+        source = "anbima_feed"
+        full_history = True
+        closed = False
+
+        def __init__(self, _settings: Settings) -> None:
+            self.calls: list[date] = []
+            instances.append(self)
+
+        async def prices(self, reference: date) -> dict[str, Decimal]:
+            self.calls.append(reference)
+            return {"CRMG15": Decimal("1045.80")}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    instances: list[HistoryProvider] = []
+    monkeypatch.setattr("app.services.fixed_income.AnbimaFeedProvider", HistoryProvider)
+    service = FixedIncomeValuationService(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        _cache(),
+    )
+    old_reference = date.today() - timedelta(days=730)
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["CRMG15"], dates=[old_reference])
+    )
+    await service.close()
+
+    provider = instances[0]
+    assert provider.calls == [old_reference]
+    assert provider.closed is True
+    valuation = result.valuations["CRMG15"][0]
+    assert valuation.reference_date == old_reference
+    assert valuation.unit_price == Decimal("1045.80")
+    assert valuation.source == "anbima_feed"
+
+
+@pytest.mark.asyncio
+async def test_service_close_is_safe_without_authenticated_history() -> None:
+    service = FixedIncomeValuationService(Settings(), _cache(), provider=_Provider({}))  # type: ignore[arg-type]
+
+    await service.close()
 
 
 class _FailingProvider:

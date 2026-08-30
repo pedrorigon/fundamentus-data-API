@@ -177,6 +177,8 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `INSTRUMENT_DATA_TTL_SECONDS` | `86400` | In-memory TTL for ETF and international instrument data. |
 | `BRAPI_TOKEN` | empty | brapi backend token required for production coverage of B3 symbols. |
 | `ALPHA_VANTAGE_API_KEY` | empty | Alpha Vantage key for international ETF profiles and stock fundamentals. |
+| `ANBIMA_FEED_CLIENT_ID` | empty | Optional ANBIMA Feed client ID for retained official debenture prices. |
+| `ANBIMA_FEED_CLIENT_SECRET` | empty | Optional ANBIMA Feed secret; required with the client ID. |
 | `SEC_EDGAR_BASE_URL` | `https://data.sec.gov` | Public SEC CompanyFacts endpoint. |
 | `SEC_COMPANY_TICKERS_URL` | `https://www.sec.gov/files/company_tickers.json` | Official SEC ticker-to-CIK directory. |
 | `SEC_USER_AGENT` | `USER_AGENT` | Optional descriptive SEC User-Agent; no secret is required. |
