@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.models import (
@@ -12,6 +13,7 @@ from app.models import (
     Dividend,
     FieldData,
     FundDistribution,
+    InstrumentBatchRequest,
     InstrumentMetadata,
     InstrumentType,
 )
@@ -68,12 +70,85 @@ class FakeAssetService:
 
 
 class FakeB3Provider:
+    def cached(self, tickers: list[str]) -> list[InstrumentMetadata]:
+        return [self._instrument(ticker) for ticker in tickers]
+
     async def get(self, ticker: str) -> InstrumentMetadata:
+        return self._instrument(ticker)
+
+    @staticmethod
+    def _instrument(ticker: str) -> InstrumentMetadata:
         return InstrumentMetadata(
             ticker=ticker,
             name="Example",
             instrument_type=InstrumentType.stock,
         )
+
+
+@pytest.mark.asyncio
+async def test_opportunity_service_resolves_instruments_from_cache_without_upstream_io() -> None:
+    class CachedB3Provider(FakeB3Provider):
+        get_calls = 0
+
+        async def get(self, ticker: str) -> InstrumentMetadata:
+            self.get_calls += 1
+            return await super().get(ticker)
+
+        def cached(self, tickers: list[str]) -> list[InstrumentMetadata]:
+            return [self._instrument(ticker) for ticker in tickers if ticker != "MISS3"]
+
+    provider = CachedB3Provider()
+
+    service = OpportunityService(
+        FakeAssetService(),  # type: ignore[arg-type]
+        Settings(),
+        b3_provider=provider,  # type: ignore[arg-type]
+    )
+
+    resolved = await service.instruments(["PETR4", "MISS3", "VALE3"])
+
+    assert [instrument.ticker for instrument in resolved] == ["PETR4", "VALE3"]
+    assert provider.get_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_instrument_batch_endpoint_normalizes_and_deduplicates_tickers() -> None:
+    from app.api.dependencies import get_opportunity_service
+    from app.main import create_app
+
+    class StubOpportunityService:
+        requested: list[str] = []
+
+        async def instruments(self, tickers: list[str]) -> list[InstrumentMetadata]:
+            self.requested = tickers
+            return [
+                InstrumentMetadata(
+                    ticker=ticker,
+                    instrument_type=InstrumentType.stock,
+                )
+                for ticker in tickers
+            ]
+
+    service = StubOpportunityService()
+    app = create_app()
+    app.dependency_overrides[get_opportunity_service] = lambda: service
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/v1/instruments:resolve",
+            json={"tickers": ["petr4", "PETR4", "vale3"]},
+        )
+
+    assert response.status_code == 200
+    assert service.requested == ["PETR4", "VALE3"]
+    assert [item["ticker"] for item in response.json()["instruments"]] == ["PETR4", "VALE3"]
+
+
+def test_instrument_batch_request_rejects_invalid_tickers() -> None:
+    with pytest.raises(ValidationError, match="invalid ticker"):
+        InstrumentBatchRequest(tickers=["bad ticker"])
 
 
 class FakeStatusProvider:
@@ -394,6 +469,7 @@ async def test_b3_provider_classifies_juro11_as_infrastructure_fund() -> None:
     assert result.instrument_type is InstrumentType.fi_infra
     assert result.name == "SPARTA INFRA FIC FI INFRA RENDA FIXA CP"
     assert result.source == "b3"
+    assert provider.cached(["JURO11", "MISS11"]) == [result]
 
 
 @pytest.mark.asyncio

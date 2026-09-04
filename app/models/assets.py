@@ -1,9 +1,12 @@
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_TICKER_RE = re.compile(r"^[A-Z0-9]+(?:[.\-][A-Z0-9]+)*$")
 
 JsonValue = str | Decimal | date | int | bool | None
 
@@ -106,6 +109,22 @@ class InstrumentMetadata(APIModel):
     reference_date: date | None = None
     source: str = "b3"
     confidence: str = "high"
+
+
+class InstrumentBatchRequest(APIModel):
+    tickers: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("tickers")
+    @classmethod
+    def normalize_tickers(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip().upper() for value in values]
+        if any(len(value) > 12 or _TICKER_RE.fullmatch(value) is None for value in normalized):
+            raise ValueError("invalid ticker")
+        return list(dict.fromkeys(normalized))
+
+
+class InstrumentBatchResponse(APIModel):
+    instruments: list[InstrumentMetadata] = Field(default_factory=list)
 
 
 class FundAllocation(APIModel):

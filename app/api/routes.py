@@ -42,6 +42,8 @@ from app.models import (
     IncomeEventChangesResponse,
     IncomeEventRefreshRequest,
     IncomeEventRefreshResponse,
+    InstrumentBatchRequest,
+    InstrumentBatchResponse,
     InstrumentDataResponse,
     InstrumentMetadata,
     InstrumentSearchResponse,
@@ -190,6 +192,18 @@ async def get_instrument(
     service: OpportunityServiceDep,
 ) -> InstrumentMetadata | None:
     return await service.instrument(ticker)
+
+
+@router.post(
+    "/v1/instruments:resolve",
+    response_model=InstrumentBatchResponse,
+    tags=["instruments"],
+)
+async def resolve_instruments(
+    payload: InstrumentBatchRequest,
+    service: OpportunityServiceDep,
+) -> InstrumentBatchResponse:
+    return InstrumentBatchResponse(instruments=await service.instruments(payload.tickers))
 
 
 @router.get("/v2/instruments/search", response_model=InstrumentSearchResponse, tags=["instruments"])

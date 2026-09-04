@@ -156,6 +156,17 @@ class B3InstrumentProvider:
         )
         return None
 
+    def cached(self, tickers: list[str]) -> list[InstrumentMetadata]:
+        """Return resolved metadata without putting upstream I/O on an import path."""
+        now = monotonic()
+        instruments: list[InstrumentMetadata] = []
+        for ticker in tickers:
+            normalized = _normalized_ticker(ticker)
+            found, cached = self._cache.get(normalized, now)
+            if found and cached is not None:
+                instruments.append(cached)
+        return instruments
+
 
 class StatusInvestProvider:
     def __init__(
@@ -241,6 +252,10 @@ class OpportunityService:
 
     async def instrument(self, ticker: str) -> InstrumentMetadata | None:
         return await self.b3.get(ticker)
+
+    async def instruments(self, tickers: list[str]) -> list[InstrumentMetadata]:
+        """Resolve a batch from the bounded cache without delaying file imports."""
+        return self.b3.cached(tickers)
 
     async def opportunity(self, ticker: str) -> OpportunityResponse:
         normalized = _normalized_ticker(ticker)
