@@ -353,7 +353,7 @@ def test_resolver_coalesces_secondary_sources_at_their_reported_precision() -> N
                 lineage="secondary:status",
                 event_type="Rendimento",
                 amount="0.08355",
-                authority=30,
+                authority=20,
             ),
             _observation(
                 "fundamentus",

@@ -56,9 +56,9 @@ def resolve_income_events(
         base = (item.ticker.upper(), item.ex_date, _amount_bucket(item.unit_price))
         compatible = [
             key
-            for key in grouped
+            for key, members in grouped.items()
             if (key[0], key[2]) == base[:2]
-            and _amounts_compatible(item.unit_price, Decimal(key[3]))
+            and _amount_matches_group(item.unit_price, members)
         ]
         key = compatible[0] if len(compatible) == 1 else (base[0], "Provento", base[1], base[2])
         grouped[key].append(item)
@@ -100,7 +100,7 @@ def _typed_group_key(
         key
         for key, members in grouped.items()
         if key[:3] == exact[:3]
-        and _amounts_compatible(item.unit_price, Decimal(key[3]))
+        and _amount_matches_group(item.unit_price, members)
         and all(member.lineage != item.lineage for member in members)
     ]
     return compatible[0] if len(compatible) == 1 else exact
@@ -188,7 +188,15 @@ def _resolve_group(
         item for item in observations if item.source_status.lower() not in {"cancelled", "canceled"}
     ]
     selected = active or observations
-    ordered = sorted(selected, key=lambda item: (item.authority, item.source_version), reverse=True)
+    ordered = sorted(
+        selected,
+        key=lambda item: (
+            item.authority,
+            item.source_version,
+            _reported_decimal_places(cast(Decimal, item.unit_price)),
+        ),
+        reverse=True,
+    )
     authoritative = [item for item in active if item.authority >= OFFICIAL_AUTHORITY]
     payment = _best_payment_date(ordered, authoritative)
     amount = _best_value(ordered, "unit_price")
@@ -372,6 +380,17 @@ def _amounts_compatible(first: Decimal | None, second: Decimal | None) -> bool:
         max(MIN_ROUNDED_AMOUNT_TOLERANCE, reported_precision / Decimal("2")),
     )
     return abs(first - second) <= tolerance
+
+
+def _amount_matches_group(
+    amount: Decimal | None,
+    observations: list[IncomeEventObservation],
+) -> bool:
+    return all(_amounts_compatible(amount, item.unit_price) for item in observations)
+
+
+def _reported_decimal_places(value: Decimal) -> int:
+    return max(-cast(int, value.as_tuple().exponent), 0)
 
 
 def _amount_bucket(value: Decimal | None) -> str:
