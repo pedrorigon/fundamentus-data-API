@@ -751,14 +751,10 @@ def _distinct_b3_isins(payload: Any) -> int:
 def _fund_unit_isin_among_subscription_rights(payload: Any) -> str | None:
     isins = _b3_isins(payload)
     fund_units = {
-        isin
-        for isin in isins
-        if len(isin) == 12 and isin.startswith("BR") and isin[6:9] == "CTF"
+        isin for isin in isins if len(isin) == 12 and isin.startswith("BR") and isin[6:9] == "CTF"
     }
     rights = {
-        isin
-        for isin in isins
-        if len(isin) == 12 and isin.startswith("BR") and isin[6] == "R"
+        isin for isin in isins if len(isin) == 12 and isin.startswith("BR") and isin[6] == "R"
     }
     if len(fund_units) == 1 and fund_units | rights == isins:
         return next(iter(fund_units))
