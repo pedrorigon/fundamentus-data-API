@@ -302,7 +302,7 @@ def test_resolver_prefers_authority_and_attaches_generic_official_type() -> None
     assert events[0].event_type == "Juros Sobre Capital Próprio"
     assert events[0].status is IncomeEventStatus.verified
     assert events[0].field_sources["payment_date"] == "cvm"
-    assert events[0].field_sources["event_type"] == "status"
+    assert events[0].field_sources["event_type"] == "fundamentus"
     assert (
         events[0].field_confidence["event_type"]
         is IncomeFieldConfidence.corroborated
@@ -326,16 +326,47 @@ def test_resolver_attaches_a_precise_generic_observation_to_one_rounded_type() -
                 amount="0.5465",
                 authority=20,
             ),
+            _observation(
+                "b3",
+                event_type="JCP",
+                amount="0.54652244673",
+                authority=90,
+            ),
         ]
     )
 
     assert len(events) == 1
     assert events[0].event_type == "Juros Sobre Capital Próprio"
     assert events[0].unit_price == Decimal("0.54652244673")
-    assert events[0].sources == ["cvm", "fundamentus"]
+    assert events[0].sources == ["b3", "cvm", "fundamentus"]
     assert events[0].status is IncomeEventStatus.verified
-    assert events[0].field_sources["event_type"] == "fundamentus"
-    assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.tentative
+    assert events[0].field_sources["event_type"] == "b3"
+    assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.authoritative
+
+
+def test_resolver_does_not_fuzzy_merge_rounded_events_from_the_same_lineage() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "b3-first",
+                lineage="official:b3",
+                amount="0.50000",
+                authority=90,
+            ),
+            _observation(
+                "b3-second",
+                lineage="official:b3",
+                amount="0.50004",
+                authority=90,
+            ),
+        ]
+    )
+
+    assert len(events) == 2
+    assert {event.unit_price for event in events} == {
+        Decimal("0.50000"),
+        Decimal("0.50004"),
+    }
 
 
 def test_resolver_keeps_a_generic_observation_when_rounded_types_are_ambiguous() -> None:

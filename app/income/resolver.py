@@ -40,15 +40,16 @@ def resolve_income_events(
     candidates = [item for item in observations if _complete(item)]
     grouped: dict[tuple[str, str, date, str], list[IncomeEventObservation]] = defaultdict(list)
     generic: list[IncomeEventObservation] = []
+    typed: list[tuple[IncomeEventObservation, str]] = []
     for item in candidates:
         assert item.ex_date is not None
         event_type = canonical_event_type(item.event_type)
         if event_type == "Provento":
             generic.append(item)
             continue
-        grouped[
-            (item.ticker.upper(), event_type, item.ex_date, _amount_bucket(item.unit_price))
-        ].append(item)
+        typed.append((item, event_type))
+    for item, event_type in sorted(typed, key=_typed_observation_order):
+        grouped[_typed_group_key(grouped, item, event_type)].append(item)
     for item in generic:
         assert item.ex_date is not None
         base = (item.ticker.upper(), item.ex_date, _amount_bucket(item.unit_price))
@@ -67,6 +68,41 @@ def resolve_income_events(
         resolved,
         key=lambda item: (item.ticker, item.payment_date, item.event_type, item.event_id),
     )
+
+
+def _typed_observation_order(
+    entry: tuple[IncomeEventObservation, str],
+) -> tuple[str, date, str, int, int, str, str]:
+    item, event_type = entry
+    assert item.ex_date is not None
+    return (
+        item.ticker.upper(),
+        item.ex_date,
+        event_type,
+        -item.authority,
+        -item.source_version,
+        item.lineage,
+        item.source_event_id,
+    )
+
+
+def _typed_group_key(
+    grouped: dict[tuple[str, str, date, str], list[IncomeEventObservation]],
+    item: IncomeEventObservation,
+    event_type: str,
+) -> tuple[str, str, date, str]:
+    assert item.ex_date is not None
+    exact = (item.ticker.upper(), event_type, item.ex_date, _amount_bucket(item.unit_price))
+    if exact in grouped:
+        return exact
+    compatible = [
+        key
+        for key, members in grouped.items()
+        if key[:3] == exact[:3]
+        and _amounts_compatible(item.unit_price, Decimal(key[3]))
+        and all(member.lineage != item.lineage for member in members)
+    ]
+    return compatible[0] if len(compatible) == 1 else exact
 
 
 def _resolve_occurrences(
