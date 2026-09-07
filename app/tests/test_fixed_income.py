@@ -625,6 +625,7 @@ async def test_service_uses_only_authenticated_history_for_retained_dates(
         _cache(),
     )
     old_reference = date.today() - timedelta(days=730)
+    old_reference -= timedelta(days=max(old_reference.weekday() - 4, 0))
 
     result = await service.resolve(
         FixedIncomeValuationRequest(identifiers=["CRMG15"], dates=[old_reference])
