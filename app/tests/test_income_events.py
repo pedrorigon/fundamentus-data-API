@@ -980,6 +980,89 @@ async def test_official_company_source_requires_isin_for_multiple_share_classes(
 
 
 @pytest.mark.asyncio
+async def test_official_company_source_selects_fund_unit_among_subscription_rights() -> None:
+    common = {
+        "label": "RENDIMENTO",
+        "lastDatePrior": "31/07/2026",
+        "paymentDate": "24/08/2026",
+    }
+    rows = [
+        {**common, "assetIssued": "BRSNAGCTF000", "rate": "0,12"},
+        {**common, "assetIssued": "BRSNAGR12M14", "rate": "0,07"},
+        {**common, "assetIssued": "BRSNAGR13M13", "rate": "0,05"},
+    ]
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="SNAG11")],
+        date(2026, 8, 27),
+    )
+
+    assert result.coverage[0].complete is True
+    assert len(result.observations) == 1
+    assert result.observations[0].isin == "BRSNAGCTF000"
+    assert result.observations[0].unit_price == Decimal("0.12")
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_keeps_mixed_fund_isins_ambiguous() -> None:
+    row = {
+        "label": "RENDIMENTO",
+        "lastDatePrior": "31/07/2026",
+        "paymentDate": "24/08/2026",
+        "rate": "0,12",
+    }
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json=[
+                {
+                    "cashDividends": [
+                        {**row, "assetIssued": "BRSNAGCTF000"},
+                        {**row, "assetIssued": "BRSNAGACNOR1"},
+                    ]
+                }
+            ],
+        )
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="SNAG11")],
+        date(2026, 8, 27),
+    )
+
+    assert result.observations == []
+    assert result.coverage[0].complete is False
+    assert result.coverage[0].detail == "B3 returned multiple ISINs for SNAG11"
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_accepts_an_unknown_b3_issuer() -> None:
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(404)),
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="UNKNOWN11")],
+        date(2026, 8, 27),
+    )
+
+    assert result.observations == []
+    assert result.coverage[0].complete is True
+
+
+@pytest.mark.asyncio
 async def test_official_company_source_isolates_transport_failure() -> None:
     source = OfficialCompanyIncomeSource(
         Settings(b3_listed_companies_base_url="https://b3.test"),

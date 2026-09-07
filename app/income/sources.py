@@ -243,12 +243,18 @@ class OfficialCompanyIncomeSource:
         as_of: date,
     ) -> list[IncomeEventObservation]:
         b3_payload = await self._b3_payload(client, instrument.ticker)
-        if instrument.isin is None and _distinct_b3_isins(b3_payload) > 1:
+        inferred_isin = (
+            _fund_unit_isin_among_subscription_rights(b3_payload)
+            if instrument.isin is None
+            else None
+        )
+        requested_isin = instrument.isin or inferred_isin
+        if requested_isin is None and _distinct_b3_isins(b3_payload) > 1:
             raise ValueError(f"B3 returned multiple ISINs for {instrument.ticker}")
         b3_events, cvm_code = parse_b3_income_events(
             b3_payload,
             ticker=instrument.ticker,
-            requested_isin=instrument.isin,
+            requested_isin=requested_isin,
         )
         if cvm_code is None:
             return b3_events
@@ -739,18 +745,37 @@ def _issuer_code(ticker: str) -> str:
 
 
 def _distinct_b3_isins(payload: Any) -> int:
+    return len(_b3_isins(payload))
+
+
+def _fund_unit_isin_among_subscription_rights(payload: Any) -> str | None:
+    isins = _b3_isins(payload)
+    fund_units = {
+        isin
+        for isin in isins
+        if len(isin) == 12 and isin.startswith("BR") and isin[6:9] == "CTF"
+    }
+    rights = {
+        isin
+        for isin in isins
+        if len(isin) == 12 and isin.startswith("BR") and isin[6] == "R"
+    }
+    if len(fund_units) == 1 and fund_units | rights == isins:
+        return next(iter(fund_units))
+    return None
+
+
+def _b3_isins(payload: Any) -> set[str]:
     rows = payload if isinstance(payload, list) else []
     company = next((row for row in rows if isinstance(row, dict)), None)
     if company is None:
-        return 0
-    return len(
-        {
-            isin
-            for row in company.get("cashDividends") or []
-            if isinstance(row, dict)
-            and (isin := str(row.get("isinCode") or row.get("assetIssued") or "").strip().upper())
-        }
-    )
+        return set()
+    return {
+        isin
+        for row in company.get("cashDividends") or []
+        if isinstance(row, dict)
+        and (isin := str(row.get("isinCode") or row.get("assetIssued") or "").strip().upper())
+    }
 
 
 def _limits(settings: Settings) -> httpx.Limits:
