@@ -360,9 +360,21 @@ class IncomeEventStore:
         if to_date is not None:
             filters.append("payment_date <= ?")
             params.append(to_date.isoformat())
-        if not include_tentative:
-            filters.append("status IN (?, ?)")
-            params.extend((IncomeEventStatus.corroborated.value, IncomeEventStatus.verified.value))
+        visible_statuses = (
+            (
+                IncomeEventStatus.tentative.value,
+                IncomeEventStatus.corroborated.value,
+                IncomeEventStatus.verified.value,
+            )
+            if include_tentative
+            else (
+                IncomeEventStatus.corroborated.value,
+                IncomeEventStatus.verified.value,
+            )
+        )
+        status_placeholders = ",".join("?" for _status in visible_statuses)
+        filters.append(f"status IN ({status_placeholders})")  # noqa: S608 - fixed placeholders
+        params.extend(visible_statuses)
         query = (
             "SELECT payload FROM canonical_income_events WHERE "
             + " AND ".join(filters)

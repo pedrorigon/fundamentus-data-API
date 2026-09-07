@@ -504,6 +504,7 @@ async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path
     assert await store.publish(replacement, scope_tickers=["BBAS3"]) == 2
     visible = await store.events(["BBAS3"])
     assert visible == replacement
+    assert await store.events(["BBAS3"], include_tentative=True) == replacement
     changes, _cursor, _has_more = await store.changes(1, limit=10)
     assert {item.status for item in changes} == {
         IncomeEventStatus.cancelled,
@@ -512,6 +513,25 @@ async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path
     await store.close()
     with pytest.raises(RuntimeError, match="not started"):
         await store.events(["BBAS3"])
+
+
+@pytest.mark.asyncio
+async def test_store_candidate_reads_include_tentative_but_exclude_cancelled(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    tentative = resolve_income_events([_observation("fundamentus")])
+    assert await store.publish(tentative, scope_tickers=["BBAS3"]) == 1
+
+    assert await store.events(["BBAS3"]) == []
+    assert await store.events(["BBAS3"], include_tentative=True) == tentative
+
+    assert await store.publish([], scope_tickers=["BBAS3"]) == 1
+    assert await store.events(["BBAS3"], include_tentative=True) == []
+    changes, _cursor, _has_more = await store.changes(0, limit=10)
+    assert changes[-1].status is IncomeEventStatus.cancelled
+    await store.close()
 
 
 @pytest.mark.asyncio
