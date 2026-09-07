@@ -22,7 +22,7 @@ from app.income.parsers import (
     parse_fundos_net_xml,
     parse_status_invest_income_events,
 )
-from app.income.resolver import canonical_event_type, resolve_income_events
+from app.income.resolver import _amounts_compatible, canonical_event_type, resolve_income_events
 from app.income.service import IncomeEventService
 from app.income.sources import (
     FundamentusIncomeSource,
@@ -342,6 +342,65 @@ def test_resolver_attaches_a_precise_generic_observation_to_one_rounded_type() -
     assert events[0].status is IncomeEventStatus.verified
     assert events[0].field_sources["event_type"] == "b3"
     assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.authoritative
+
+
+def test_resolver_coalesces_secondary_sources_at_their_reported_precision() -> None:
+    assert _amounts_compatible(None, Decimal("0.08")) is False
+    events = resolve_income_events(
+        [
+            _observation(
+                "status",
+                lineage="secondary:status",
+                event_type="Rendimento",
+                amount="0.08355",
+                authority=30,
+            ),
+            _observation(
+                "fundamentus",
+                lineage="secondary:fundamentus",
+                event_type="Rendimento",
+                amount="0.08",
+                authority=20,
+            ),
+        ]
+    )
+
+    assert len(events) == 1
+    assert events[0].unit_price == Decimal("0.08355")
+    assert events[0].sources == ["fundamentus", "status"]
+    assert events[0].status is IncomeEventStatus.corroborated
+
+
+def test_resolver_does_not_attach_one_rounded_value_to_ambiguous_events() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "status-first",
+                lineage="secondary:status",
+                amount="0.0745",
+                authority=30,
+            ),
+            _observation(
+                "status-second",
+                lineage="secondary:status",
+                amount="0.0712",
+                authority=30,
+            ),
+            _observation(
+                "fundamentus",
+                lineage="secondary:fundamentus",
+                amount="0.07",
+                authority=20,
+            ),
+        ]
+    )
+
+    assert len(events) == 3
+    assert {event.unit_price for event in events} == {
+        Decimal("0.07"),
+        Decimal("0.0712"),
+        Decimal("0.0745"),
+    }
 
 
 def test_resolver_does_not_fuzzy_merge_rounded_events_from_the_same_lineage() -> None:

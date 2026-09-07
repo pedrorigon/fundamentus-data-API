@@ -16,7 +16,8 @@ from app.models.income_events import (
 )
 
 OFFICIAL_AUTHORITY = 80
-GENERIC_AMOUNT_TOLERANCE = Decimal("0.00005")
+MIN_ROUNDED_AMOUNT_TOLERANCE = Decimal("0.00005")
+MAX_ROUNDED_AMOUNT_TOLERANCE = Decimal("0.005")
 _TYPE_ALIASES = (
     (("AMORT",), "Amortização"),
     (("JRS CAP", "JUROS SOBRE CAPITAL", "JSCP", "JCP"), "Juros Sobre Capital Próprio"),
@@ -359,11 +360,18 @@ def _event_type_confidence(
 
 
 def _amounts_compatible(first: Decimal | None, second: Decimal | None) -> bool:
-    return (
-        first is not None
-        and second is not None
-        and abs(first - second) <= GENERIC_AMOUNT_TOLERANCE
+    if first is None or second is None:
+        return False
+    coarsest_exponent = max(
+        cast(int, first.as_tuple().exponent),
+        cast(int, second.as_tuple().exponent),
     )
+    reported_precision = Decimal("1").scaleb(coarsest_exponent)
+    tolerance = min(
+        MAX_ROUNDED_AMOUNT_TOLERANCE,
+        max(MIN_ROUNDED_AMOUNT_TOLERANCE, reported_precision / Decimal("2")),
+    )
+    return abs(first - second) <= tolerance
 
 
 def _amount_bucket(value: Decimal | None) -> str:
