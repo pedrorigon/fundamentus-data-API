@@ -57,8 +57,7 @@ def resolve_income_events(
         compatible = [
             key
             for key, members in grouped.items()
-            if (key[0], key[2]) == base[:2]
-            and _amount_matches_group(item.unit_price, members)
+            if (key[0], key[2]) == base[:2] and _amount_matches_group(item.unit_price, members)
         ]
         key = compatible[0] if len(compatible) == 1 else (base[0], "Provento", base[1], base[2])
         grouped[key].append(item)
@@ -101,7 +100,10 @@ def _typed_group_key(
         for key, members in grouped.items()
         if key[:3] == exact[:3]
         and _amount_matches_group(item.unit_price, members)
-        and all(member.lineage != item.lineage for member in members)
+        and all(
+            member.lineage != item.lineage or member.payment_date != item.payment_date
+            for member in members
+        )
     ]
     return compatible[0] if len(compatible) == 1 else exact
 

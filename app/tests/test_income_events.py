@@ -303,10 +303,7 @@ def test_resolver_prefers_authority_and_attaches_generic_official_type() -> None
     assert events[0].status is IncomeEventStatus.verified
     assert events[0].field_sources["payment_date"] == "cvm"
     assert events[0].field_sources["event_type"] == "fundamentus"
-    assert (
-        events[0].field_confidence["event_type"]
-        is IncomeFieldConfidence.corroborated
-    )
+    assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.corroborated
     assert events[0].projectable is True
     assert canonical_event_type("rend. trib.") == "Rendimento"
 
@@ -426,6 +423,51 @@ def test_resolver_does_not_fuzzy_merge_rounded_events_from_the_same_lineage() ->
         Decimal("0.50000"),
         Decimal("0.50004"),
     }
+
+
+def test_resolver_groups_repeated_installments_before_refining_generic_types() -> None:
+    first_payment = date(2026, 5, 20)
+    second_payment = date(2026, 6, 22)
+    observations = []
+    for payment_date in (first_payment, second_payment):
+        observations.extend(
+            [
+                _observation(
+                    "b3",
+                    lineage="official:b3",
+                    event_type="JCP",
+                    payment_date=payment_date,
+                    amount="0.31311454",
+                    authority=90,
+                    source_event_id=f"b3-{payment_date.isoformat()}",
+                ),
+                _observation(
+                    "fundamentus",
+                    lineage="secondary:fundamentus",
+                    event_type="JCP",
+                    payment_date=payment_date,
+                    amount="0.3131",
+                    authority=20,
+                    source_event_id=f"fundamentus-{payment_date.isoformat()}",
+                ),
+                _observation(
+                    "cvm",
+                    lineage="official:cvm",
+                    event_type="Provento",
+                    payment_date=payment_date,
+                    amount="0.31311454",
+                    authority=100,
+                    source_event_id=f"cvm-{payment_date.isoformat()}",
+                ),
+            ]
+        )
+
+    events = resolve_income_events(observations)
+
+    assert [event.payment_date for event in events] == [first_payment, second_payment]
+    assert all(event.event_type == "Juros Sobre Capital Próprio" for event in events)
+    assert all(event.unit_price == Decimal("0.31311454") for event in events)
+    assert all(event.sources == ["b3", "cvm", "fundamentus"] for event in events)
 
 
 def test_resolver_keeps_a_generic_observation_when_rounded_types_are_ambiguous() -> None:
