@@ -42,6 +42,7 @@ from app.models import (
     IncomeEventObservation,
     IncomeEventRefreshRequest,
     IncomeEventStatus,
+    IncomeFieldConfidence,
     IncomeInstrumentRequest,
     IncomeSourceCoverage,
 )
@@ -301,8 +302,70 @@ def test_resolver_prefers_authority_and_attaches_generic_official_type() -> None
     assert events[0].event_type == "Juros Sobre Capital Próprio"
     assert events[0].status is IncomeEventStatus.verified
     assert events[0].field_sources["payment_date"] == "cvm"
+    assert events[0].field_sources["event_type"] == "status"
+    assert (
+        events[0].field_confidence["event_type"]
+        is IncomeFieldConfidence.corroborated
+    )
     assert events[0].projectable is True
     assert canonical_event_type("rend. trib.") == "Rendimento"
+
+
+def test_resolver_attaches_a_precise_generic_observation_to_one_rounded_type() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "cvm",
+                event_type="Provento",
+                amount="0.54652244673",
+                authority=100,
+            ),
+            _observation(
+                "fundamentus",
+                event_type="JCP",
+                amount="0.5465",
+                authority=20,
+            ),
+        ]
+    )
+
+    assert len(events) == 1
+    assert events[0].event_type == "Juros Sobre Capital Próprio"
+    assert events[0].unit_price == Decimal("0.54652244673")
+    assert events[0].sources == ["cvm", "fundamentus"]
+    assert events[0].status is IncomeEventStatus.verified
+    assert events[0].field_sources["event_type"] == "fundamentus"
+    assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.tentative
+
+
+def test_resolver_keeps_a_generic_observation_when_rounded_types_are_ambiguous() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "cvm",
+                event_type="Provento",
+                amount="0.50004",
+                authority=100,
+            ),
+            _observation(
+                "fundamentus",
+                event_type="Dividendo",
+                amount="0.50000",
+            ),
+            _observation(
+                "status",
+                event_type="JCP",
+                amount="0.50008",
+            ),
+        ]
+    )
+
+    assert len(events) == 3
+    assert {event.event_type for event in events} == {
+        "Dividendo",
+        "Juros Sobre Capital Próprio",
+        "Provento",
+    }
 
 
 def test_resolver_requires_independent_lineages_and_detects_official_conflict() -> None:

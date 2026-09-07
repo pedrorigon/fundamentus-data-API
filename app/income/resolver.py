@@ -16,6 +16,7 @@ from app.models.income_events import (
 )
 
 OFFICIAL_AUTHORITY = 80
+GENERIC_AMOUNT_TOLERANCE = Decimal("0.00005")
 _TYPE_ALIASES = (
     (("AMORT",), "Amortização"),
     (("JRS CAP", "JUROS SOBRE CAPITAL", "JSCP", "JCP"), "Juros Sobre Capital Próprio"),
@@ -51,7 +52,12 @@ def resolve_income_events(
     for item in generic:
         assert item.ex_date is not None
         base = (item.ticker.upper(), item.ex_date, _amount_bucket(item.unit_price))
-        compatible = [key for key in grouped if (key[0], key[2], key[3]) == base]
+        compatible = [
+            key
+            for key in grouped
+            if (key[0], key[2]) == base[:2]
+            and _amounts_compatible(item.unit_price, Decimal(key[3]))
+        ]
         key = compatible[0] if len(compatible) == 1 else (base[0], "Provento", base[1], base[2])
         grouped[key].append(item)
     resolved = [
@@ -158,6 +164,11 @@ def _resolve_group(
     status = _status(observations, authoritative, lineages)
     confidence = _confidence(status)
     field_source = _field_sources(ordered)
+    event_type_source = _event_type_source(ordered, event_type)
+    if event_type_source is not None:
+        field_source["event_type"] = event_type_source
+    field_confidence = {field: confidence for field in field_source}
+    field_confidence["event_type"] = _event_type_confidence(ordered, event_type)
     identity = "|".join(
         (ticker, event_type, ex_date.isoformat(), payment.isoformat(), _amount_bucket(amount))
     )
@@ -174,7 +185,7 @@ def _resolve_group(
         revision=max(item.source_version for item in observations),
         sources=sources,
         field_sources=field_source,
-        field_confidence={field: confidence for field in field_source},
+        field_confidence=field_confidence,
         updated_at=max(item.observed_at for item in observations).astimezone(UTC),
     )
 
@@ -281,6 +292,42 @@ def _source_for_field(observations: list[IncomeEventObservation], field: str) ->
         if getattr(item, field) not in {None, ""}:
             return item.source
     return None
+
+
+def _event_type_source(
+    observations: list[IncomeEventObservation],
+    event_type: str,
+) -> str | None:
+    return next(
+        (
+            item.source
+            for item in observations
+            if canonical_event_type(item.event_type) == event_type
+        ),
+        None,
+    )
+
+
+def _event_type_confidence(
+    observations: list[IncomeEventObservation],
+    event_type: str,
+) -> IncomeFieldConfidence:
+    supporting = [
+        item for item in observations if canonical_event_type(item.event_type) == event_type
+    ]
+    if any(item.authority >= OFFICIAL_AUTHORITY for item in supporting):
+        return IncomeFieldConfidence.authoritative
+    if len({item.lineage for item in supporting}) >= 2:
+        return IncomeFieldConfidence.corroborated
+    return IncomeFieldConfidence.tentative
+
+
+def _amounts_compatible(first: Decimal | None, second: Decimal | None) -> bool:
+    return (
+        first is not None
+        and second is not None
+        and abs(first - second) <= GENERIC_AMOUNT_TOLERANCE
+    )
 
 
 def _amount_bucket(value: Decimal | None) -> str:
