@@ -30,26 +30,60 @@ class IncomeEventService:
         self.snapshot_overlap_days = snapshot_overlap_days
         self.refresh_ttl_seconds = refresh_ttl_seconds
         self._inflight: dict[
-            tuple[tuple[str, str | None], ...], asyncio.Task[IncomeEventRefreshResponse]
+            tuple[tuple[tuple[str, str | None], ...], date],
+            asyncio.Task[IncomeEventRefreshResponse],
         ] = {}
         self._lock = asyncio.Lock()
+        self._closed = False
 
     async def refresh(self, request: IncomeEventRefreshRequest) -> IncomeEventRefreshResponse:
         instruments = _unique_instruments(request.instruments)
-        key = tuple((item.ticker, item.isin) for item in instruments)
+        as_of = request.as_of or date.today()
+        identity = tuple(
+            sorted(
+                ((item.ticker, item.isin) for item in instruments),
+                key=lambda item: (item[0], item[1] or ""),
+            )
+        )
+        key = (identity, as_of)
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("IncomeEventService is closed")
             task = self._inflight.get(key)
             if task is None:
-                task = asyncio.create_task(
-                    self._refresh(instruments, request.as_of or date.today())
-                )
+                task = asyncio.create_task(self._refresh(instruments, as_of))
                 self._inflight[key] = task
-        try:
-            return await task
-        finally:
-            async with self._lock:
-                if self._inflight.get(key) is task:
-                    self._inflight.pop(key, None)
+                task.add_done_callback(lambda completed: self._cleanup_inflight(key, completed))
+        return await asyncio.shield(task)
+
+    async def close(self) -> None:
+        """Stop accepting refreshes and drain shielded producers.
+
+        Refresh waiters may be cancelled independently of the shared producer.
+        Waiting for the producer here guarantees that no source task can write
+        through a store after the application starts closing that store.
+        """
+
+        async with self._lock:
+            self._closed = True
+            pending = tuple(self._inflight.values())
+        if pending:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending),
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    def _cleanup_inflight(
+        self,
+        key: tuple[tuple[tuple[str, str | None], ...], date],
+        task: asyncio.Future[IncomeEventRefreshResponse],
+    ) -> None:
+        """Drop only the completed task that still owns its request key."""
+        if self._inflight.get(key) is task:
+            self._inflight.pop(key, None)
+        if not task.cancelled():
+            task.exception()
 
     async def _refresh(
         self,

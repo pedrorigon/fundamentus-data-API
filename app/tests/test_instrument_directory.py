@@ -99,6 +99,88 @@ async def test_brapi_directory_alias_and_unavailable_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_brapi_directory_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BrapiInstrumentDirectoryProvider(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def load() -> list[InstrumentMetadata]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return [InstrumentMetadata(ticker="PETR4", instrument_type=InstrumentType.stock)]
+
+    monkeypatch.setattr(provider, "_load", load)
+    first = asyncio.create_task(provider.directory())
+    await started.wait()
+    second = asyncio.create_task(provider.directory())
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert calls == 1
+    assert not cancelled.is_set()
+
+    release.set()
+    result = await second
+    assert [item.ticker for item in result] == ["PETR4"]
+    await asyncio.sleep(0)
+    assert provider._inflight is None
+
+
+@pytest.mark.asyncio
+async def test_brapi_directory_failure_cleans_up_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BrapiInstrumentDirectoryProvider(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def load() -> list[InstrumentMetadata]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        raise RuntimeError("directory unavailable")
+
+    monkeypatch.setattr(provider, "_load", load)
+    first = asyncio.create_task(provider.directory())
+    await started.wait()
+    shared = provider._inflight
+    assert shared is not None
+    second = asyncio.create_task(provider.directory())
+    await asyncio.sleep(0)
+
+    first.cancel()
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    release.set()
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await shared
+    await asyncio.sleep(0)
+    assert provider._inflight is None
+
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await provider.directory()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_warm_merges_sec_and_brazil_sources_and_search_is_local() -> None:
     calls: list[str] = []
 
@@ -264,6 +346,86 @@ async def test_warm_singleflight_and_stale_fallback_on_provider_outage() -> None
 
 
 @pytest.mark.asyncio
+async def test_warm_directory_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = InstrumentDataService(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def refresh() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(service, "_refresh_directory", refresh)
+    first = asyncio.create_task(service.warm_directory(force=True))
+    await started.wait()
+    second = asyncio.create_task(service.warm_directory(force=True))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert calls == 1
+    assert not cancelled.is_set()
+
+    release.set()
+    await second
+    await asyncio.sleep(0)
+    assert service._directory_task is None
+
+
+@pytest.mark.asyncio
+async def test_warm_directory_failure_cleans_up_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = InstrumentDataService(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def refresh() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        raise RuntimeError("directory unavailable")
+
+    monkeypatch.setattr(service, "_refresh_directory", refresh)
+    first = asyncio.create_task(service.warm_directory(force=True))
+    await started.wait()
+    shared = service._directory_task
+    assert shared is not None
+    second = asyncio.create_task(service.warm_directory(force=True))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    release.set()
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await shared
+    await asyncio.sleep(0)
+    assert service._directory_task is None
+
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await service.warm_directory(force=True)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_search_ranking_ttl_refresh_and_empty_query() -> None:
     settings = Settings(instrument_directory_ttl_seconds=3600)
     service = InstrumentDataService(settings)
@@ -337,19 +499,40 @@ async def test_directory_warning_and_shutdown_cancellation_paths() -> None:
     )
 
     class Slow:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.cleaned = asyncio.Event()
+
         async def ticker_directory(self) -> list[object]:
-            await asyncio.sleep(10)
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await asyncio.sleep(0)
+                self.cleaned.set()
+                raise
             return []
 
         async def directory(self) -> list[InstrumentMetadata]:
-            await asyncio.sleep(10)
-            return []
+            return await self.ticker_directory()  # type: ignore[return-value]
 
-    slow = InstrumentDataService(_settings(), sec=Slow(), brapi_directory=Slow())  # type: ignore[arg-type]
+    sec = Slow()
+    brapi = Slow()
+    slow = InstrumentDataService(_settings(), sec=sec, brapi_directory=brapi)  # type: ignore[arg-type]
     warm_task = asyncio.create_task(slow.warm_directory())
-    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(sec.started.wait(), brapi.started.wait()), timeout=1)
+    warm_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm_task
+
+    # A cancelled warm-up waiter must leave the shared refresh running until
+    # the service is explicitly closed.
+    assert not sec.cancelled.is_set() and not brapi.cancelled.is_set()
     await slow.close()
-    await asyncio.gather(warm_task, return_exceptions=True)
+    assert sec.cancelled.is_set() and sec.cleaned.is_set()
+    assert brapi.cancelled.is_set() and brapi.cleaned.is_set()
 
 
 @pytest.mark.asyncio

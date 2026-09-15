@@ -146,17 +146,31 @@ class AssetService:
             else None
         )
 
-        if details_task is not None:
-            details, cached["details"] = await details_task
-        if dividends_task is not None:
-            dividends, cached["dividends"] = await dividends_task
+        child_tasks = tuple(task for task in (details_task, dividends_task) if task is not None)
+        try:
+            await asyncio.gather(*child_tasks)
+            if details_task is not None:
+                details, cached["details"] = details_task.result()
+            if dividends_task is not None:
+                dividends, cached["dividends"] = dividends_task.result()
 
-        return AssetResponse(
-            ticker=normalized,
-            details=details,
-            dividends=dividends,
-            cached=cached,
-        )
+            return AssetResponse(
+                ticker=normalized,
+                details=details,
+                dividends=dividends,
+                cached=cached,
+            )
+        finally:
+            await self._cancel_and_wait(child_tasks)
+
+    @staticmethod
+    async def _cancel_and_wait(tasks: tuple[asyncio.Task[object], ...]) -> None:
+        """Stop request-owned sibling work before returning from ``get_asset``."""
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_batch(
         self,

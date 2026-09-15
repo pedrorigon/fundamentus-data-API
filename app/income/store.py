@@ -7,6 +7,7 @@ from pathlib import Path
 import aiosqlite
 import orjson
 
+from app.cache.sqlite import configure_sqlite_connection, sqlite_path_lock, sqlite_transaction
 from app.models.income_events import (
     CanonicalIncomeEvent,
     IncomeEventObservation,
@@ -22,70 +23,109 @@ class IncomeEventStore:
         self._lock = asyncio.Lock()
 
     async def startup(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self.path)
-        self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA synchronous=NORMAL")
-        await self._db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS income_event_observations (
-                source TEXT NOT NULL,
-                source_event_id TEXT NOT NULL,
-                source_version INTEGER NOT NULL,
-                ticker TEXT NOT NULL,
-                payment_date TEXT,
-                payload TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (source, source_event_id, source_version)
-            );
-            CREATE INDEX IF NOT EXISTS ix_income_observation_ticker
-                ON income_event_observations (ticker, observed_at);
-
-            CREATE TABLE IF NOT EXISTS canonical_income_events (
-                event_id TEXT PRIMARY KEY,
-                ticker TEXT NOT NULL,
-                ex_date TEXT NOT NULL,
-                payment_date TEXT NOT NULL,
-                status TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                changed_seq INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_canonical_income_ticker_payment
-                ON canonical_income_events (ticker, payment_date);
-            CREATE INDEX IF NOT EXISTS ix_canonical_income_changes
-                ON canonical_income_events (changed_seq);
-
-            CREATE TABLE IF NOT EXISTS income_source_coverage (
-                source TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                PRIMARY KEY (source, ticker)
-            );
-
-            CREATE TABLE IF NOT EXISTS income_event_sequence (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                value INTEGER NOT NULL
-            );
-            INSERT OR IGNORE INTO income_event_sequence (singleton, value) VALUES (1, 0);
-            """
-        )
-        await self._ensure_observation_active_column()
-        await self._ensure_observation_payment_date_column()
-        await self._db.commit()
+        async with self._lock:
+            if self._db is not None:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            db = await aiosqlite.connect(self.path, timeout=5.0)
+            db.row_factory = aiosqlite.Row
+            self._db = db
+            try:
+                async with sqlite_path_lock(self.path):
+                    await configure_sqlite_connection(db)
+                    async with sqlite_transaction(db, self.path, acquire_lock=False):
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS income_event_observations (
+                                source TEXT NOT NULL,
+                                source_event_id TEXT NOT NULL,
+                                source_version INTEGER NOT NULL,
+                                ticker TEXT NOT NULL,
+                                payment_date TEXT,
+                                payload TEXT NOT NULL,
+                                observed_at TEXT NOT NULL,
+                                active INTEGER NOT NULL DEFAULT 1,
+                                PRIMARY KEY (source, source_event_id, source_version)
+                            )
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE INDEX IF NOT EXISTS ix_income_observation_ticker
+                                ON income_event_observations (ticker, observed_at)
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS canonical_income_events (
+                                event_id TEXT PRIMARY KEY,
+                                ticker TEXT NOT NULL,
+                                ex_date TEXT NOT NULL,
+                                payment_date TEXT NOT NULL,
+                                status TEXT NOT NULL,
+                                revision INTEGER NOT NULL,
+                                payload TEXT NOT NULL,
+                                changed_seq INTEGER NOT NULL
+                            )
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE INDEX IF NOT EXISTS ix_canonical_income_ticker_payment
+                                ON canonical_income_events (ticker, payment_date)
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE INDEX IF NOT EXISTS ix_canonical_income_changes
+                                ON canonical_income_events (changed_seq)
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS income_source_coverage (
+                                source TEXT NOT NULL,
+                                ticker TEXT NOT NULL,
+                                payload TEXT NOT NULL,
+                                observed_at TEXT NOT NULL,
+                                PRIMARY KEY (source, ticker)
+                            )
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS income_event_sequence (
+                                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                                value INTEGER NOT NULL
+                            )
+                            """
+                        )
+                        await db.execute(
+                            """
+                            INSERT OR IGNORE INTO income_event_sequence (singleton, value)
+                            VALUES (1, 0)
+                            """
+                        )
+                        await self._ensure_observation_active_column()
+                        await self._ensure_observation_payment_date_column()
+            except BaseException:
+                await db.close()
+                self._db = None
+                raise
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        async with self._lock:
+            db = self._db
+            if db is not None:
+                async with sqlite_path_lock(self.path):
+                    try:
+                        await db.close()
+                    finally:
+                        self._db = None
 
     async def save_observations(self, observations: list[IncomeEventObservation]) -> int:
         if not observations:
             return 0
-        db = self._require_db()
         rows = [
             (
                 item.source,
@@ -100,22 +140,23 @@ class IncomeEventStore:
             for item in observations
         ]
         async with self._lock:
-            await db.executemany(
-                """
-                INSERT INTO income_event_observations (
-                    source, source_event_id, source_version, ticker,
-                    payment_date, payload, observed_at, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
-                    ticker = excluded.ticker,
-                    payment_date = excluded.payment_date,
-                    payload = excluded.payload,
-                    observed_at = excluded.observed_at,
-                    active = excluded.active
-                """,
-                rows,
-            )
-            await db.commit()
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.executemany(
+                    """
+                    INSERT INTO income_event_observations (
+                        source, source_event_id, source_version, ticker,
+                        payment_date, payload, observed_at, active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
+                        ticker = excluded.ticker,
+                        payment_date = excluded.payment_date,
+                        payload = excluded.payload,
+                        observed_at = excluded.observed_at,
+                        active = excluded.active
+                    """,
+                    rows,
+                )
         return len(rows)
 
     async def replace_observations(
@@ -129,7 +170,6 @@ class IncomeEventStore:
         """Atomically replace complete source/ticker snapshots and retain failed ones."""
         if not snapshot_sources or not complete_tickers:
             return 0
-        db = self._require_db()
         normalized_tickers = list(dict.fromkeys(ticker.upper() for ticker in complete_tickers))
         rows = [
             (
@@ -153,33 +193,33 @@ class IncomeEventStore:
             "AND payment_date >= ?"
         )  # noqa: S608 - placeholders are generated, never user-controlled
         async with self._lock:
-            await db.execute(
-                deactivate,
-                [*snapshot_sources, *normalized_tickers, snapshot_from.isoformat()],
-            )
-            if rows:
-                await db.executemany(
-                    """
-                    INSERT INTO income_event_observations (
-                        source, source_event_id, source_version, ticker, payment_date,
-                        payload, observed_at, active
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
-                        ticker = excluded.ticker,
-                        payment_date = excluded.payment_date,
-                        payload = excluded.payload,
-                        observed_at = excluded.observed_at,
-                        active = excluded.active
-                    """,
-                    rows,
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.execute(
+                    deactivate,
+                    [*snapshot_sources, *normalized_tickers, snapshot_from.isoformat()],
                 )
-            await db.commit()
+                if rows:
+                    await db.executemany(
+                        """
+                        INSERT INTO income_event_observations (
+                            source, source_event_id, source_version, ticker, payment_date,
+                            payload, observed_at, active
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(source, source_event_id, source_version) DO UPDATE SET
+                            ticker = excluded.ticker,
+                            payment_date = excluded.payment_date,
+                            payload = excluded.payload,
+                            observed_at = excluded.observed_at,
+                            active = excluded.active
+                        """,
+                        rows,
+                    )
         return len(rows)
 
     async def observations(self, tickers: list[str]) -> list[IncomeEventObservation]:
         if not tickers:
             return []
-        db = self._require_db()
         placeholders = ",".join("?" for _ in tickers)
         query = f"""
             SELECT payload FROM (
@@ -194,29 +234,36 @@ class IncomeEventStore:
             WHERE version_rank = 1
             ORDER BY observed_at, source, source_event_id
         """  # noqa: S608 - placeholders are generated, never user-controlled
-        async with db.execute(query, [ticker.upper() for ticker in tickers]) as cursor:
-            rows = await cursor.fetchall()
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(query, [ticker.upper() for ticker in tickers]) as cursor:
+                rows = await cursor.fetchall()
         return [IncomeEventObservation.model_validate_json(row["payload"]) for row in rows]
 
     async def save_coverage(self, coverage: list[IncomeSourceCoverage]) -> None:
         if not coverage:
             return
-        db = self._require_db()
         async with self._lock:
-            await db.executemany(
-                """
-                INSERT INTO income_source_coverage (source, ticker, payload, observed_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(source, ticker) DO UPDATE SET
-                    payload = excluded.payload,
-                    observed_at = excluded.observed_at
-                """,
-                [
-                    (item.source, item.ticker.upper(), _dump(item), item.observed_at.isoformat())
-                    for item in coverage
-                ],
-            )
-            await db.commit()
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.executemany(
+                    """
+                    INSERT INTO income_source_coverage (source, ticker, payload, observed_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(source, ticker) DO UPDATE SET
+                        payload = excluded.payload,
+                        observed_at = excluded.observed_at
+                    """,
+                    [
+                        (
+                            item.source,
+                            item.ticker.upper(),
+                            _dump(item),
+                            item.observed_at.isoformat(),
+                        )
+                        for item in coverage
+                    ],
+                )
 
     async def fresh_coverage(
         self,
@@ -227,17 +274,20 @@ class IncomeEventStore:
     ) -> set[str]:
         if not tickers:
             return set()
-        db = self._require_db()
         placeholders = ",".join("?" for _ in tickers)
         query = (
             "SELECT payload FROM income_source_coverage "
             f"WHERE source = ? AND ticker IN ({placeholders})"
         )  # noqa: S608 - placeholders are generated, never user-controlled
-        async with db.execute(query, [source, *(ticker.upper() for ticker in tickers)]) as cursor:
-            coverage = [
-                IncomeSourceCoverage.model_validate_json(row["payload"])
-                for row in await cursor.fetchall()
-            ]
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(
+                query, [source, *(ticker.upper() for ticker in tickers)]
+            ) as cursor:
+                coverage = [
+                    IncomeSourceCoverage.model_validate_json(row["payload"])
+                    for row in await cursor.fetchall()
+                ]
         return {
             item.ticker for item in coverage if item.complete and item.observed_at >= not_before
         }
@@ -250,45 +300,47 @@ class IncomeEventStore:
     ) -> int:
         if not events and not scope_tickers:
             return 0
-        db = self._require_db()
         changed = 0
         async with self._lock:
-            for event in events:
-                existing = await self._existing(event.event_id)
-                revision = existing.revision if existing else 0
-                if existing is not None and _semantic_payload(existing) == _semantic_payload(event):
-                    continue
-                sequence = await self._next_sequence()
-                published = event.model_copy(update={"revision": revision + 1})
-                await db.execute(
-                    """
-                    INSERT INTO canonical_income_events (
-                        event_id, ticker, ex_date, payment_date, status,
-                        revision, payload, changed_seq
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET
-                        ticker = excluded.ticker,
-                        ex_date = excluded.ex_date,
-                        payment_date = excluded.payment_date,
-                        status = excluded.status,
-                        revision = excluded.revision,
-                        payload = excluded.payload,
-                        changed_seq = excluded.changed_seq
-                    """,
-                    (
-                        published.event_id,
-                        published.ticker,
-                        published.ex_date.isoformat(),
-                        published.payment_date.isoformat(),
-                        published.status.value,
-                        published.revision,
-                        _dump(published),
-                        sequence,
-                    ),
-                )
-                changed += 1
-            changed += await self._cancel_missing(events, scope_tickers or [])
-            await db.commit()
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                for event in events:
+                    existing = await self._existing(event.event_id)
+                    revision = existing.revision if existing else 0
+                    if existing is not None and _semantic_payload(existing) == _semantic_payload(
+                        event
+                    ):
+                        continue
+                    sequence = await self._next_sequence()
+                    published = event.model_copy(update={"revision": revision + 1})
+                    await db.execute(
+                        """
+                        INSERT INTO canonical_income_events (
+                            event_id, ticker, ex_date, payment_date, status,
+                            revision, payload, changed_seq
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id) DO UPDATE SET
+                            ticker = excluded.ticker,
+                            ex_date = excluded.ex_date,
+                            payment_date = excluded.payment_date,
+                            status = excluded.status,
+                            revision = excluded.revision,
+                            payload = excluded.payload,
+                            changed_seq = excluded.changed_seq
+                        """,
+                        (
+                            published.event_id,
+                            published.ticker,
+                            published.ex_date.isoformat(),
+                            published.payment_date.isoformat(),
+                            published.status.value,
+                            published.revision,
+                            _dump(published),
+                            sequence,
+                        ),
+                    )
+                    changed += 1
+                changed += await self._cancel_missing(events, scope_tickers or [])
         return changed
 
     async def _cancel_missing(
@@ -350,7 +402,6 @@ class IncomeEventStore:
     ) -> list[CanonicalIncomeEvent]:
         if not tickers:
             return []
-        db = self._require_db()
         placeholders = ",".join("?" for _ in tickers)
         filters = [f"ticker IN ({placeholders})"]  # noqa: S608 - fixed placeholders
         params: list[object] = [ticker.upper() for ticker in tickers]
@@ -380,8 +431,10 @@ class IncomeEventStore:
             + " AND ".join(filters)
             + " ORDER BY ticker, payment_date, event_id"
         )
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
         return [CanonicalIncomeEvent.model_validate_json(row["payload"]) for row in rows]
 
     async def changes(
@@ -390,15 +443,16 @@ class IncomeEventStore:
         *,
         limit: int,
     ) -> tuple[list[CanonicalIncomeEvent], int, bool]:
-        db = self._require_db()
-        async with db.execute(
-            """
-            SELECT payload, changed_seq FROM canonical_income_events
-            WHERE changed_seq > ? ORDER BY changed_seq LIMIT ?
-            """,
-            (max(cursor, 0), limit + 1),
-        ) as result:
-            rows = list(await result.fetchall())
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(
+                """
+                SELECT payload, changed_seq FROM canonical_income_events
+                WHERE changed_seq > ? ORDER BY changed_seq LIMIT ?
+                """,
+                (max(cursor, 0), limit + 1),
+            ) as result:
+                rows = list(await result.fetchall())
         has_more = len(rows) > limit
         selected = rows[:limit]
         next_cursor = int(selected[-1]["changed_seq"]) if selected else max(cursor, 0)
@@ -406,11 +460,12 @@ class IncomeEventStore:
         return events, next_cursor, has_more
 
     async def cursor(self) -> int:
-        db = self._require_db()
-        async with db.execute(
-            "SELECT value FROM income_event_sequence WHERE singleton = 1"
-        ) as cursor:
-            row = await cursor.fetchone()
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(
+                "SELECT value FROM income_event_sequence WHERE singleton = 1"
+            ) as cursor:
+                row = await cursor.fetchone()
         return int(row["value"]) if row else 0
 
     async def _existing(self, event_id: str) -> CanonicalIncomeEvent | None:

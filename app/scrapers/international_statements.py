@@ -33,6 +33,7 @@ import httpx
 from selectolax.parser import HTMLParser
 
 from app.config import Settings
+from app.core.errors import ProviderInvalidResponseError, ProviderUnavailableError
 
 SOURCE_STATEMENTS = "public_filings"
 SOURCE_STOCK_ANALYSIS = "stockanalysis"
@@ -137,18 +138,40 @@ class InternationalStatementsProvider:
         if income is None:
             return None
         years = parse_annual_income(income)
-        if not years:
-            return None
-        years = _with_operating_cash_flow(
-            years,
-            parse_operating_cash_flow(await self._cash_flow_page(ticker) or ""),
-        )
-        balance = parse_balance_sheet(await self._balance_page(ticker) or "")
+        if not years or not _has_reported_income(years):
+            raise ProviderInvalidResponseError(
+                "International statements page did not contain a usable income statement.",
+                details={"provider": SOURCE_STOCK_ANALYSIS},
+            )
+
+        # Cash flow is supplementary.  The page is rendered dynamically and
+        # may be unavailable even when the annual income statement is valid;
+        # preserving the statement lets the caller use the fields that were
+        # actually published instead of turning a partial response into a
+        # false provider outage.
+        try:
+            cash_flow = await self._cash_flow_page(ticker)
+        except (ProviderUnavailableError, ProviderInvalidResponseError):
+            cash_flow = None
+        years = _with_operating_cash_flow(years, parse_operating_cash_flow(cash_flow or ""))
+
+        # StatusInvest and Investidor10 are independent balance-sheet sources.
+        # A failure on one must not prevent the other from supplying the
+        # balance sheet, and an absent balance sheet is valid for some listings.
+        try:
+            balance_page = await self._balance_page(ticker)
+        except (ProviderUnavailableError, ProviderInvalidResponseError):
+            balance_page = None
+        balance = parse_balance_sheet(balance_page or "")
         if not balance:
             # Status Invest lists ordinary shares only, so a REIT reaches this
             # point without a balance sheet. Its own listing page publishes the
             # totals the quality methodology needs.
-            balance = parse_reit_balance_sheet(await self._reit_page(ticker) or "")
+            try:
+                reit_page = await self._reit_page(ticker)
+            except (ProviderUnavailableError, ProviderInvalidResponseError):
+                reit_page = None
+            balance = parse_reit_balance_sheet(reit_page or "")
         return InternationalStatements(
             ticker=ticker.upper(),
             source=SOURCE_STOCK_ANALYSIS,
@@ -190,15 +213,49 @@ class InternationalStatementsProvider:
         )
 
     async def _get(self, base_url: str, path: str) -> str | None:
-        async with httpx.AsyncClient(
-            base_url=base_url,
-            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
-            transport=self.transport,
-            headers={"User-Agent": self.settings.user_agent},
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(path)
-        return response.text if response.status_code == 200 else None
+        try:
+            async with httpx.AsyncClient(
+                base_url=base_url,
+                timeout=httpx.Timeout(self.settings.request_timeout_seconds),
+                transport=self.transport,
+                headers={"User-Agent": self.settings.user_agent},
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(path)
+        except httpx.TimeoutException as exc:
+            raise ProviderUnavailableError(
+                "International statements provider timed out.",
+                details={"provider": SOURCE_STOCK_ANALYSIS},
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                "International statements provider is unavailable.",
+                details={"provider": SOURCE_STOCK_ANALYSIS},
+            ) from exc
+
+        if response.status_code == 404:
+            return None
+        if not 200 <= response.status_code < 300:
+            raise ProviderUnavailableError(
+                "International statements provider is unavailable.",
+                details={
+                    "provider": SOURCE_STOCK_ANALYSIS,
+                    "status_code": response.status_code,
+                },
+            )
+        try:
+            body = response.text
+        except UnicodeDecodeError as exc:
+            raise ProviderInvalidResponseError(
+                "International statements provider returned an invalid response.",
+                details={"provider": SOURCE_STOCK_ANALYSIS},
+            ) from exc
+        if not body.strip():
+            raise ProviderInvalidResponseError(
+                "International statements provider returned an empty response.",
+                details={"provider": SOURCE_STOCK_ANALYSIS},
+            )
+        return body
 
 
 def parse_annual_income(html: str) -> tuple[AnnualFigures, ...]:
@@ -232,6 +289,21 @@ def parse_annual_income(html: str) -> tuple[AnnualFigures, ...]:
         for index, period_end in enumerate(period_ends[:_MAX_YEARS])
     ]
     return tuple(reversed(years))
+
+
+def _has_reported_income(years: tuple[AnnualFigures, ...]) -> bool:
+    """Return whether the page supplied at least one financial line item."""
+    return any(
+        value is not None
+        for year in years
+        for value in (
+            year.revenue,
+            year.gross_profit,
+            year.ebit,
+            year.net_income,
+            year.earnings_per_share,
+        )
+    )
 
 
 def parse_operating_cash_flow(html: str) -> dict[date, Decimal]:

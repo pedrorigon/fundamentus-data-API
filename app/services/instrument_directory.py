@@ -42,12 +42,19 @@ class BrapiInstrumentDirectoryProvider:
             if task is None:
                 task = asyncio.create_task(self._load())
                 self._inflight = task
-        try:
-            return await task
-        finally:
-            async with self._lock:
-                if self._inflight is task:
-                    self._inflight = None
+                task.add_done_callback(self._complete)
+        # This task is shared by all callers.  A request cancellation must not
+        # cancel the bulk refresh for every other waiter.
+        return await asyncio.shield(task)
+
+    def _complete(self, task: asyncio.Task[list[InstrumentMetadata]]) -> None:
+        """Release ownership only when this provider task has completed."""
+        if self._inflight is task:
+            self._inflight = None
+        # A cancelled waiter may be the only consumer of a failed task.  Mark
+        # the exception as retrieved while preserving it for any other waiter.
+        if not task.cancelled():
+            task.exception()
 
     async def instruments(self) -> list[InstrumentMetadata]:
         return await self.directory()

@@ -1,6 +1,8 @@
 import asyncio
 import hmac
+import logging
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Response, status
@@ -18,7 +20,7 @@ from app.api.dependencies import (
     get_quality_facts_service,
 )
 from app.config import Settings, get_settings
-from app.core.errors import UnauthorizedCacheInvalidationError
+from app.core.errors import APIError, InvalidTickerError, UnauthorizedCacheInvalidationError
 from app.core.metrics import metrics
 from app.income import IncomeEventService
 from app.models import (
@@ -34,6 +36,7 @@ from app.models import (
     FundamentalsBatchRequest,
     FundamentalsBatchResponse,
     FundamentalsResponse,
+    FundamentalsSnapshot,
     HealthResponse,
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
@@ -64,6 +67,7 @@ from app.services import (
 )
 
 router = APIRouter()
+_LOGGER = logging.getLogger(__name__)
 
 AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
@@ -270,20 +274,36 @@ async def _resolve_fundamentals(
     opportunity: OpportunityService,
 ) -> FundamentalsResponse:
     """Resolve one ticker, shared by the single and the batch routes."""
-    opportunity_data = await opportunity.opportunity(ticker)
-    instrument = opportunity_data.instrument
-    metrics = opportunity_data.metrics
+    try:
+        opportunity_data = await opportunity.opportunity(ticker)
+    except InvalidTickerError:
+        raise
+    except APIError as error:
+        # Opportunity enrichments are optional for a CVM fundamentals
+        # snapshot.  Keep the source error visible in logs and continue with
+        # the ticker-only fundamentals path when possible.
+        _LOGGER.warning("opportunity enrichment unavailable for %s: %s", ticker, error.message)
+        opportunity_data = None
+    instrument = opportunity_data.instrument if opportunity_data is not None else None
+    metrics = opportunity_data.metrics if opportunity_data is not None else None
+
+    def _metric_value(name: str) -> Decimal | None:
+        return getattr(metrics, name).value if metrics is not None else None
+
+    def _metric_sources(name: str) -> str:
+        return ",".join(getattr(metrics, name).sources) if metrics is not None else ""
+
     snapshot = await fundamentals.snapshot(
         ticker,
         instrument.name if instrument else None,
-        reference_shares=metrics.shares_outstanding.value,
-        earnings_per_share=metrics.earnings_per_share.value,
-        book_value_per_share=metrics.book_value_per_share.value,
-        recurring_dividends_per_share=metrics.dividends_12m.value,
+        reference_shares=_metric_value("shares_outstanding"),
+        earnings_per_share=_metric_value("earnings_per_share"),
+        book_value_per_share=_metric_value("book_value_per_share"),
+        recurring_dividends_per_share=_metric_value("dividends_12m"),
         supplemental_sources={
-            "earnings_per_share": ",".join(metrics.earnings_per_share.sources),
-            "book_value_per_share": ",".join(metrics.book_value_per_share.sources),
-            "recurring_dividends_per_share": ",".join(metrics.dividends_12m.sources),
+            "earnings_per_share": _metric_sources("earnings_per_share"),
+            "book_value_per_share": _metric_sources("book_value_per_share"),
+            "recurring_dividends_per_share": _metric_sources("dividends_12m"),
         },
     )
     return FundamentalsResponse(
@@ -312,10 +332,46 @@ async def resolve_fundamentals_batch(
     """
     _cache_headers(response)
     resolved = await asyncio.gather(
-        *(_resolve_fundamentals(ticker, fundamentals, opportunity) for ticker in payload.tickers)
+        *(_resolve_fundamentals(ticker, fundamentals, opportunity) for ticker in payload.tickers),
+        return_exceptions=True,
     )
+    assets: list[FundamentalsResponse] = []
+    for ticker, item in zip(payload.tickers, resolved, strict=True):
+        if isinstance(item, FundamentalsResponse):
+            assets.append(item)
+            continue
+        if isinstance(item, InvalidTickerError):
+            raise item
+        if isinstance(item, APIError):
+            _LOGGER.warning("fundamentals resolution unavailable for %s: %s", ticker, item.message)
+            assets.append(
+                FundamentalsResponse(
+                    ticker=ticker,
+                    snapshot=FundamentalsSnapshot(
+                        ticker=ticker,
+                        unavailable_reason=item.message,
+                    ),
+                    refreshed_at=datetime.now(UTC).date(),
+                )
+            )
+            continue
+        _LOGGER.error(
+            "fundamentals resolution failed for %s: %s",
+            ticker,
+            type(item).__name__,
+        )
+        assets.append(
+            FundamentalsResponse(
+                ticker=ticker,
+                snapshot=FundamentalsSnapshot(
+                    ticker=ticker,
+                    unavailable_reason="Fundamentals resolution failed",
+                ),
+                refreshed_at=datetime.now(UTC).date(),
+            )
+        )
     return FundamentalsBatchResponse(
-        assets=list(resolved),
+        assets=assets,
         refreshed_at=datetime.now(UTC).date(),
     )
 

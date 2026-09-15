@@ -75,6 +75,7 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}/details` | Details page fields and preserved sections. |
 | `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
 | `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
+| `POST /v1/assessments/snapshot` | Idempotent, period-bound assessment snapshot shared across callers. |
 | `GET /v1/assets/{ticker}/fundamentals` | Multi-year financial statements resolved from CVM open data. |
 | `POST /v1/quality/facts:resolve` | Batched, normalized quality evidence for stocks, listed funds and ETFs. |
 | `POST /v2/income-events/refresh` | Protected background refresh from public income sources. |
@@ -187,6 +188,12 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `SEC_COMPANYFACTS_TTL_SECONDS` | `86400` | Local TTL for CompanyFacts payloads. |
 | `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
 | `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
+| `DATABASE_URL` | empty | Optional PostgreSQL URL for durable assessment snapshots. `FUNDAMENTUS_API_DATABASE_URL` and `DATABASE_URL` are accepted. |
+| `ASSESSMENT_SQLITE_PATH` | derived from `SQLITE_CACHE_PATH` | Separate SQLite path for assessment snapshots when PostgreSQL is not configured. In Docker Compose the default is `/data/fundamentus_cache_assessments.sqlite3`. |
+| `ASSESSMENT_LEASE_SECONDS` | `3600` | Maximum ownership lease for one assessment attempt (1 to 3600 seconds). |
+| `ASSESSMENT_MAX_ATTEMPTS` | `3` | Bounded attempts for an assessment period (1 to 10). |
+| `ASSESSMENT_PERIOD_HISTORY_DAYS` | `370` | Retention window for accepted scheduler periods (1 to 3650 days). |
+| `ASSESSMENT_RETRY_BACKOFF_SECONDS` | `15` | Initial retry delay after a failed assessment attempt (0 to 3600 seconds). |
 | `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
 | `UPSTREAM_CONCURRENCY` | `4` | Maximum concurrent Fundamentus requests. |
 | `UPSTREAM_MIN_INTERVAL_SECONDS` | `0.15` | Minimum interval between upstream requests. |

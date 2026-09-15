@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -116,8 +117,9 @@ class BcbBankProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._registrations: dict[int, tuple[dict[str, object], ...]] = {}
-        self._cache: dict[str, BankQualitySnapshot] = {}
+        self._cache_max_entries = max(1, settings.memory_cache_max_entries)
+        self._registrations: OrderedDict[int, tuple[dict[str, object], ...]] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int], BankQualitySnapshot] = OrderedDict()
         self._registration_lock = asyncio.Lock()
         self._request_semaphore = asyncio.Semaphore(2)
 
@@ -126,10 +128,12 @@ class BcbBankProvider:
         company_name: str,
         reference: date | None = None,
     ) -> BankQualitySnapshot:
-        key = _fold(company_name)
-        if key in self._cache:
-            return self._cache[key]
         capital_period = _latest_disclosed_quarter(reference or datetime.now(UTC).date())
+        key = (_fold(company_name), capital_period)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
         registrations = await self._registration(capital_period)
         institution = _match_institution(company_name, registrations)
         if institution is None:
@@ -152,17 +156,27 @@ class BcbBankProvider:
         )
         if result.basel_ratio is not None:
             self._cache[key] = result
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max_entries:
+                self._cache.popitem(last=False)
         return result
 
     async def _registration(self, period: int) -> tuple[dict[str, object], ...]:
-        if period in self._registrations:
-            return self._registrations[period]
+        cached = self._registrations.get(period)
+        if cached is not None:
+            self._registrations.move_to_end(period)
+            return cached
         async with self._registration_lock:
-            if period in self._registrations:
-                return self._registrations[period]
+            cached = self._registrations.get(period)
+            if cached is not None:
+                self._registrations.move_to_end(period)
+                return cached
             values = await self._request(f"IfDataCadastro(AnoMes={period})")
             if values:
                 self._registrations[period] = values
+                self._registrations.move_to_end(period)
+                while len(self._registrations) > self._cache_max_entries:
+                    self._registrations.popitem(last=False)
             return values
 
     async def _values(

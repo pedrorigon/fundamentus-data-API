@@ -13,7 +13,11 @@ from pydantic import ValidationError
 
 from app.cache import CacheStore
 from app.config import Settings
-from app.core.errors import InvalidTickerError
+from app.core.errors import (
+    InvalidTickerError,
+    ProviderInvalidResponseError,
+    ProviderUnavailableError,
+)
 from app.models.fundamentals import FinancialPeriod, FundamentalsSnapshot
 from app.parsers.cvm_statements import (
     ACCOUNT_EBIT,
@@ -210,13 +214,13 @@ async def test_reconciles_share_units_from_independent_per_share_values(
     assert shares_provenance.selected_source == "derived_public_indicators"
 
 
-async def test_reports_reason_when_every_archive_is_unavailable(tmp_path: Path) -> None:
+async def test_reports_no_data_when_every_archive_is_not_found(tmp_path: Path) -> None:
     service = await build(tmp_path, StubProvider())
 
     snapshot = await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
 
     assert snapshot.trailing_twelve_months is None
-    assert snapshot.unavailable_reason == "CVM statement archives are unavailable"
+    assert snapshot.unavailable_reason == "No CVM filing matched this company"
 
 
 async def test_falls_back_to_older_archive_when_latest_year_missing(tmp_path: Path) -> None:
@@ -447,14 +451,16 @@ async def test_peer_group_skips_assets_without_usable_data(tmp_path: Path) -> No
     assert group.unavailable_reason is not None
 
 
-async def test_provider_returns_none_on_transport_error(tmp_path: Path) -> None:
+async def test_provider_raises_unavailable_on_transport_error(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("boom", request=request)
 
     provider = CvmOpenDataProvider(settings(tmp_path), transport=httpx.MockTransport(handler))
 
-    assert await provider.statements(StatementKind.ANNUAL, 2024) is None
-    assert await provider.registry() == {}
+    with pytest.raises(ProviderUnavailableError):
+        await provider.statements(StatementKind.ANNUAL, 2024)
+    with pytest.raises(ProviderUnavailableError):
+        await provider.registry()
 
 
 async def test_provider_returns_none_on_not_found(tmp_path: Path) -> None:
@@ -466,13 +472,31 @@ async def test_provider_returns_none_on_not_found(tmp_path: Path) -> None:
     assert await provider.statements(StatementKind.ANNUAL, 1990) is None
 
 
-async def test_provider_returns_none_on_server_error(tmp_path: Path) -> None:
+async def test_provider_raises_unavailable_on_server_error(tmp_path: Path) -> None:
     provider = CvmOpenDataProvider(
         settings(tmp_path),
         transport=httpx.MockTransport(lambda request: httpx.Response(500)),
     )
 
-    assert await provider.statements(StatementKind.ANNUAL, 2024) is None
+    with pytest.raises(ProviderUnavailableError):
+        await provider.statements(StatementKind.ANNUAL, 2024)
+
+
+async def test_provider_rejects_invalid_or_oversized_statement_archives(tmp_path: Path) -> None:
+    invalid = CvmOpenDataProvider(
+        settings(tmp_path),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"not a zip")),
+    )
+    oversized_settings = settings(tmp_path).model_copy(update={"archive_download_max_bytes": 3})
+    oversized = CvmOpenDataProvider(
+        oversized_settings,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"large")),
+    )
+
+    with pytest.raises(ProviderInvalidResponseError):
+        await invalid.statements(StatementKind.ANNUAL, 2024)
+    with pytest.raises(ProviderInvalidResponseError):
+        await oversized.statements(StatementKind.ANNUAL, 2024)
 
 
 async def test_provider_parses_downloaded_archive(tmp_path: Path) -> None:
@@ -718,6 +742,42 @@ async def test_a_foreign_listing_falls_back_to_public_statements(tmp_path: Path)
     assert international.calls == ["AAPL"]
 
 
+async def test_cvm_outage_uses_a_trustworthy_public_fallback(tmp_path: Path) -> None:
+    class OutageProvider(StubProvider):
+        async def statements(
+            self,
+            kind: StatementKind,
+            year: int,
+            cnpjs: set[str] | None = None,
+        ) -> StatementArchive | None:
+            raise ProviderUnavailableError()
+
+    international = StubInternationalProvider(_international_statements())
+    service = await build(tmp_path, OutageProvider(), international)
+
+    snapshot = await service.snapshot("AAPL", COMPANY, reference=date(2024, 12, 31))
+
+    assert snapshot.unavailable_reason is None
+    assert snapshot.periods[0].source == "public_filings"
+    assert international.calls == ["AAPL"]
+
+
+async def test_cvm_outage_remains_retryable_when_no_fallback_exists(tmp_path: Path) -> None:
+    class OutageProvider(StubProvider):
+        async def statements(
+            self,
+            kind: StatementKind,
+            year: int,
+            cnpjs: set[str] | None = None,
+        ) -> StatementArchive | None:
+            raise ProviderUnavailableError()
+
+    service = await build(tmp_path, OutageProvider(), StubInternationalProvider(None))
+
+    with pytest.raises(ProviderUnavailableError):
+        await service.snapshot("TEST4", COMPANY, reference=date(2024, 12, 31))
+
+
 async def test_the_cvm_reason_survives_when_no_statements_are_found(tmp_path: Path) -> None:
     """A ticker neither source knows must explain the original failure."""
     service = await build(tmp_path, StubProvider(), StubInternationalProvider(None))
@@ -739,6 +799,19 @@ async def test_an_unreachable_public_source_does_not_mask_the_cvm_reason(
     snapshot = await service.snapshot("AAPL", None)
 
     assert snapshot.unavailable_reason == "Corporate name is required to resolve CVM filings"
+
+
+async def test_a_typed_public_source_outage_remains_retryable(
+    tmp_path: Path,
+) -> None:
+    class FailingProvider(StubInternationalProvider):
+        async def statements(self, ticker: str) -> InternationalStatements | None:
+            raise ProviderUnavailableError(ticker=ticker)
+
+    service = await build(tmp_path, StubProvider(), FailingProvider())
+
+    with pytest.raises(ProviderUnavailableError):
+        await service.snapshot("AAPL", None)
 
 
 async def test_a_closed_exercise_is_cached_far_longer_than_the_current_one(

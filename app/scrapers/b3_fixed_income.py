@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from time import monotonic
@@ -36,7 +37,8 @@ class B3FixedIncomeProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._cache: dict[tuple[date, str], tuple[float, Decimal | None]] = {}
+        self._cache_max_entries = max(1, settings.memory_cache_max_entries)
+        self._cache: OrderedDict[tuple[date, str], tuple[float, Decimal | None]] = OrderedDict()
         self._semaphore = asyncio.Semaphore(max(1, self.settings.upstream_concurrency))
 
     async def prices(self, _reference: date) -> dict[str, Decimal]:
@@ -46,18 +48,22 @@ class B3FixedIncomeProvider:
         return {}
 
     async def prices_for(self, reference: date, identifiers: set[str]) -> dict[str, Decimal]:
-        normalized = {value.strip().upper() for value in identifiers if value.strip()}
+        normalized = sorted({value.strip().upper() for value in identifiers if value.strip()})
         if not normalized or not self.settings.b3_bdi_base_url:
             return {}
         result: dict[str, Decimal] = {}
         missing: list[str] = []
         now = monotonic()
         for identifier in normalized:
-            cached = self._cache.get((reference, identifier))
+            key = (reference, identifier)
+            cached = self._cache.get(key)
             if cached is None or cached[0] <= now:
+                self._cache.pop(key, None)
                 missing.append(identifier)
-            elif cached[1] is not None:
-                result[identifier] = cached[1]
+            else:
+                self._cache.move_to_end(key)
+                if cached[1] is not None:
+                    result[identifier] = cached[1]
         if not missing:
             return result
 
@@ -91,7 +97,11 @@ class B3FixedIncomeProvider:
             values = await asyncio.gather(*(fetch(identifier) for identifier in missing))
         expires_at = monotonic() + _CACHE_TTL_SECONDS
         for identifier, price in values:
-            self._cache[(reference, identifier)] = (expires_at, price)
+            key = (reference, identifier)
+            self._cache[key] = (expires_at, price)
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max_entries:
+                self._cache.popitem(last=False)
             if price is not None:
                 result[identifier] = price
         return result

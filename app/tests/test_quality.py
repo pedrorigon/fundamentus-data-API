@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -28,6 +29,7 @@ from app.models import (
     OpportunityResponse,
     SectorCompany,
 )
+from app.models.assets import FundDistributionEvidence, OpportunityObservation
 from app.models.quality import (
     QualityAssetKind,
     QualityAssetRequest,
@@ -35,7 +37,12 @@ from app.models.quality import (
     QualityFactsResponse,
 )
 from app.services.bcb_quality import BankQualitySnapshot, MacroQualitySnapshot
-from app.services.quality import QualityFactsService
+from app.services.quality import (
+    QualityFactsService,
+    _has_domestic_stock_instrument,
+    _market_scale_facts,
+    _metric_fact,
+)
 
 TODAY = date(2026, 7, 30)
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
@@ -59,20 +66,24 @@ class FundamentalsStub:
 class InstrumentsStub:
     def __init__(self, values: dict[str, InstrumentDataResponse]) -> None:
         self.values = values
+        self.calls: list[tuple[str, InstrumentType | None]] = []
 
     async def get(
         self,
         ticker: str,
         _instrument_type: InstrumentType | None = None,
     ) -> InstrumentDataResponse:
+        self.calls.append((ticker, _instrument_type))
         return self.values[ticker]
 
 
 class OpportunityStub:
     def __init__(self, values: dict[str, OpportunityResponse]) -> None:
         self.values = values
+        self.calls: list[str] = []
 
     async def opportunity(self, ticker: str) -> OpportunityResponse:
+        self.calls.append(ticker)
         return self.values[ticker]
 
 
@@ -126,6 +137,7 @@ def opportunity(
     *,
     reports: list[FundMonthlyReport] | None = None,
     distributions: list[FundDistribution] | None = None,
+    distribution_evidence: list[FundDistributionEvidence] | None = None,
 ) -> OpportunityResponse:
     return OpportunityResponse(
         ticker=ticker,
@@ -133,7 +145,83 @@ def opportunity(
         metrics=opportunity_metrics(),
         fund_reports=FundReportSeries(cnpj="123", reports=reports or []),
         fund_distributions=distributions or [],
+        fund_distribution_evidence=distribution_evidence or [],
         refreshed_at=NOW,
+    )
+
+
+def distribution_evidence(
+    event_dates: list[date],
+    unresolved_indices: set[int],
+) -> list[FundDistributionEvidence]:
+    return [
+        FundDistributionEvidence(
+            ex_date=event_date,
+            value=Decimal("1") if index not in unresolved_indices else None,
+            status="single_source" if index not in unresolved_indices else "conflict",
+            reason=(
+                "Only one independent source was available"
+                if index not in unresolved_indices
+                else "Independent sources disagree without a clear majority"
+            ),
+            confidence=Decimal("0.55") if index not in unresolved_indices else Decimal("0"),
+            sources=["cvm"]
+            if index not in unresolved_indices
+            else ["fundamentus", "status_invest"],
+            independent_sources=["cvm"]
+            if index not in unresolved_indices
+            else ["fundamentus", "status_invest"],
+            source_lineage=["cvm"]
+            if index not in unresolved_indices
+            else ["fundamentus", "status_invest"],
+            observations=(
+                []
+                if index not in unresolved_indices
+                else [
+                    OpportunityObservation(
+                        value=Decimal("1"),
+                        source="fundamentus",
+                        as_of=event_date,
+                        unit="BRL",
+                        source_lineage=["fundamentus"],
+                        independent_origin="fundamentus",
+                    ),
+                    OpportunityObservation(
+                        value=Decimal("1.5"),
+                        source="status_invest",
+                        as_of=event_date,
+                        unit="BRL",
+                        source_lineage=["status_invest"],
+                        independent_origin="status_invest",
+                    ),
+                ]
+            ),
+        )
+        for index, event_date in enumerate(event_dates)
+    ]
+
+
+def fund_quality_service(
+    ticker: str,
+    instrument: InstrumentMetadata,
+    reports: list[FundMonthlyReport],
+    distributions: list[FundDistribution],
+    evidence: list[FundDistributionEvidence],
+) -> QualityFactsService:
+    return QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({ticker: instrument_data(ticker, instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                ticker: opportunity(
+                    ticker,
+                    instrument,
+                    reports=reports,
+                    distributions=distributions,
+                    distribution_evidence=evidence,
+                )
+            }
+        ),  # type: ignore[arg-type]
     )
 
 
@@ -229,7 +317,147 @@ async def test_isolates_provider_errors_inside_a_quality_batch() -> None:
     )
 
     assert response.assets[0].unavailable_reason == "Invalid ticker."
+    assert response.assets[0].error_code == "INVALID_TICKER"
+    assert response.assets[0].retryable is False
     assert "network-data" in (response.assets[1].unavailable_reason or "")
+
+
+async def test_quality_awaits_instrument_cleanup_when_opportunity_fails() -> None:
+    class InstrumentProbe:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.cleaned = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def get(
+            self,
+            _ticker: str,
+            _instrument_type: InstrumentType | None = None,
+        ) -> InstrumentDataResponse:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await asyncio.sleep(0)
+                self.cleaned.set()
+                raise
+            finally:
+                self.finished.set()
+            raise AssertionError("unreachable")
+
+    class FailingOpportunity:
+        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+            await instrument.started.wait()
+            raise RuntimeError("opportunity provider failed")
+
+    instrument = InstrumentProbe()
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        instrument,  # type: ignore[arg-type]
+        FailingOpportunity(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="opportunity provider failed"):
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+            )
+        )
+
+    assert instrument.cancelled.is_set()
+    assert instrument.cleaned.is_set()
+    assert instrument.finished.is_set()
+
+
+async def test_quality_cancels_shared_provider_tasks_when_batch_is_cancelled() -> None:
+    class BlockingSectorProvider(FundamentalsStub):
+        def __init__(self) -> None:
+            super().__init__(stock_snapshot())
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.cleaned = asyncio.Event()
+            self.finished = asyncio.Event()
+            self.task: asyncio.Task[object] | None = None
+
+        async def sector_universe(self) -> dict[str, list[SectorCompany]]:
+            self.task = asyncio.current_task()
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await asyncio.sleep(0)
+                self.cleaned.set()
+                raise
+            finally:
+                self.finished.set()
+            raise AssertionError("unreachable")
+
+    class BlockingMacroProvider:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.cleaned = asyncio.Event()
+            self.finished = asyncio.Event()
+            self.task: asyncio.Task[object] | None = None
+
+        async def snapshot(self) -> MacroQualitySnapshot:
+            self.task = asyncio.current_task()
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await asyncio.sleep(0)
+                self.cleaned.set()
+                raise
+            finally:
+                self.finished.set()
+            raise AssertionError("unreachable")
+
+    sector = BlockingSectorProvider()
+    macro = BlockingMacroProvider()
+    instrument = InstrumentMetadata(
+        ticker="TEST3",
+        name="Test",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+        country="BR",
+        exchange="B3",
+        source="b3",
+    )
+    service = QualityFactsService(
+        sector,  # type: ignore[arg-type]
+        InstrumentsStub({}),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+        macro_provider=macro,  # type: ignore[arg-type]
+    )
+    request = QualityFactsRequest(
+        assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+    )
+    resolve_task = asyncio.create_task(
+        service.resolve(
+            request,
+            opportunity_by_ticker={"TEST3": opportunity("TEST3", instrument)},
+            fundamentals_by_ticker={"TEST3": stock_snapshot()},
+        )
+    )
+
+    await asyncio.wait_for(
+        asyncio.gather(sector.started.wait(), macro.started.wait()),
+        timeout=1,
+    )
+    resolve_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resolve_task
+
+    for provider in (sector, macro):
+        assert provider.cancelled.is_set()
+        assert provider.cleaned.is_set()
+        assert provider.finished.is_set()
+        assert provider.task is not None and provider.task.done() and provider.task.cancelled()
 
 
 def test_request_normalizes_tickers_and_rejects_duplicates() -> None:
@@ -283,6 +511,104 @@ async def test_resolves_complete_domestic_stock_quality_facts() -> None:
     assert facts["book_value_per_share_consistency_error"].value == Decimal("0")
     assert result.profile == "industrial"
     assert fundamentals.calls == ["TEST3"]
+
+
+async def test_quality_reuses_provided_domestic_stock_identity_without_lookup() -> None:
+    instrument = InstrumentMetadata(
+        ticker="TEST3",
+        name="Test",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+        isin="BRTESTACNOR0",
+        country="BR",
+        exchange="B3",
+    )
+    instruments = InstrumentsStub({})
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        instruments,  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+        ),
+        opportunity_by_ticker={"TEST3": opportunity("TEST3", instrument)},
+        fundamentals_by_ticker={"TEST3": stock_snapshot()},
+    )
+
+    assert response.assets[0].facts
+    assert instruments.calls == []
+
+
+def test_domestic_stock_identity_reuse_requires_authoritative_metadata() -> None:
+    domestic = InstrumentMetadata(
+        ticker="TEST3",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+        country="BR",
+        exchange="B3",
+    )
+    assert _has_domestic_stock_instrument(opportunity("TEST3", domestic))
+    assert not _has_domestic_stock_instrument(None)
+    assert not _has_domestic_stock_instrument(
+        opportunity("TEST3", domestic.model_copy(update={"source": "status_invest"}))
+    )
+    assert not _has_domestic_stock_instrument(
+        opportunity(
+            "TEST3",
+            domestic.model_copy(update={"instrument_type": InstrumentType.bdr}),
+        )
+    )
+    assert not _has_domestic_stock_instrument(
+        opportunity("TEST3", domestic.model_copy(update={"category": "INTERNATIONAL"}))
+    )
+    assert not _has_domestic_stock_instrument(
+        opportunity("TEST3", domestic.model_copy(update={"country": "US"}))
+    )
+    assert not _has_domestic_stock_instrument(
+        opportunity("TEST3", domestic.model_copy(update={"exchange": "NYSE"}))
+    )
+
+
+@pytest.mark.parametrize(
+    ("ticker", "instrument_type", "category"),
+    [
+        ("ACME", InstrumentType.stock, "INTERNATIONAL"),
+        ("AAPL34", InstrumentType.bdr, "SHARES"),
+    ],
+)
+async def test_quality_keeps_instrument_lookup_for_non_domestic_opportunity_identity(
+    ticker: str,
+    instrument_type: InstrumentType,
+    category: str,
+) -> None:
+    instrument = InstrumentMetadata(
+        ticker=ticker,
+        name="Test",
+        instrument_type=instrument_type,
+        category=category,
+        isin="US0000000001" if category == "INTERNATIONAL" else "BRAAPL34E1",
+    )
+    instruments = InstrumentsStub({ticker: instrument_data(ticker, instrument)})
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        instruments,  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+    supplied_snapshot = stock_snapshot().model_copy(update={"ticker": ticker})
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker=ticker, kind=QualityAssetKind.stock)]
+        ),
+        opportunity_by_ticker={ticker: opportunity(ticker, instrument)},
+        fundamentals_by_ticker={ticker: supplied_snapshot},
+    )
+
+    assert response.assets[0].facts
+    assert instruments.calls == [(ticker, InstrumentType.stock)]
 
 
 async def test_resolves_bank_specific_macro_peer_and_prudential_facts() -> None:
@@ -719,6 +1045,109 @@ async def test_resolves_etf_cost_scale_and_diversification_facts() -> None:
     assert facts["fund_age_years"] is not None
 
 
+async def test_assessment_can_reuse_opportunity_without_a_second_provider_call() -> None:
+    instrument = InstrumentMetadata(ticker="TEST3", instrument_type=InstrumentType.stock)
+    opportunity_provider = OpportunityStub({"TEST3": opportunity("TEST3", instrument)})
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"TEST3": instrument_data("TEST3", instrument)}),  # type: ignore[arg-type]
+        opportunity_provider,  # type: ignore[arg-type]
+    )
+
+    await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+        ),
+        opportunity_by_ticker={"TEST3": opportunity("TEST3", instrument)},
+    )
+
+    assert opportunity_provider.calls == []
+
+
+async def test_quality_does_not_repeat_a_failed_b3_identity_lookup() -> None:
+    instrument = InstrumentMetadata(ticker="TEST3", instrument_type=InstrumentType.stock)
+    provided = opportunity("TEST3", instrument).model_copy(
+        update={
+            "instrument": None,
+            "source_failures": {"b3": "PROVIDER_UNAVAILABLE"},
+        }
+    )
+    instruments = InstrumentsStub({})
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        instruments,  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    result = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+        ),
+        opportunity_by_ticker={"TEST3": provided},
+        fundamentals_by_ticker={"TEST3": stock_snapshot()},
+    )
+
+    assert instruments.calls == []
+    assert result.assets[0].unavailable_reason == "Instrument metadata unavailable"
+
+
+async def test_etf_quality_does_not_call_equity_opportunity_provider() -> None:
+    instrument = InstrumentMetadata(ticker="ETF", instrument_type=InstrumentType.etf)
+    profile = FundProfile(
+        net_assets=Decimal("100000000"),
+        inception_date=date(2020, 1, 1),
+        holdings=[FundHolding(symbol="A", weight=Decimal("1"))],
+        source="public_fund_profile",
+    )
+    opportunity_provider = OpportunityStub({})
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ETF": instrument_data("ETF", instrument, fund_profile=profile)}),  # type: ignore[arg-type]
+        opportunity_provider,  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(assets=[QualityAssetRequest(ticker="ETF", kind=QualityAssetKind.etf)])
+    )
+
+    assert response.assets[0].unavailable_reason is None
+    assert opportunity_provider.calls == []
+
+
+@pytest.mark.parametrize("use_provided_opportunity", [False, True])
+async def test_real_estate_fund_quality_skips_instrument_lookup(
+    use_provided_opportunity: bool,
+) -> None:
+    instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
+    resolved_opportunity = opportunity("FUND11", instrument)
+    instruments = InstrumentsStub({})
+    opportunity_provider = OpportunityStub({"FUND11": resolved_opportunity})
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        instruments,  # type: ignore[arg-type]
+        opportunity_provider,  # type: ignore[arg-type]
+    )
+    request = QualityFactsRequest(
+        assets=[
+            QualityAssetRequest(
+                ticker="FUND11",
+                kind=QualityAssetKind.real_estate_fund,
+            )
+        ]
+    )
+    if use_provided_opportunity:
+        response = await service.resolve(
+            request,
+            opportunity_by_ticker={"FUND11": resolved_opportunity},
+        )
+    else:
+        response = await service.resolve(request)
+
+    assert response.assets[0].facts
+    assert instruments.calls == []
+    assert opportunity_provider.calls == ([] if use_provided_opportunity else ["FUND11"])
+
+
 async def test_reports_missing_etf_profile() -> None:
     instrument = InstrumentMetadata(ticker="ETF", instrument_type=InstrumentType.etf)
     service = QualityFactsService(
@@ -861,6 +1290,245 @@ async def test_fund_with_short_history_explains_missing_stability() -> None:
     facts = {fact.key: fact for fact in response.assets[0].facts}
     assert facts["distribution_stability"].status == "missing_data"
     assert "six distributions" in (facts["distribution_stability"].unavailable_reason or "")
+
+
+async def test_fund_distribution_facts_keep_status_invest_provenance() -> None:
+    instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
+    event_dates = [date(2026, month, 15) for month in range(1, 7)]
+    distributions = [
+        FundDistribution(ex_date=event_date, value=Decimal("1"), source="status_invest")
+        for event_date in event_dates
+    ]
+    evidence = [
+        FundDistributionEvidence(
+            ex_date=event_date,
+            value=Decimal("1"),
+            status="single_source",
+            reason="Only one independent source was available",
+            confidence=Decimal("0.55"),
+            sources=["status_invest"],
+            independent_sources=["status_invest"],
+            source_lineage=["status_invest"],
+        )
+        for event_date in event_dates
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"FUND11": instrument_data("FUND11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "FUND11": opportunity(
+                    "FUND11",
+                    instrument,
+                    distributions=distributions,
+                    distribution_evidence=evidence,
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[
+                    QualityAssetRequest(
+                        ticker="FUND11",
+                        kind=QualityAssetKind.real_estate_fund,
+                    )
+                ]
+            )
+        )
+    ).assets[0]
+
+    facts = {fact.key: fact for fact in result.facts}
+    assert "status_invest" in result.sources
+    assert "cvm" not in result.sources
+    for key in (
+        "distribution_history_months",
+        "distribution_stability",
+        "positive_distribution_frequency",
+    ):
+        assert facts[key].source == "status_invest"
+        assert facts[key].source_lineage == ["status_invest"]
+        assert facts[key].independent_source_count == 1
+        assert facts[key].confidence == Decimal("0.55")
+
+
+async def test_fund_with_non_latest_conflict_withholds_truncated_distribution_history() -> None:
+    instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
+    event_dates = [date(2025 + index // 12, index % 12 + 1, 15) for index in range(13)]
+    reports = [
+        FundMonthlyReport(
+            as_of=event_date.replace(day=1),
+            nav_per_share=Decimal("100"),
+            monthly_distribution_yield=Decimal("0.01"),
+        )
+        for event_date in event_dates
+    ]
+    distributions = [
+        FundDistribution(ex_date=event_date, value=Decimal("1"), source="cvm")
+        for index, event_date in enumerate(event_dates)
+        if index != 5
+    ]
+    evidence = [
+        FundDistributionEvidence(
+            ex_date=event_date,
+            value=Decimal("1") if index != 5 else None,
+            status="single_source" if index != 5 else "conflict",
+            reason=(
+                "Only one independent source was available"
+                if index != 5
+                else "Independent sources disagree without a clear majority"
+            ),
+            confidence=Decimal("0.55") if index != 5 else Decimal("0"),
+            sources=["cvm"] if index != 5 else ["fundamentus", "status_invest"],
+            independent_sources=["cvm"] if index != 5 else ["fundamentus", "status_invest"],
+            source_lineage=["cvm"] if index != 5 else ["fundamentus", "status_invest"],
+            observations=(
+                []
+                if index != 5
+                else [
+                    OpportunityObservation(
+                        value=Decimal("1"),
+                        source="fundamentus",
+                        as_of=event_date,
+                        unit="BRL",
+                        source_lineage=["fundamentus"],
+                        independent_origin="fundamentus",
+                    ),
+                    OpportunityObservation(
+                        value=Decimal("1.5"),
+                        source="status_invest",
+                        as_of=event_date,
+                        unit="BRL",
+                        source_lineage=["status_invest"],
+                        independent_origin="status_invest",
+                    ),
+                ]
+            ),
+        )
+        for index, event_date in enumerate(event_dates)
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"FUND11": instrument_data("FUND11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "FUND11": opportunity(
+                    "FUND11",
+                    instrument,
+                    reports=reports,
+                    distributions=distributions,
+                    distribution_evidence=evidence,
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[
+                    QualityAssetRequest(
+                        ticker="FUND11",
+                        kind=QualityAssetKind.real_estate_fund,
+                    )
+                ]
+            )
+        )
+    ).assets[0]
+    facts = {fact.key: fact for fact in result.facts}
+    affected = {
+        "distribution_history_months",
+        "distribution_stability",
+        "positive_distribution_frequency",
+        "distribution_growth",
+        "distribution_cut_frequency",
+        "distribution_report_consistency_error",
+    }
+    for key in affected:
+        assert facts[key].value is None
+        assert facts[key].status == "missing_data"
+        assert facts[key].unavailable_reason == (
+            "Recent distribution history contains unresolved source observations"
+        )
+    assert facts["reporting_history_months"].value == Decimal("13")
+    assert facts["reporting_regularity"].value is not None
+    assert result.warnings == [
+        "Recent distribution history contains unresolved source observations; "
+        "distribution-derived history facts were withheld"
+    ]
+
+
+async def test_fund_conflict_outside_recent_distribution_window_keeps_recent_facts() -> None:
+    instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
+    event_dates = [date(2023 + index // 12, index % 12 + 1, 15) for index in range(37)]
+    reports = [
+        FundMonthlyReport(
+            as_of=event_date.replace(day=1),
+            nav_per_share=Decimal("100"),
+            monthly_distribution_yield=Decimal("0.01"),
+        )
+        for event_date in event_dates
+    ]
+    distributions = [
+        FundDistribution(ex_date=event_date, value=Decimal("1"), source="cvm")
+        for index, event_date in enumerate(event_dates)
+        if index != 0
+    ]
+    evidence = [
+        FundDistributionEvidence(
+            ex_date=event_date,
+            value=Decimal("1") if index != 0 else None,
+            status="single_source" if index != 0 else "conflict",
+            reason=(
+                "Only one independent source was available"
+                if index != 0
+                else "Independent sources disagree without a clear majority"
+            ),
+            confidence=Decimal("0.55") if index != 0 else Decimal("0"),
+            sources=["cvm"] if index != 0 else ["fundamentus", "status_invest"],
+            independent_sources=["cvm"] if index != 0 else ["fundamentus", "status_invest"],
+            source_lineage=["cvm"] if index != 0 else ["fundamentus", "status_invest"],
+        )
+        for index, event_date in enumerate(event_dates)
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"FUND11": instrument_data("FUND11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "FUND11": opportunity(
+                    "FUND11",
+                    instrument,
+                    reports=reports,
+                    distributions=distributions,
+                    distribution_evidence=evidence,
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    result = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[
+                    QualityAssetRequest(
+                        ticker="FUND11",
+                        kind=QualityAssetKind.real_estate_fund,
+                    )
+                ]
+            )
+        )
+    ).assets[0]
+    facts = {fact.key: fact for fact in result.facts}
+    assert facts["distribution_history_months"].value == Decimal("36")
+    assert facts["distribution_stability"].value == Decimal("0")
+    assert facts["positive_distribution_frequency"].value == Decimal("1")
+    assert facts["distribution_growth"].value is not None
+    assert facts["distribution_cut_frequency"].value == Decimal("0")
+    assert facts["distribution_report_consistency_error"].value == Decimal("0")
+    assert result.warnings == []
 
 
 async def test_fi_infra_derives_monthly_nav_returns_from_daily_cvm_history() -> None:
@@ -1026,3 +1694,130 @@ async def test_quality_endpoint_uses_bounded_service_contract() -> None:
     assert response.status_code == 200
     assert response.json()["assets"][0]["kind"] == "crypto"
     assert response.headers["cache-control"].startswith("private")
+
+
+async def test_quality_batch_isolates_known_provider_schema_failures() -> None:
+    class FailingInstruments:
+        async def get(
+            self,
+            _ticker: str,
+            _instrument_type: InstrumentType | None = None,
+        ) -> InstrumentDataResponse:
+            raise ValueError("malformed provider payload")
+
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        FailingInstruments(),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.etf)])
+    )
+
+    assert response.assets[0].unavailable_reason == "Quality evidence unavailable"
+    assert response.assets[0].error_code == "QUALITY_RESOLUTION_FAILED"
+    assert response.assets[0].retryable is True
+
+
+async def test_quality_reuses_provided_fundamentals_and_marks_missing_opportunity_evidence() -> (
+    None
+):
+    instrument = InstrumentMetadata(
+        ticker="TEST3",
+        name="Test",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+        isin="BRTESTACNOR0",
+    )
+    fundamentals = FundamentalsStub(stock_snapshot())
+    service = QualityFactsService(
+        fundamentals,  # type: ignore[arg-type]
+        InstrumentsStub({"TEST3": instrument_data("TEST3", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+        ),
+        opportunity_by_ticker={"TEST3": None},
+        fundamentals_by_ticker={"TEST3": stock_snapshot()},
+    )
+
+    facts = {fact.key: fact for fact in response.assets[0].facts}
+    assert fundamentals.calls == []
+    assert facts["daily_traded_value"].status == "missing_data"
+    assert facts["market_capitalization"].status == "missing_data"
+
+
+async def test_quality_reports_missing_provided_fundamentals_for_domestic_stock() -> None:
+    instrument = InstrumentMetadata(
+        ticker="TEST3",
+        name="Test",
+        instrument_type=InstrumentType.stock,
+        category="SHARES",
+        isin="BRTESTACNOR0",
+    )
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"TEST3": instrument_data("TEST3", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    response = await service.resolve(
+        QualityFactsRequest(
+            assets=[QualityAssetRequest(ticker="TEST3", kind=QualityAssetKind.stock)]
+        ),
+        opportunity_by_ticker={"TEST3": None},
+        fundamentals_by_ticker={"TEST3": None},
+    )
+
+    assert response.assets[0].unavailable_reason == "Fundamentals evidence unavailable"
+    assert response.assets[0].error_code is None
+    assert response.assets[0].retryable is False
+
+
+async def test_quality_reports_missing_or_reuses_provided_international_fundamentals() -> None:
+    instrument = InstrumentMetadata(
+        ticker="ACME",
+        instrument_type=InstrumentType.stock,
+        category="INTERNATIONAL",
+        isin="US0000000001",
+    )
+    data = instrument_data("ACME", instrument)
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ACME": data}),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+    request = QualityFactsRequest(
+        assets=[QualityAssetRequest(ticker="ACME", kind=QualityAssetKind.stock)]
+    )
+
+    missing = await service.resolve(
+        request,
+        opportunity_by_ticker={"ACME": None},
+        fundamentals_by_ticker={"ACME": None},
+    )
+    assert missing.assets[0].unavailable_reason == "Fundamentals evidence unavailable"
+    assert missing.assets[0].error_code is None
+    assert missing.assets[0].retryable is False
+
+    supplied = stock_snapshot().model_copy(update={"ticker": "ACME"})
+    resolved = await service.resolve(
+        request,
+        opportunity_by_ticker={"ACME": None},
+        fundamentals_by_ticker={"ACME": supplied},
+    )
+    assert resolved.assets[0].facts
+
+
+def test_quality_market_scale_helpers_explain_absent_opportunity_values() -> None:
+    facts = _market_scale_facts(None)
+
+    assert [fact.key for fact in facts] == ["daily_traded_value", "market_capitalization"]
+    assert all(fact.status == "missing_data" for fact in facts)
+    assert _metric_fact("market_capitalization", None, "currency").unavailable_reason == (
+        "Opportunity evidence unavailable"
+    )

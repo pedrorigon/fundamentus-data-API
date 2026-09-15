@@ -5,11 +5,13 @@ import csv
 import io
 import unicodedata
 import zipfile
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from time import monotonic
 
 import httpx
 
@@ -19,6 +21,7 @@ from app.core.archive_safety import (
     open_validated_zip,
     read_bounded_body,
 )
+from app.core.errors import APIError, ProviderInvalidResponseError, ProviderUnavailableError
 from app.models import InstrumentMetadata, InstrumentType
 
 SOURCE_CVM = "cvm"
@@ -48,13 +51,20 @@ class FundReportPoint:
 
 
 @dataclass(frozen=True)
+class FundArchiveFailure:
+    path: str
+    code: str
+
+
+@dataclass(frozen=True)
 class FundReportSeries:
     cnpj: str | None = None
     reports: tuple[FundReportPoint, ...] = ()
+    archive_failures: tuple[FundArchiveFailure, ...] = ()
 
 
 class CvmFundReportProvider:
-    """Load official CVM fund reports and retain downloaded archives in memory."""
+    """Load official CVM fund reports with bounded, shared in-process caches."""
 
     def __init__(
         self,
@@ -63,10 +73,17 @@ class CvmFundReportProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._archives: dict[str, bytes | None] = {}
+        self._report_cache_max_entries = max(settings.cvm_report_cache_max_entries, 1)
+        self._archive_cache_max_entries = max(settings.cvm_archive_cache_max_entries, 1)
+        self._archive_cache_max_bytes = max(settings.cvm_archive_cache_max_bytes, 1)
+        self._cache_ttl_seconds = max(settings.instrument_data_ttl_seconds, 0)
+        self._archives: OrderedDict[str, tuple[float, bytes | None]] = OrderedDict()
+        self._archive_cache_bytes = 0
         self._archive_tasks: dict[str, asyncio.Task[bytes | None]] = {}
         self._archive_lock = asyncio.Lock()
-        self._reports: dict[tuple[str, str, str, str, date], FundReportSeries] = {}
+        self._reports: OrderedDict[
+            tuple[str, str, str, str, date], tuple[float, FundReportSeries]
+        ] = OrderedDict()
 
     async def reports(
         self,
@@ -80,20 +97,27 @@ class CvmFundReportProvider:
         reference = today or datetime.now(UTC).date()
         cache_key = (
             instrument.instrument_type.value,
-            instrument.ticker,
-            instrument.isin or "",
+            instrument.ticker.strip().upper(),
+            (instrument.isin or "").strip().upper(),
             _digits(cnpj),
             reference,
         )
-        if cache_key in self._reports:
-            return self._reports[cache_key]
+        cached = self._reports.get(cache_key)
+        if cached is not None:
+            expires_at, result = cached
+            if expires_at > monotonic():
+                self._reports.move_to_end(cache_key)
+                return result
+            self._reports.pop(cache_key, None)
         if instrument.instrument_type is InstrumentType.fi_infra:
             result = await self._fi_infra_reports(cnpj, reference)
         elif instrument.instrument_type in {InstrumentType.fii, InstrumentType.fiagro}:
             result = await self._listed_fund_reports(instrument, reference)
         else:
             result = FundReportSeries()
-        self._reports[cache_key] = result
+        self._reports[cache_key] = (monotonic() + self._cache_ttl_seconds, result)
+        self._reports.move_to_end(cache_key)
+        _trim_lru(self._reports, self._report_cache_max_entries)
         return result
 
     async def _listed_fund_reports(
@@ -103,23 +127,38 @@ class CvmFundReportProvider:
     ) -> FundReportSeries:
         years = range(reference.year - _FII_HISTORY_YEARS + 1, reference.year + 1)
         paths = [f"/dados/FII/DOC/INF_MENSAL/DADOS/inf_mensal_fii_{year}.zip" for year in years]
-        payloads = await asyncio.gather(*(self._download(path) for path in paths))
-        candidates = [
-            parse_fii_reports(payload, instrument) for payload in payloads if payload is not None
+        payloads, failures = await self._download_many(paths)
+        if not payloads and failures:
+            raise failures[0][1]
+        archive_failures = [
+            FundArchiveFailure(path=path, code=error.code) for path, error in failures
         ]
+        candidates = [parse_fii_reports(payload, instrument) for payload in payloads]
         if instrument.instrument_type is InstrumentType.fiagro:
             fiagro_paths = [
                 (f"/dados/FIAGRO/DOC/INF_MENSAL/DADOS/inf_mensal_fiagro_{year}{month:02d}.zip")
                 for year, month in _months_until(reference, 18)
                 if (year, month) >= (2025, 8)
             ]
-            fiagro_payloads = await asyncio.gather(*(self._download(path) for path in fiagro_paths))
-            candidates.extend(
-                parse_fiagro_reports(payload, instrument)
-                for payload in fiagro_payloads
-                if payload is not None
+            fiagro_payloads, fiagro_failures = await self._download_many(fiagro_paths)
+            if (
+                not fiagro_payloads
+                and fiagro_failures
+                and not any(candidate.reports for candidate in candidates)
+            ):
+                raise fiagro_failures[0][1]
+            archive_failures.extend(
+                FundArchiveFailure(path=path, code=error.code) for path, error in fiagro_failures
             )
-        return merge_report_series(candidates)
+            candidates.extend(
+                parse_fiagro_reports(payload, instrument) for payload in fiagro_payloads
+            )
+        merged = merge_report_series(candidates)
+        return FundReportSeries(
+            cnpj=merged.cnpj,
+            reports=merged.reports,
+            archive_failures=(*merged.archive_failures, *archive_failures),
+        )
 
     async def _fi_infra_reports(
         self,
@@ -133,33 +172,105 @@ class CvmFundReportProvider:
             (f"/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_{year}{month:02d}.zip")
             for year, month in _months_until(reference, _FI_INFRA_HISTORY_MONTHS)
         ]
-        payloads = await asyncio.gather(*(self._download(path) for path in paths))
+        payloads, failures = await self._download_many(paths)
+        if not payloads and failures:
+            raise failures[0][1]
         reports = [
             point
             for payload in payloads
-            if payload is not None
             for point in parse_daily_fund_reports(payload, normalized_cnpj)
         ]
         return FundReportSeries(
             cnpj=normalized_cnpj,
             reports=_latest_version_by_month(reports),
+            archive_failures=tuple(
+                FundArchiveFailure(path=path, code=error.code) for path, error in failures
+            ),
         )
 
     async def _download(self, path: str) -> bytes | None:
-        if path in self._archives:
-            return self._archives[path]
         async with self._archive_lock:
-            if path in self._archives:
-                return self._archives[path]
+            self._purge_expired_archives()
+            cached = self._archives.get(path)
+            if cached is not None:
+                self._archives.move_to_end(path)
+                return cached[1]
             task = self._archive_tasks.get(path)
             if task is None:
-                task = asyncio.create_task(self._request(path))
+                task = asyncio.create_task(self._fetch_and_cache(path))
+                task.add_done_callback(_consume_task_exception)
                 self._archive_tasks[path] = task
-        payload = await task
-        async with self._archive_lock:
-            self._archives[path] = payload
-            self._archive_tasks.pop(path, None)
-        return payload
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache(self, path: str) -> bytes | None:
+        task = asyncio.current_task()
+        try:
+            payload = await self._request(path)
+            async with self._archive_lock:
+                if self._archive_tasks.get(path) is task:
+                    self._cache_archive(path, payload)
+                    self._archive_tasks.pop(path, None)
+            return payload
+        except BaseException:
+            async with self._archive_lock:
+                if self._archive_tasks.get(path) is task:
+                    self._archive_tasks.pop(path, None)
+            raise
+
+    def _cache_archive(self, path: str, payload: bytes | None) -> None:
+        """Store one completed archive while holding ``_archive_lock``."""
+
+        self._purge_expired_archives()
+        self._remove_archive(path)
+        if payload is not None and len(payload) > self._archive_cache_max_bytes:
+            return
+        self._archives[path] = (monotonic() + self._cache_ttl_seconds, payload)
+        self._archives.move_to_end(path)
+        if payload is not None:
+            self._archive_cache_bytes += len(payload)
+        self._trim_archive_cache()
+
+    def _purge_expired_archives(self) -> None:
+        now = monotonic()
+        for path, (expires_at, _payload) in tuple(self._archives.items()):
+            if expires_at <= now:
+                self._remove_archive(path)
+
+    def _trim_archive_cache(self) -> None:
+        while (
+            len(self._archives) > self._archive_cache_max_entries
+            or self._archive_cache_bytes > self._archive_cache_max_bytes
+        ):
+            path, _entry = self._archives.popitem(last=False)
+            self._remove_archive_bytes(_entry[1])
+
+    def _remove_archive(self, path: str) -> None:
+        entry = self._archives.pop(path, None)
+        if entry is not None:
+            self._remove_archive_bytes(entry[1])
+
+    def _remove_archive_bytes(self, payload: bytes | None) -> None:
+        if payload is not None:
+            self._archive_cache_bytes -= len(payload)
+
+    async def _download_many(
+        self,
+        paths: list[str],
+    ) -> tuple[list[bytes], list[tuple[str, APIError]]]:
+        results = await asyncio.gather(
+            *(self._download(path) for path in paths),
+            return_exceptions=True,
+        )
+        payloads: list[bytes] = []
+        failures: list[tuple[str, APIError]] = []
+        for path, result in zip(paths, results, strict=True):
+            if isinstance(result, bytes):
+                payloads.append(result)
+            elif isinstance(result, APIError):
+                failures.append((path, result))
+            elif isinstance(result, BaseException):
+                raise result
+        return payloads, failures
 
     async def _request(self, path: str) -> bytes | None:
         try:
@@ -173,14 +284,19 @@ class CvmFundReportProvider:
                 async with client.stream("GET", path) as response:
                     if response.status_code == 404:
                         return None
-                    response.raise_for_status()
+                    if not 200 <= response.status_code < 300:
+                        raise ProviderUnavailableError()
                     payload = await read_bounded_body(
                         response, self.settings.archive_download_max_bytes
                     )
                     with open_validated_zip(payload):
                         return payload
-        except (ArchiveSafetyError, httpx.HTTPError, zipfile.BadZipFile):
-            return None
+        except ProviderUnavailableError:
+            raise
+        except (ArchiveSafetyError, zipfile.BadZipFile) as exc:
+            raise ProviderInvalidResponseError() from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError() from exc
 
 
 def parse_fii_reports(
@@ -284,9 +400,10 @@ def parse_daily_fund_reports(payload: bytes, cnpj: str) -> tuple[FundReportPoint
 
 
 def merge_report_series(series: list[FundReportSeries]) -> FundReportSeries:
+    archive_failures = tuple(failure for item in series for failure in item.archive_failures)
     populated = [item for item in series if item.reports]
     if not populated:
-        return FundReportSeries()
+        return FundReportSeries(archive_failures=archive_failures)
     cnpj_counts: dict[str, int] = {}
     for item in populated:
         if item.cnpj:
@@ -295,7 +412,11 @@ def merge_report_series(series: list[FundReportSeries]) -> FundReportSeries:
     reports = [
         report for item in populated if cnpj is None or item.cnpj == cnpj for report in item.reports
     ]
-    return FundReportSeries(cnpj=cnpj, reports=_latest_version_by_date(reports))
+    return FundReportSeries(
+        cnpj=cnpj,
+        reports=_latest_version_by_date(reports),
+        archive_failures=archive_failures,
+    )
 
 
 def _monthly_report(
@@ -513,6 +634,19 @@ def _date(value: str | None) -> date | None:
 
 def _digits(value: str | None) -> str:
     return "".join(character for character in value or "" if character.isdigit())
+
+
+def _trim_lru[CacheKey, CacheValue](
+    cache: OrderedDict[CacheKey, CacheValue],
+    maximum: int,
+) -> None:
+    while len(cache) > max(maximum, 1):
+        cache.popitem(last=False)
+
+
+def _consume_task_exception(task: asyncio.Task[bytes | None]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _text(value: str | None) -> str | None:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -604,6 +606,7 @@ def test_resolver_requires_secondary_payment_consensus_and_uses_unique_majority(
 async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path) -> None:
     store = IncomeEventStore(tmp_path / "income.sqlite3")
     await store.startup()
+    await store.startup()
     first = _observation("cvm", authority=100, version=1)
     corrected = _observation("cvm", authority=100, version=2, payment_date=date(2026, 9, 12))
     await store.save_observations([first, corrected])
@@ -669,7 +672,7 @@ async def test_store_candidate_reads_include_tentative_but_exclude_cancelled(
 @pytest.mark.asyncio
 async def test_store_migrates_legacy_observation_columns(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             """
             CREATE TABLE income_event_observations (
@@ -752,6 +755,52 @@ class _Source:
         )
 
 
+class _EventGatedSource:
+    name = "gated"
+    snapshot_sources: tuple[str, ...] = ("official",)
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.as_of_values: list[date] = []
+        self.first_call_started = asyncio.Event()
+        self.second_call_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.calls += 1
+        self.as_of_values.append(as_of)
+        if self.calls == 1:
+            self.first_call_started.set()
+        elif self.calls == 2:
+            self.second_call_started.set()
+        await self.release.wait()
+        return IncomeSourceResult(
+            [_observation("official", authority=100)],
+            [
+                IncomeSourceCoverage(
+                    source=self.name, ticker=instruments[0].ticker, status="complete", complete=True
+                )
+            ],
+        )
+
+
+class _FailingCoverageStore(IncomeEventStore):
+    async def replace_observations(
+        self,
+        observations: list[IncomeEventObservation],
+        *,
+        snapshot_sources: tuple[str, ...],
+        complete_tickers: list[str],
+        snapshot_from: date,
+    ) -> int:
+        del observations, snapshot_sources, complete_tickers, snapshot_from
+        raise RuntimeError("observation persistence failed")
+
+
 @pytest.mark.asyncio
 async def test_service_singleflight_batch_and_failed_source(tmp_path: Path) -> None:
     store = IncomeEventStore(tmp_path / "income.sqlite3")
@@ -796,6 +845,176 @@ async def test_service_reuses_fresh_complete_source_coverage(tmp_path: Path) -> 
     assert source.calls == 1
     assert len((await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))).events) == 1
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_is_scoped_to_as_of_period(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    first_date = date(2026, 9, 1)
+    second_date = date(2026, 9, 2)
+    request = IncomeEventRefreshRequest(instruments=[IncomeInstrumentRequest(ticker="BBAS3")])
+
+    first = asyncio.create_task(service.refresh(request.model_copy(update={"as_of": first_date})))
+    await source.first_call_started.wait()
+    second = asyncio.create_task(service.refresh(request.model_copy(update={"as_of": second_date})))
+    await source.second_call_started.wait()
+
+    assert source.calls == 2
+    assert source.as_of_values == [first_date, second_date]
+
+    source.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.requested == second_result.requested == 1
+    assert first_result.observations == second_result.observations == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_canonicalizes_instrument_order(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    as_of = date(2026, 9, 1)
+    first_request = IncomeEventRefreshRequest(
+        instruments=[
+            IncomeInstrumentRequest(ticker="BBAS3"),
+            IncomeInstrumentRequest(ticker="PETR4"),
+        ],
+        as_of=as_of,
+    )
+    reversed_request = first_request.model_copy(
+        update={"instruments": list(reversed(first_request.instruments))}
+    )
+
+    first = asyncio.create_task(service.refresh(first_request))
+    await source.first_call_started.wait()
+    second = asyncio.create_task(service.refresh(reversed_request))
+    await asyncio.sleep(0)
+    assert source.calls == 1
+    assert not second.done()
+
+    source.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == second_result
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_shields_shared_task_from_cancelled_waiter(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 1),
+    )
+
+    first = asyncio.create_task(service.refresh(request))
+    await source.first_call_started.wait()
+    second = asyncio.create_task(service.refresh(request))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    third = asyncio.create_task(service.refresh(request))
+    await asyncio.sleep(0)
+    assert source.calls == 1
+    assert not second.done()
+    assert not third.done()
+
+    source.release.set()
+    second_result, third_result = await asyncio.gather(second, third)
+
+    assert second_result == third_result
+    assert source.calls == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_close_drains_shared_refresh_before_store_close(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 1),
+    )
+
+    refresh = asyncio.create_task(service.refresh(request))
+    await source.first_call_started.wait()
+    close = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+
+    source.release.set()
+    await close
+    assert refresh.done()
+    assert not service._inflight
+    with pytest.raises(RuntimeError, match="closed"):
+        await service.refresh(request)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_consumes_failure_when_all_waiters_cancel(tmp_path: Path) -> None:
+    store = _FailingCoverageStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 1),
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+
+    def capture_loop_error(
+        _loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_errors.append(context)
+
+    loop.set_exception_handler(capture_loop_error)
+    shared_task: asyncio.Task[object] | None = None
+    try:
+        first = asyncio.create_task(service.refresh(request))
+        await source.first_call_started.wait()
+        shared_task = next(iter(service._inflight.values()))
+        second = asyncio.create_task(service.refresh(request))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        second.cancel()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+
+        source.release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if shared_task.done() and not service._inflight:
+                break
+        assert shared_task.done()
+        assert not service._inflight
+
+        del shared_task
+        gc.collect()
+        assert loop_errors == []
+    finally:
+        source.release.set()
+        loop.set_exception_handler(previous_handler)
+        await store.close()
 
 
 async def _empty_source_collect(
@@ -921,6 +1140,79 @@ async def test_status_source_marks_http_failure_incomplete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_profile_singleflight_survives_cancelled_waiter() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, text="<profile>")
+
+    source = StatusInvestIncomeSource(
+        Settings(status_invest_base_url="https://status.test"),
+        httpx.MockTransport(handler),
+    )
+    instrument = IncomeInstrumentRequest(ticker="BBAS3")
+    async with source._client() as client:
+        first = asyncio.create_task(source._profile_html(client, instrument))
+        await started.wait()
+        second = asyncio.create_task(source._profile_html(client, instrument))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == "<profile>"
+        assert await source._profile_html(client, instrument) == "<profile>"
+
+    assert calls == 1
+    assert source._profile_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_status_collect_keeps_client_open_until_shared_producer_finishes() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        started.set()
+        await release.wait()
+        return httpx.Response(200, text="<profile>")
+
+    class TrackingTransport(httpx.MockTransport):
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+            await super().aclose()
+
+    transport = TrackingTransport(handler)
+    source = StatusInvestIncomeSource(
+        Settings(status_invest_base_url="https://status.test"),
+        transport,
+    )
+    collection = asyncio.create_task(
+        source.collect([IncomeInstrumentRequest(ticker="BBAS3")], date(2026, 9, 1))
+    )
+    await started.wait()
+
+    collection.cancel()
+    await asyncio.sleep(0)
+    assert not transport.closed
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await collection
+    assert transport.closed
+
+
+@pytest.mark.asyncio
 async def test_official_company_source_combines_b3_and_cvm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -966,6 +1258,42 @@ async def test_official_company_source_combines_b3_and_cvm(
         date(2026, 8, 27),
     )
     assert archive_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_official_cvm_document_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, content=b"pdf")
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: "report")
+    source = OfficialCompanyIncomeSource(Settings(), httpx.MockTransport(handler))
+    link = "https://cvm.test/report.pdf"
+    async with source._client() as client:
+        first = asyncio.create_task(source._cvm_document_text(client, link))
+        await started.wait()
+        second = asyncio.create_task(source._cvm_document_text(client, link))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == "report"
+        assert await source._cvm_document_text(client, link) == "report"
+
+    assert calls == 1
+    assert source._cvm_document_tasks == {}
 
 
 @pytest.mark.asyncio
@@ -1239,6 +1567,91 @@ async def test_fundos_net_source_filters_requested_ticker() -> None:
     assert all(item.observations for item in repeated)
     assert result.coverage[0].complete is True
     assert requests == {"index": 2, "document": 1, "status": 1}
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_rows_singleflight_survives_cancelled_waiter() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": "row-1", "dataEntrega": "02/01/2026"}],
+                "recordsFiltered": 1,
+            },
+        )
+
+    source = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(handler),
+    )
+    snapshot_from = date(2026, 1, 1)
+    expected = ([{"id": "row-1", "dataEntrega": "02/01/2026"}], True)
+    async with source._client() as client:
+        first = asyncio.create_task(source._rows_for_cnpj(client, "123", snapshot_from))
+        await started.wait()
+        second = asyncio.create_task(source._rows_for_cnpj(client, "123", snapshot_from))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == expected
+        assert await source._rows_for_cnpj(client, "123", snapshot_from) == expected
+
+    assert calls == 1
+    assert source._fund_row_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_document_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, content=b"<document/>")
+
+    monkeypatch.setattr(
+        "app.income.sources.parse_fundos_net_xml",
+        lambda *args, **kwargs: [],
+    )
+    source = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(handler),
+    )
+    row = {"id": "doc-1", "versao": 1}
+    async with source._client() as client:
+        first = asyncio.create_task(source._document(client, row))
+        await started.wait()
+        second = asyncio.create_task(source._document(client, row))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == []
+        assert await source._document(client, row) == []
+
+    assert calls == 1
+    assert source._document_tasks == {}
 
 
 @pytest.mark.asyncio

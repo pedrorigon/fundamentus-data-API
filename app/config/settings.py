@@ -2,7 +2,7 @@ from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_prefix="FUNDAMENTUS_API_",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     app_name: str = "Fundamentus Data API"
@@ -105,6 +106,13 @@ class Settings(BaseSettings):
     opportunity_cache_ttl_seconds: int = 900
     instrument_data_ttl_seconds: int = 86400
     ticker_cache_max_entries: int = 1024
+    # CVM report entries and ZIP payloads are bounded separately because a
+    # single archive can be hundreds of megabytes while report results are
+    # comparatively small.
+    cvm_report_cache_max_entries: int = Field(default=1024, ge=1)
+    cvm_archive_cache_max_entries: int = Field(default=32, ge=1)
+    cvm_archive_cache_max_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    memory_cache_max_entries: int = Field(default=4096, ge=1)
     fixed_income_current_ttl_seconds: int = 3600
     fixed_income_history_ttl_seconds: int = 2592000
     fixed_income_series_cache_max_entries: int = 2048
@@ -123,13 +131,42 @@ class Settings(BaseSettings):
 
     sqlite_cache_enabled: bool = True
     sqlite_cache_path: Path = Field(default=Path(".cache/fundamentus_cache.sqlite3"))
+    database_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FUNDAMENTUS_API_DATABASE_URL", "DATABASE_URL"),
+    )
+    assessment_sqlite_path: Path | None = None
+    # The longest CVM archive request is measured in minutes.  A lease shorter
+    # than that window permits a second worker to start the same paid/requested
+    # operation before the first worker can publish it.
+    assessment_lease_seconds: int = Field(default=3600, ge=1, le=3600)
+    assessment_max_attempts: int = Field(default=3, ge=1, le=10)
+    assessment_period_history_days: int = Field(default=370, ge=1, le=3650)
+    assessment_retry_backoff_seconds: int = Field(default=15, ge=0, le=3600)
 
     batch_limit: int = 20
     cache_invalidate_token: SecretStr | None = None
 
+    @field_validator("database_url", "assessment_sqlite_path", mode="before")
+    @classmethod
+    def empty_optional_storage_settings(cls, value: object) -> object:
+        """Treat blank compose substitutions as unset optional settings."""
+
+        return None if value is None or (isinstance(value, str) and not value.strip()) else value
+
     @property
     def details_ttl_seconds(self) -> int:
         return min(self.market_data_ttl_seconds, self.fundamentals_ttl_seconds)
+
+    @property
+    def resolved_assessment_sqlite_path(self) -> Path:
+        """Use a distinct DB so assessment writes cannot lock source cache rows."""
+
+        if self.assessment_sqlite_path is not None:
+            return self.assessment_sqlite_path
+        return self.sqlite_cache_path.with_name(
+            f"{self.sqlite_cache_path.stem}_assessments{self.sqlite_cache_path.suffix}"
+        )
 
     @property
     def anbima_feed_configured(self) -> bool:
