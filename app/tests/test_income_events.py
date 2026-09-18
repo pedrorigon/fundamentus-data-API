@@ -1861,3 +1861,56 @@ async def test_income_refresh_job_and_coverage_routes(tmp_path: Path) -> None:
         assert coverage.status_code == 200
         assert coverage.json()["items"][0]["complete"] is True
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_processes_a_queued_job_after_startup(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], worker_poll_seconds=0.01)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+    await service.startup()
+    try:
+        job = await service.refresh_async(request)
+        state = None
+        for _ in range(200):
+            state = await service.refresh_job(job.job_id)
+            if state is not None and state["status"] in {"completed", "partial"}:
+                break
+            await asyncio.sleep(0.01)
+        assert state is not None and state["status"] == "completed"
+        assert source.calls == 1
+    finally:
+        await service.close()
+    assert await store.coverage([]) == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_items_whose_source_is_unknown(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from app.income.store import ITEM_FAILED
+
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_Source()])
+    created = await store.create_refresh_job(
+        "job-ghost",
+        [("ghost", "BBAS3")],
+        requested=1,
+        as_of=date(2026, 9, 1),
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    assert created == 1
+    assert await service.process_pending_once() == 1
+    state = await service.refresh_job("job-ghost")
+    item = _job_item(state)
+    assert item["status"] == ITEM_FAILED
+    assert state is not None and state["status"] == "partial"
+    await store.close()
