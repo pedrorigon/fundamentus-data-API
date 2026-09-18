@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from fastapi.responses import PlainTextResponse
 
 from app import __version__
@@ -40,9 +40,12 @@ from app.models import (
     HealthResponse,
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
+    IncomeEventAsyncRefreshResponse,
     IncomeEventBatchRequest,
     IncomeEventBatchResponse,
     IncomeEventChangesResponse,
+    IncomeEventCoverageResponse,
+    IncomeEventRefreshJobResponse,
     IncomeEventRefreshRequest,
     IncomeEventRefreshResponse,
     InstrumentBatchRequest,
@@ -91,16 +94,49 @@ CacheTokenHeader = Annotated[str | None, Header(alias="X-Cache-Token")]
 
 @router.post(
     "/v2/income-events/refresh",
-    response_model=IncomeEventRefreshResponse,
+    response_model=IncomeEventRefreshResponse | IncomeEventAsyncRefreshResponse,
     tags=["income-events"],
 )
 async def refresh_income_events(
     payload: IncomeEventRefreshRequest,
     service: IncomeEventServiceDep,
+    response: Response,
     x_cache_token: CacheTokenHeader = None,
-) -> IncomeEventRefreshResponse:
+) -> IncomeEventRefreshResponse | IncomeEventAsyncRefreshResponse:
     _require_refresh_authorization(x_cache_token)
+    if payload.mode == "async":
+        response.status_code = status.HTTP_202_ACCEPTED
+        return await service.refresh_async(payload)
     return await service.refresh(payload)
+
+
+@router.get(
+    "/v2/income-events/refresh-jobs/{job_id}",
+    response_model=IncomeEventRefreshJobResponse,
+    responses={404: {"description": "Income refresh job not found"}},
+    tags=["income-events"],
+)
+async def get_income_refresh_job(
+    job_id: str,
+    service: IncomeEventServiceDep,
+) -> IncomeEventRefreshJobResponse:
+    job = await service.refresh_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Income refresh job not found")
+    return IncomeEventRefreshJobResponse.model_validate(job)
+
+
+@router.get(
+    "/v2/income-events/coverage",
+    response_model=IncomeEventCoverageResponse,
+    tags=["income-events"],
+)
+async def income_event_coverage(
+    service: IncomeEventServiceDep,
+    tickers: Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")],
+) -> IncomeEventCoverageResponse:
+    normalized = [value.strip().upper() for value in tickers.split(",") if value.strip()]
+    return await service.coverage(list(dict.fromkeys(normalized))[:100])
 
 
 @router.post(

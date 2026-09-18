@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -14,6 +14,15 @@ from app.models.income_events import (
     IncomeEventStatus,
     IncomeSourceCoverage,
 )
+
+REFRESH_QUEUED = "queued"
+REFRESH_RUNNING = "running"
+REFRESH_COMPLETED = "completed"
+REFRESH_PARTIAL = "partial"
+ITEM_QUEUED = "queued"
+ITEM_RUNNING = "running"
+ITEM_COMPLETE = "complete"
+ITEM_FAILED = "failed"
 
 
 class IncomeEventStore:
@@ -104,6 +113,49 @@ class IncomeEventStore:
                             """
                             INSERT OR IGNORE INTO income_event_sequence (singleton, value)
                             VALUES (1, 0)
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS income_refresh_jobs (
+                                job_id TEXT PRIMARY KEY,
+                                status TEXT NOT NULL,
+                                requested INTEGER NOT NULL,
+                                as_of TEXT NOT NULL,
+                                error TEXT,
+                                created_at TEXT NOT NULL,
+                                updated_at TEXT NOT NULL
+                            )
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS income_refresh_job_items (
+                                job_id TEXT NOT NULL,
+                                source TEXT NOT NULL,
+                                ticker TEXT NOT NULL,
+                                status TEXT NOT NULL,
+                                attempts INTEGER NOT NULL DEFAULT 0,
+                                lease_until TEXT,
+                                last_error TEXT,
+                                updated_at TEXT NOT NULL,
+                                PRIMARY KEY (job_id, source, ticker)
+                            )
+                            """
+                        )
+                        await db.execute(
+                            """
+                            CREATE INDEX IF NOT EXISTS ix_income_refresh_item_claim
+                                ON income_refresh_job_items (status, lease_until)
+                            """
+                        )
+                        # Persisted single-flight: one in-flight item per source
+                        # and ticker, shared by every API replica.
+                        await db.execute(
+                            """
+                            CREATE UNIQUE INDEX IF NOT EXISTS uq_income_refresh_item_inflight
+                                ON income_refresh_job_items (source, ticker)
+                                WHERE status IN ('queued', 'running')
                             """
                         )
                         await self._ensure_observation_active_column()
@@ -467,6 +519,283 @@ class IncomeEventStore:
             ) as cursor:
                 row = await cursor.fetchone()
         return int(row["value"]) if row else 0
+
+    async def create_refresh_job(
+        self,
+        job_id: str,
+        items: list[tuple[str, str]],
+        *,
+        requested: int,
+        as_of: date,
+        now: datetime,
+    ) -> int:
+        """Create a job and enqueue only the items no other job owns."""
+        moment = now.isoformat()
+        inserted = 0
+        async with self._lock:
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.execute(
+                    """
+                    INSERT INTO income_refresh_jobs (
+                        job_id, status, requested, as_of, error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (job_id, REFRESH_QUEUED, requested, as_of.isoformat(), moment, moment),
+                )
+                for source, ticker in items:
+                    cursor = await db.execute(
+                        """
+                        INSERT OR IGNORE INTO income_refresh_job_items (
+                            job_id, source, ticker, status, attempts, lease_until,
+                            last_error, updated_at
+                        ) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?)
+                        """,
+                        (job_id, source, ticker.upper(), ITEM_QUEUED, moment),
+                    )
+                    inserted += max(cursor.rowcount or 0, 0)
+        return inserted
+
+    async def claim_refresh_items(
+        self,
+        *,
+        limit: int,
+        lease_seconds: int,
+        now: datetime,
+    ) -> list[dict[str, object]]:
+        moment = now.isoformat()
+        lease = (now + timedelta(seconds=lease_seconds)).isoformat()
+        async with self._lock:
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.execute(
+                    """
+                    UPDATE income_refresh_job_items
+                    SET status = ?, lease_until = NULL, updated_at = ?
+                    WHERE status = ? AND lease_until IS NOT NULL AND lease_until <= ?
+                    """,
+                    (ITEM_QUEUED, moment, ITEM_RUNNING, moment),
+                )
+                async with db.execute(
+                    """
+                    SELECT i.job_id, i.source, i.ticker, i.attempts + 1 AS attempts, j.as_of
+                    FROM income_refresh_job_items i
+                    JOIN income_refresh_jobs j ON j.job_id = i.job_id
+                    WHERE i.status = ?
+                      AND (i.lease_until IS NULL OR i.lease_until <= ?)
+                    ORDER BY i.rowid
+                    LIMIT ?
+                    """,
+                    (ITEM_QUEUED, moment, limit),
+                ) as cursor:
+                    rows = [dict(row) for row in await cursor.fetchall()]
+                if rows:
+                    await db.executemany(
+                        """
+                        UPDATE income_refresh_job_items
+                        SET status = ?, attempts = attempts + 1, lease_until = ?, updated_at = ?
+                        WHERE job_id = ? AND source = ? AND ticker = ?
+                        """,
+                        [
+                            (
+                                ITEM_RUNNING,
+                                lease,
+                                moment,
+                                row["job_id"],
+                                row["source"],
+                                row["ticker"],
+                            )
+                            for row in rows
+                        ],
+                    )
+                    await db.executemany(
+                        """
+                        UPDATE income_refresh_jobs SET status = ?, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        [
+                            (REFRESH_RUNNING, moment, job_id)
+                            for job_id in {str(row["job_id"]) for row in rows}
+                        ],
+                    )
+        return rows
+
+    async def complete_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        now: datetime,
+    ) -> None:
+        await self._set_refresh_item(
+            job_id,
+            source,
+            ticker,
+            status=ITEM_COMPLETE,
+            lease_until=None,
+            last_error=None,
+            now=now,
+        )
+
+    async def requeue_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        error: str,
+        available_at: datetime,
+        now: datetime,
+    ) -> None:
+        await self._set_refresh_item(
+            job_id,
+            source,
+            ticker,
+            status=ITEM_QUEUED,
+            lease_until=available_at,
+            last_error=error[:200],
+            now=now,
+        )
+
+    async def fail_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        error: str,
+        now: datetime,
+    ) -> None:
+        await self._set_refresh_item(
+            job_id,
+            source,
+            ticker,
+            status=ITEM_FAILED,
+            lease_until=None,
+            last_error=error[:200],
+            now=now,
+        )
+
+    async def _set_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        status: str,
+        lease_until: datetime | None,
+        last_error: str | None,
+        now: datetime,
+    ) -> None:
+        async with self._lock:
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.execute(
+                    """
+                    UPDATE income_refresh_job_items
+                    SET status = ?, lease_until = ?, last_error = ?, updated_at = ?
+                    WHERE job_id = ? AND source = ? AND ticker = ?
+                    """,
+                    (
+                        status,
+                        lease_until.isoformat() if lease_until is not None else None,
+                        last_error,
+                        now.isoformat(),
+                        job_id,
+                        source,
+                        ticker.upper(),
+                    ),
+                )
+
+    async def pending_refresh_item_count(self, job_id: str) -> int:
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(
+                """
+                SELECT COUNT(*) AS total FROM income_refresh_job_items
+                WHERE job_id = ? AND status IN (?, ?)
+                """,
+                (job_id, ITEM_QUEUED, ITEM_RUNNING),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return int(row["total"]) if row else 0
+
+    async def job_tickers(self, job_id: str) -> list[str]:
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(
+                """
+                SELECT DISTINCT ticker FROM income_refresh_job_items
+                WHERE job_id = ? ORDER BY ticker
+                """,
+                (job_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [str(row["ticker"]) for row in rows]
+
+    async def finish_refresh_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error: str | None,
+        now: datetime,
+    ) -> None:
+        async with self._lock:
+            db = self._require_db()
+            async with sqlite_transaction(db, self.path):
+                await db.execute(
+                    """
+                    UPDATE income_refresh_jobs SET status = ?, error = ?, updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (status, error[:200] if error else None, now.isoformat(), job_id),
+                )
+
+    async def refresh_job(self, job_id: str) -> dict[str, object] | None:
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(
+                "SELECT * FROM income_refresh_jobs WHERE job_id = ?", (job_id,)
+            ) as cursor:
+                job = await cursor.fetchone()
+            if job is None:
+                return None
+            async with db.execute(
+                """
+                SELECT source, ticker, status, attempts, last_error
+                FROM income_refresh_job_items WHERE job_id = ?
+                ORDER BY source, ticker
+                """,
+                (job_id,),
+            ) as cursor:
+                items = [dict(row) for row in await cursor.fetchall()]
+        return {
+            "job_id": str(job["job_id"]),
+            "status": str(job["status"]),
+            "requested": int(job["requested"]),
+            "error": job["error"],
+            "created_at": str(job["created_at"]),
+            "updated_at": str(job["updated_at"]),
+            "completed": sum(1 for item in items if item["status"] == ITEM_COMPLETE),
+            "failed": sum(1 for item in items if item["status"] == ITEM_FAILED),
+            "items": items,
+        }
+
+    async def coverage(self, tickers: list[str]) -> list[IncomeSourceCoverage]:
+        if not tickers:
+            return []
+        placeholders = ",".join("?" for _ in tickers)
+        query = (
+            "SELECT payload FROM income_source_coverage "
+            f"WHERE ticker IN ({placeholders}) ORDER BY ticker, source"
+        )  # noqa: S608 - placeholders are generated, never user-controlled
+        async with self._lock:
+            db = self._require_db()
+            async with db.execute(query, [ticker.upper() for ticker in tickers]) as cursor:
+                rows = await cursor.fetchall()
+        return [IncomeSourceCoverage.model_validate_json(row["payload"]) for row in rows]
 
     async def _existing(self, event_id: str) -> CanonicalIncomeEvent | None:
         db = self._require_db()

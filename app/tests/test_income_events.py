@@ -1713,3 +1713,151 @@ def _zip_many() -> bytes:
         archive.writestr("first.csv", b"a\n1\n")
         archive.writestr("second.csv", b"a\n2\n")
     return buffer.getvalue()
+
+
+def _job_item(state: dict[str, object] | None) -> dict[str, object]:
+    assert state is not None
+    items = state["items"]
+    assert isinstance(items, list) and items
+    item = items[0]
+    assert isinstance(item, dict)
+    return item
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_job_deduplicates_and_processes_in_the_background(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    first = await service.refresh_async(request)
+    second = await service.refresh_async(request)
+
+    assert first.queued == 1
+    assert first.deduplicated == 0
+    assert second.queued == 0
+    assert second.deduplicated == 1
+
+    assert await service.process_pending_once() == 1
+    assert source.calls == 1
+    first_job = await service.refresh_job(first.job_id)
+    second_job = await service.refresh_job(second.job_id)
+    assert first_job is not None and first_job["status"] == "completed"
+    assert second_job is not None and second_job["status"] == "completed"
+    batch = await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))
+    assert len(batch.events) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_reuses_fresh_coverage_before_queueing(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+    reused = await service.refresh_async(request)
+
+    assert reused.queued == 0
+    assert reused.deduplicated == 0
+    reused_job = await service.refresh_job(reused.job_id)
+    assert reused_job is not None and reused_job["status"] == "completed"
+    assert source.calls == 1
+    coverage = await service.coverage(["BBAS3"])
+    assert coverage.items[0].complete is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_requeues_a_failed_item_with_backoff(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(fail=True)
+    service = IncomeEventService(store, [source], job_max_attempts=3)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    job = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+
+    state = await service.refresh_job(job.job_id)
+    item = _job_item(state)
+    assert state is not None
+    assert state["status"] == "running"
+    assert state["failed"] == 0
+    assert item["status"] == "queued"
+    assert item["attempts"] == 1
+    assert item["last_error"] == "offline"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_marks_an_exhausted_item_as_failed(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(fail=True)
+    service = IncomeEventService(store, [source], job_max_attempts=1)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    job = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+
+    state = await service.refresh_job(job.job_id)
+    item = _job_item(state)
+    assert state is not None
+    assert state["status"] == "partial"
+    assert state["failed"] == 1
+    assert item["status"] == "failed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_income_refresh_job_and_coverage_routes(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_Source()])
+    app = create_app()
+    app.dependency_overrides[get_income_event_service] = lambda: service
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post(
+            "/v2/income-events/refresh",
+            json={"instruments": [{"ticker": "BBAS3"}], "mode": "async"},
+        )
+        assert accepted.status_code == 202
+        body = accepted.json()
+        assert body["queued"] == 1
+
+        await service.process_pending_once()
+        job = await client.get(f"/v2/income-events/refresh-jobs/{body['job_id']}")
+        assert job.status_code == 200
+        assert job.json()["status"] == "completed"
+        missing = await client.get("/v2/income-events/refresh-jobs/deadbeef")
+        assert missing.status_code == 404
+
+        coverage = await client.get(
+            "/v2/income-events/coverage",
+            params={"tickers": "BBAS3,bbas3"},
+        )
+        assert coverage.status_code == 200
+        assert coverage.json()["items"][0]["complete"] is True
+    await store.close()

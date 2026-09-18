@@ -101,6 +101,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             snapshot_overlap_days=settings.income_snapshot_overlap_days,
             refresh_ttl_seconds=settings.income_refresh_ttl_seconds,
         )
+        await getattr(income_event_service, "startup", _noop)()
         app.state.income_event_service = income_event_service
         app.state.opportunity_service = OpportunityService(asset_service, settings)
         instrument_data_service = InstrumentDataService(settings)
