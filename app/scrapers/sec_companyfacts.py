@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -223,7 +224,8 @@ class SecCompanyFactsProvider:
     ) -> None:
         self.settings = settings
         self.transport = transport
-        self._cache: dict[str, _CachedValue] = {}
+        self._cache_max_entries = max(settings.ticker_cache_max_entries, 1)
+        self._cache: OrderedDict[str, _CachedValue] = OrderedDict()
         self._inflight: dict[str, asyncio.Task[Any]] = {}
         self._lock = asyncio.Lock()
 
@@ -278,26 +280,43 @@ class SecCompanyFactsProvider:
         loader: Any,
         ttl_seconds: int,
     ) -> Any | None:
-        now = asyncio.get_running_loop().time()
-        cached = self._cache.get(key)
-        if cached is not None and cached.expires_at > now:
-            return cached.value
         async with self._lock:
+            now = asyncio.get_running_loop().time()
             cached = self._cache.get(key)
-            if cached is not None and cached.expires_at > now:
-                return cached.value
+            if cached is not None:
+                if cached.expires_at > now:
+                    self._cache.move_to_end(key)
+                    return cached.value
+                self._cache.pop(key, None)
             task = self._inflight.get(key)
             if task is None:
-                task = asyncio.create_task(loader())
+                task = asyncio.create_task(self._load_and_cache(key, loader, ttl_seconds))
                 self._inflight[key] = task
-        try:
-            value = await task
-        finally:
-            async with self._lock:
-                if self._inflight.get(key) is task:
-                    self._inflight.pop(key, None)
-        self._cache[key] = _CachedValue(now + ttl_seconds, value)
+                task.add_done_callback(lambda completed: self._complete_inflight(key, completed))
+        # A cancelled caller must not cancel the shared provider request.  The
+        # shared operation owns cache writes and cleanup so one waiter cannot
+        # remove work that another waiter still needs.
+        return await asyncio.shield(task)
+
+    async def _load_and_cache(self, key: str, loader: Any, ttl_seconds: int) -> Any | None:
+        value = await loader()
+        async with self._lock:
+            self._cache[key] = _CachedValue(asyncio.get_running_loop().time() + ttl_seconds, value)
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max_entries:
+                self._cache.popitem(last=False)
         return value
+
+    def _complete_inflight(self, key: str, task: asyncio.Task[Any]) -> None:
+        """Drop only the completed task that still owns its cache key."""
+        if self._inflight.get(key) is task:
+            self._inflight.pop(key, None)
+
+        # If every waiter was cancelled, retrieve a failed task's exception so
+        # the event loop does not report an unhandled-task warning.  Waiters
+        # still receive the original exception when they await the task.
+        if not task.cancelled():
+            task.exception()
 
     async def _fetch_json_url(self, url: str) -> Any | None:
         return await self._fetch_json(url, None)

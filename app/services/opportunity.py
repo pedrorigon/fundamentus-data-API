@@ -1,20 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from time import monotonic
 
 import httpx
 from selectolax.parser import HTMLParser
 
 from app.config import Settings
-from app.core.errors import APIError, InvalidTickerError
+from app.core.errors import (
+    APIError,
+    InvalidTickerError,
+    ProviderInvalidResponseError,
+    ProviderUnavailableError,
+)
+from app.domain.evidence import (
+    ConsensusResult,
+    ConsensusStatus,
+    SourceObservation,
+    resolve_consensus,
+)
 from app.models import (
     AssetDetails,
     Dividend,
@@ -25,8 +36,10 @@ from app.models import (
     InstrumentType,
     OpportunityMetric,
     OpportunityMetrics,
+    OpportunityObservation,
     OpportunityResponse,
 )
+from app.models.assets import FundDistributionEvidence
 from app.parsers.normalizers import clean_text, normalize_ticker, parse_br_decimal
 from app.parsers.status_invest import status_invest_cnpj
 from app.scrapers.cvm_fund_reports import (
@@ -74,6 +87,20 @@ class StatusInvestProfile:
     distributions: tuple[FundDistribution, ...] = ()
 
 
+@dataclass(frozen=True)
+class _ReconciledDistribution:
+    """One dated distribution after source reconciliation.
+
+    The public ``FundDistribution`` contract predates source voting and only
+    carries one value/source pair.  Keep the full consensus result internally
+    so derived metrics never consume an observation that lost the vote (for
+    example, a newest but conflicting event).
+    """
+
+    ex_date: date
+    consensus: ConsensusResult
+
+
 def _fold(value: str | None) -> str:
     normalized = unicodedata.normalize("NFKD", clean_text(value))
     return normalized.encode("ascii", "ignore").decode("ascii").upper()
@@ -85,13 +112,56 @@ def _metric(
     as_of: date | None,
     sources: list[str],
     reason: str,
+    unit: str | None = None,
+    consensus: ConsensusResult | None = None,
 ) -> OpportunityMetric:
+    if consensus is not None:
+        return OpportunityMetric(
+            value=consensus.value,
+            as_of=consensus.as_of,
+            unit=unit,
+            sources=list(consensus.sources),
+            independent_sources=list(consensus.independent_sources),
+            source_lineage=list(consensus.source_lineage),
+            observations=_public_observations(consensus.observations),
+            rejected_observations=_public_observations(consensus.rejected_observations),
+            consensus_status=consensus.status.value,
+            confidence=consensus.confidence,
+            unavailable_reason=(
+                None if consensus.value is not None else consensus.reason or reason
+            ),
+        )
     return OpportunityMetric(
         value=value,
         as_of=as_of,
+        unit=unit,
         sources=sources if value is not None else [],
+        consensus_status=(
+            ConsensusStatus.single_source.value
+            if value is not None
+            else ConsensusStatus.missing_data.value
+        ),
+        confidence=Decimal("0.55") if value is not None else Decimal("0"),
         unavailable_reason=None if value is not None else reason,
     )
+
+
+def _public_observations(
+    observations: tuple[SourceObservation, ...],
+) -> list[OpportunityObservation]:
+    """Serialize normalized evidence without exposing provider payloads."""
+
+    return [
+        OpportunityObservation(
+            value=observation.value,
+            source=observation.source,
+            as_of=observation.as_of,
+            unit=observation.unit,
+            source_lineage=list(observation.source_lineage),
+            independent_origin=observation.independent_origin,
+        )
+        for observation in observations
+    ]
 
 
 class B3InstrumentProvider:
@@ -129,6 +199,8 @@ class B3InstrumentProvider:
             transport=self.transport,
             headers={"User-Agent": self.settings.user_agent},
         ) as client:
+            invalid_response = False
+            unavailable = False
             for days_ago in range(1, 8):
                 reference = datetime.now(UTC).date() - timedelta(days=days_ago)
                 try:
@@ -137,9 +209,21 @@ class B3InstrumentProvider:
                         params={"filter": encoded},
                         json={},
                     )
-                    response.raise_for_status()
+                except httpx.RequestError:
+                    unavailable = True
+                    continue
+                if response.status_code == 404:
+                    continue
+                if not 200 <= response.status_code < 300:
+                    unavailable = True
+                    continue
+                try:
                     payload = response.json()
-                except (httpx.HTTPError, ValueError):
+                except ValueError:
+                    invalid_response = True
+                    continue
+                if not _is_valid_b3_payload(payload):
+                    invalid_response = True
                     continue
                 result = _instrument_from_b3(payload, normalized)
                 if result is not None:
@@ -149,6 +233,15 @@ class B3InstrumentProvider:
                         result,
                     )
                     return result
+            # A negative result is cacheable only when every attempted source
+            # path completed successfully.  A valid empty bulletin followed by
+            # a transient failure is not evidence that the instrument is
+            # absent; surface the retryable error instead of suppressing future
+            # lookups behind the negative cache.
+            if unavailable:
+                raise ProviderUnavailableError(ticker=normalized)
+            if invalid_response:
+                raise ProviderInvalidResponseError(ticker=normalized)
         self._cache.set(
             normalized,
             monotonic() + self.settings.opportunity_cache_ttl_seconds,
@@ -210,13 +303,21 @@ class StatusInvestProvider:
                 "User-Agent": "Mozilla/5.0",
             },
         ) as client:
+            invalid_response = False
+            unavailable = False
             for path in paths:
                 try:
                     response = await client.get(f"/{path}/{normalized}")
-                    if response.status_code == 404:
-                        continue
-                    response.raise_for_status()
-                except httpx.HTTPError:
+                except httpx.RequestError:
+                    unavailable = True
+                    continue
+                if response.status_code == 404:
+                    continue
+                if not 200 <= response.status_code < 300:
+                    unavailable = True
+                    continue
+                if not response.text.strip():
+                    invalid_response = True
                     continue
                 profile = parse_status_invest_profile(response.text)
                 if profile.values or profile.cnpj or profile.distributions:
@@ -226,6 +327,14 @@ class StatusInvestProvider:
                         profile,
                     )
                     return profile
+            # Do not persist an empty aggregate while any alternate path was
+            # unavailable or malformed.  The next request must be able to
+            # retry those paths and recover a profile that was not visible in
+            # this partial response set.
+            if unavailable:
+                raise ProviderUnavailableError(ticker=normalized)
+            if invalid_response:
+                raise ProviderInvalidResponseError(ticker=normalized)
         self._cache.set(
             cache_key,
             monotonic() + self.settings.opportunity_cache_ttl_seconds,
@@ -259,39 +368,102 @@ class OpportunityService:
 
     async def opportunity(self, ticker: str) -> OpportunityResponse:
         normalized = _normalized_ticker(ticker)
-        instrument = await self.b3.get(normalized)
-        details: AssetDetails | None = None
-        dividends = []
+        source_failures: dict[str, str] = {}
+        b3_task = asyncio.create_task(self.b3.get(normalized))
+        asset_task = asyncio.create_task(self.asset_service.get_asset(normalized))
+        source_tasks = (b3_task, asset_task)
         try:
-            asset = await self.asset_service.get_asset(normalized)
+            instrument_result, asset_result = await asyncio.gather(
+                *source_tasks,
+                return_exceptions=True,
+            )
+        finally:
+            for task in source_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*source_tasks, return_exceptions=True)
+
+        instrument: InstrumentMetadata | None
+        if isinstance(instrument_result, APIError):
+            error = instrument_result
+            if isinstance(error, InvalidTickerError):
+                raise error
+            # B3 identity enriches the response but is not the only source of
+            # valuation evidence. Keep Fundamentus/StatusInvest observations
+            # usable when the identity bulletin is temporarily unavailable.
+            instrument = None
+            source_failures[SOURCE_B3] = error.code
+        elif isinstance(instrument_result, BaseException):
+            raise instrument_result
+        else:
+            instrument = instrument_result
+
+        details: AssetDetails | None
+        dividends: list[Dividend]
+        if isinstance(asset_result, APIError):
+            details = None
+            dividends = []
+            source_failures[SOURCE_FUNDAMENTUS] = asset_result.code
+        elif isinstance(asset_result, BaseException):
+            raise asset_result
+        else:
+            asset = asset_result
             details = asset.details
             dividends = asset.dividends or []
-        except APIError:
-            pass
 
-        status_profile = await self.status.profile(
-            normalized,
-            instrument.instrument_type if instrument else None,
-        )
+        try:
+            status_profile = await self.status.profile(
+                normalized,
+                instrument.instrument_type if instrument else None,
+            )
+        except APIError as error:
+            # StatusInvest is an optional observation source.  Its failure
+            # must not prevent the Fundamentus/CVM observations from being
+            # returned; the metric resolver records the remaining source
+            # count explicitly.
+            status_profile = StatusInvestProfile(values={})
+            source_failures[SOURCE_STATUS_INVEST] = error.code
         metrics = _opportunity_metrics(
             details,
             dividends,
             status_profile.values,
             self.settings.bazin_minimum_yield_percent,
         )
-        report_series = await self.cvm.reports(
-            instrument,
-            cnpj=status_profile.cnpj,
-        )
+        try:
+            report_series = await self.cvm.reports(
+                instrument,
+                cnpj=status_profile.cnpj,
+            )
+        except APIError as error:
+            report_series = CvmReportSeries()
+            source_failures[SOURCE_CVM] = error.code
+        else:
+            # A fund report can be partially populated when one or more CVM
+            # archives fail while another archive succeeds. Preserve each
+            # bounded path/code pair so callers can distinguish degraded
+            # provenance from a complete CVM outage.
+            source_failures.update(
+                {
+                    f"{SOURCE_CVM}:{failure.path}": failure.code
+                    for failure in report_series.archive_failures
+                }
+            )
         metrics = _merge_official_fund_metrics(metrics, report_series)
-        distributions = _merge_fund_distributions(dividends, status_profile.distributions)
-        metrics = _add_distribution_metrics(metrics, distributions)
+        reconciled_distributions = _reconcile_fund_distributions(
+            dividends,
+            status_profile.distributions,
+        )
+        distributions = _public_fund_distributions(reconciled_distributions)
+        distribution_evidence = _public_fund_distribution_evidence(reconciled_distributions)
+        metrics = _add_distribution_metrics(metrics, reconciled_distributions)
         return OpportunityResponse(
             ticker=normalized,
             instrument=instrument,
             metrics=metrics,
             fund_reports=_report_series(report_series),
             fund_distributions=list(distributions),
+            fund_distribution_evidence=list(distribution_evidence),
+            source_failures=source_failures,
             refreshed_at=datetime.now(UTC),
         )
 
@@ -301,6 +473,27 @@ def _normalized_ticker(ticker: str) -> str:
         return normalize_ticker(ticker)
     except ValueError as exc:
         raise InvalidTickerError(ticker=ticker) from exc
+
+
+def _is_valid_b3_payload(payload: object) -> bool:
+    """Return whether a B3 bulletin has the tabular envelope we consume."""
+
+    # The bulletin occasionally answers with an empty JSON object when the
+    # requested session has no rows. Treat that as a confirmed empty result;
+    # malformed non-empty envelopes remain typed schema failures.
+    if payload == {}:
+        return True
+    if not isinstance(payload, dict) or not isinstance(payload.get("table"), dict):
+        return False
+    table = payload["table"]
+    columns = table.get("columns")
+    values = table.get("values")
+    if not isinstance(columns, list) or not isinstance(values, list):
+        return False
+    return bool(columns) and all(
+        isinstance(column, dict) and isinstance(column.get("name"), str) and column["name"]
+        for column in columns
+    )
 
 
 def _instrument_from_b3(payload: object, ticker: str) -> InstrumentMetadata | None:
@@ -548,6 +741,89 @@ def _decimal_value(value: object) -> Decimal | None:
         return None
 
 
+def _observation(
+    value: Decimal | None,
+    *,
+    source: str,
+    as_of: date | None,
+    unit: str,
+    lineage: tuple[str, ...] = (),
+    independent_origin: str | None = None,
+) -> SourceObservation | None:
+    if value is None or not value.is_finite():
+        return None
+    return SourceObservation(
+        value=value,
+        source=source,
+        as_of=as_of,
+        unit=unit,
+        source_lineage=lineage,
+        independent_origin=independent_origin,
+    )
+
+
+def _resolved_metric(
+    observations: list[SourceObservation],
+    *,
+    as_of: date | None,
+    unit: str,
+    reason: str,
+    valid_range: tuple[Decimal, Decimal] | None = None,
+) -> OpportunityMetric:
+    result = resolve_consensus(
+        observations,
+        expected_unit=unit,
+        valid_range=valid_range,
+    )
+    if result.value is None and result.status is ConsensusStatus.missing_data:
+        result = result.model_copy(update={"reason": reason})
+    return _metric(
+        result.value,
+        as_of=result.as_of or as_of,
+        sources=list(result.sources),
+        reason=reason,
+        unit=unit,
+        consensus=result,
+    )
+
+
+def _observations_for(
+    candidates: tuple[tuple[Decimal | None, str, date | None], ...],
+    *,
+    unit: str,
+) -> list[SourceObservation]:
+    return [
+        observation
+        for value, source, as_of in candidates
+        if (observation := _observation(value, source=source, as_of=as_of, unit=unit)) is not None
+    ]
+
+
+def _merge_sources(*metrics: OpportunityMetric) -> list[str]:
+    return sorted({source for metric in metrics for source in metric.sources})
+
+
+def _derived_metric(
+    value: Decimal | None,
+    *,
+    as_of: date | None,
+    sources: list[str],
+    unit: str,
+    reason: str,
+) -> OpportunityMetric:
+    return OpportunityMetric(
+        value=value,
+        as_of=as_of if value is not None else None,
+        unit=unit,
+        sources=sorted(set(sources)) if value is not None else [],
+        independent_sources=[],
+        source_lineage=sorted(set(sources)) if value is not None else [],
+        consensus_status="derived" if value is not None else ConsensusStatus.missing_data.value,
+        confidence=Decimal("0.70") if value is not None else Decimal("0"),
+        unavailable_reason=None if value is not None else reason,
+    )
+
+
 def _opportunity_metrics(
     details: AssetDetails | None,
     dividends: list[Dividend],
@@ -555,43 +831,111 @@ def _opportunity_metrics(
     bazin_yield: Decimal,
 ) -> OpportunityMetrics:
     as_of = details.quote_date if details and details.quote_date else datetime.now(UTC).date()
+    detail_as_of = details.quote_date if details else None
+    fundamental_as_of = (
+        details.last_balance_date if details and details.last_balance_date else detail_as_of
+    )
     fields = _detail_fields(details)
-    current_price, price_source = _prefer(
-        details.quote if details else None,
-        status.get("current_price"),
+    # Keep every finite provider observation until ``resolve_consensus`` can
+    # apply the field's plausible range.  Dropping non-positive prices here
+    # would erase the evidence trail and make a malformed provider response
+    # indistinguishable from a source that did not answer.
+    price_candidates = _observations_for(
+        (
+            (details.quote if details else None, SOURCE_FUNDAMENTUS, detail_as_of),
+            (status.get("current_price"), SOURCE_STATUS_INVEST, None),
+        ),
+        unit="BRL",
     )
-    book_value, book_value_source = _prefer(
-        details.book_value_per_share if details else None,
-        status.get("book_value_per_share"),
+    price_metric = _resolved_metric(
+        price_candidates,
+        as_of=as_of,
+        unit="BRL",
+        reason="Current price unavailable",
+        # A traded price must be strictly positive.  Keep zero and negatives
+        # in the resolver's evidence set so they are surfaced as rejected
+        # observations instead of disappearing as if the provider were empty.
+        valid_range=(Decimal("1E-100"), Decimal("1E100")),
     )
-    earnings, earnings_source = _prefer(
-        details.earnings_per_share if details else None,
-        status.get("earnings_per_share"),
+    book_metric = _resolved_metric(
+        _observations_for(
+            (
+                (
+                    details.book_value_per_share if details else None,
+                    SOURCE_FUNDAMENTUS,
+                    fundamental_as_of,
+                ),
+                (status.get("book_value_per_share"), SOURCE_STATUS_INVEST, None),
+            ),
+            unit="BRL",
+        ),
+        as_of=fundamental_as_of or as_of,
+        unit="BRL",
+        reason="Book value per share unavailable",
     )
-    price_to_book, price_to_book_source = _prefer(
-        fields.get("p_vp"),
-        status.get("price_to_book"),
+    earnings_metric = _resolved_metric(
+        _observations_for(
+            (
+                (
+                    details.earnings_per_share if details else None,
+                    SOURCE_FUNDAMENTUS,
+                    fundamental_as_of,
+                ),
+                (status.get("earnings_per_share"), SOURCE_STATUS_INVEST, None),
+            ),
+            unit="BRL",
+        ),
+        as_of=fundamental_as_of or as_of,
+        unit="BRL",
+        reason="Earnings per share unavailable",
+    )
+    price_to_book_candidates = _observations_for(
+        (
+            (fields.get("p_vp"), SOURCE_FUNDAMENTUS, detail_as_of),
+            (status.get("price_to_book"), SOURCE_STATUS_INVEST, None),
+        ),
+        unit="multiple",
+    )
+    price_to_book_metric = _resolved_metric(
+        price_to_book_candidates,
+        as_of=as_of,
+        unit="multiple",
+        reason="Book value per share unavailable",
+        valid_range=(Decimal("0"), Decimal("1E100")),
+    )
+    if not price_to_book_candidates and price_metric.value is not None and book_metric.value:
+        price_to_book_metric = _derived_metric(
+            price_metric.value / book_metric.value,
+            as_of=as_of,
+            sources=_merge_sources(price_metric, book_metric),
+            unit="multiple",
+            reason="Book value per share unavailable",
+        )
+    price_to_earnings_candidates = _observations_for(
+        (
+            (fields.get("p_l"), SOURCE_FUNDAMENTUS, detail_as_of),
+            (status.get("price_to_earnings"), SOURCE_STATUS_INVEST, None),
+        ),
+        unit="multiple",
+    )
+    price_to_earnings_metric = _resolved_metric(
+        price_to_earnings_candidates,
+        as_of=as_of,
+        unit="multiple",
+        reason="Earnings per share unavailable",
     )
     if (
-        price_to_book is None
-        and current_price is not None
-        and book_value is not None
-        and book_value != 0
+        not price_to_earnings_candidates
+        and price_metric.value is not None
+        and earnings_metric.value
     ):
-        price_to_book = current_price / book_value
-        price_to_book_source = price_source or book_value_source
-    price_to_earnings, price_to_earnings_source = _prefer(
-        fields.get("p_l"),
-        status.get("price_to_earnings"),
-    )
-    if (
-        price_to_earnings is None
-        and current_price is not None
-        and earnings is not None
-        and earnings != 0
-    ):
-        price_to_earnings = current_price / earnings
-        price_to_earnings_source = price_source or earnings_source
+        price_to_earnings_metric = _derived_metric(
+            price_metric.value / earnings_metric.value,
+            as_of=as_of,
+            sources=_merge_sources(price_metric, earnings_metric),
+            unit="multiple",
+            reason="Earnings per share unavailable",
+        )
 
     cutoff = as_of - timedelta(days=365)
     dividend_total = Decimal("0")
@@ -599,124 +943,169 @@ def _opportunity_metrics(
         event_date = item.ex_date or item.payment_date
         if event_date is not None and event_date >= cutoff:
             dividend_total += item.value or Decimal("0")
-    dividend_source = SOURCE_FUNDAMENTUS
-    if dividend_total <= 0:
-        status_dividends = status.get("dividends_12m")
-        if status_dividends is not None:
-            dividend_total = status_dividends
-            dividend_source = SOURCE_STATUS_INVEST
-    dividend_total_value = (
-        dividend_total
-        if dividend_total > 0 or details is not None or "dividends_12m" in status
+    dividend_candidates: list[SourceObservation] = []
+    # An empty dividend page is absence of an observation unless the detail
+    # page explicitly reports a zero yield.  Treating every empty list as a
+    # zero creates a false disagreement with another source that reports a
+    # positive distribution and suppresses Bazin/yield metrics.
+    confirmed_fundamentus_zero = fields.get("div_yield") == 0
+    if dividends or confirmed_fundamentus_zero:
+        detail_dividends = _observation(
+            dividend_total,
+            source=SOURCE_FUNDAMENTUS,
+            as_of=detail_as_of,
+            unit="BRL",
+        )
+        if detail_dividends is not None:
+            dividend_candidates.append(detail_dividends)
+    status_dividends = _observation(
+        status.get("dividends_12m"),
+        source=SOURCE_STATUS_INVEST,
+        as_of=None,
+        unit="BRL",
+    )
+    if status_dividends is not None:
+        dividend_candidates.append(status_dividends)
+    dividend_result = resolve_consensus(
+        dividend_candidates,
+        expected_unit="BRL",
+        valid_range=(Decimal("0"), Decimal("1E100")),
+    )
+    dividend_metric = _metric(
+        dividend_result.value,
+        as_of=dividend_result.as_of or as_of,
+        sources=list(dividend_result.sources),
+        reason="Trailing dividends unavailable",
+        unit="BRL",
+        consensus=dividend_result,
+    )
+    dividend_total_value = dividend_metric.value
+    dividend_yield = (
+        dividend_total_value / price_metric.value * Decimal("100")
+        if dividend_total_value is not None and price_metric.value
         else None
     )
-    reported_dividend_yield = fields.get("div_yield") or status.get("dividend_yield_12m")
-    dividend_yield = reported_dividend_yield
-    if dividend_total_value is not None and current_price:
-        dividend_yield = dividend_total_value / current_price * Decimal("100")
+    dividend_yield_metric = _derived_metric(
+        dividend_yield,
+        as_of=as_of,
+        sources=list(dividend_metric.sources) + list(price_metric.sources),
+        unit="percent",
+        reason="Trailing dividends unavailable",
+    )
 
     graham = None
-    if earnings is not None and earnings > 0 and book_value is not None and book_value > 0:
-        graham = Decimal(str(math.sqrt(float(Decimal("22.5") * earnings * book_value))))
+    if (
+        earnings_metric.value is not None
+        and earnings_metric.value > 0
+        and book_metric.value is not None
+        and book_metric.value > 0
+    ):
+        # Keep the Graham estimate decimal all the way through. The context
+        # is local so a large/small financial value cannot silently round the
+        # process-wide decimal precision or pass through binary float space.
+        with localcontext() as context:
+            context.prec = max(
+                34,
+                len(earnings_metric.value.as_tuple().digits)
+                + len(book_metric.value.as_tuple().digits)
+                + 16,
+            )
+            graham = (Decimal("22.5") * earnings_metric.value * book_metric.value).sqrt()
     bazin = (
         dividend_total_value / (bazin_yield / Decimal("100"))
         if dividend_total_value is not None and bazin_yield > 0
         else None
     )
-    min_52, min_source = _prefer(
-        details.min_52_weeks if details else None,
-        status.get("min_52_weeks"),
+    min_metric = _resolved_metric(
+        _observations_for(
+            (
+                (details.min_52_weeks if details else None, SOURCE_FUNDAMENTUS, detail_as_of),
+                (status.get("min_52_weeks"), SOURCE_STATUS_INVEST, None),
+            ),
+            unit="BRL",
+        ),
+        as_of=as_of,
+        unit="BRL",
+        reason="52-week minimum unavailable",
+        valid_range=(Decimal("0"), Decimal("1E100")),
     )
-    max_52, max_source = _prefer(
-        details.max_52_weeks if details else None,
-        status.get("max_52_weeks"),
+    max_metric = _resolved_metric(
+        _observations_for(
+            (
+                (details.max_52_weeks if details else None, SOURCE_FUNDAMENTUS, detail_as_of),
+                (status.get("max_52_weeks"), SOURCE_STATUS_INVEST, None),
+            ),
+            unit="BRL",
+        ),
+        as_of=as_of,
+        unit="BRL",
+        reason="52-week maximum unavailable",
+        valid_range=(Decimal("0"), Decimal("1E100")),
     )
-    fundamental_source = [SOURCE_FUNDAMENTUS]
+    shares_metric = _resolved_metric(
+        _observations_for(
+            ((details.shares_count if details else None, SOURCE_FUNDAMENTUS, fundamental_as_of),),
+            unit="shares",
+        ),
+        as_of=fundamental_as_of or as_of,
+        unit="shares",
+        reason="Outstanding shares unavailable",
+        valid_range=(Decimal("0"), Decimal("1E100")),
+    )
+    traded_value_metric = _resolved_metric(
+        _observations_for(
+            (
+                (
+                    details.average_daily_volume_2m if details else None,
+                    SOURCE_FUNDAMENTUS,
+                    detail_as_of,
+                ),
+            ),
+            unit="BRL",
+        ),
+        as_of=as_of,
+        unit="BRL",
+        reason="Average daily traded value unavailable",
+        valid_range=(Decimal("0"), Decimal("1E100")),
+    )
+    market_cap_metric = _resolved_metric(
+        _observations_for(
+            ((details.market_value if details else None, SOURCE_FUNDAMENTUS, detail_as_of),),
+            unit="BRL",
+        ),
+        as_of=as_of,
+        unit="BRL",
+        reason="Market capitalization unavailable",
+        valid_range=(Decimal("0"), Decimal("1E100")),
+    )
+    fundamental_sources = _merge_sources(earnings_metric, book_metric)
     return OpportunityMetrics(
-        current_price=_metric(
-            current_price,
-            as_of=as_of,
-            sources=[price_source] if price_source else [],
-            reason="Current price unavailable",
-        ),
-        shares_outstanding=_metric(
-            details.shares_count if details else None,
-            as_of=as_of,
-            sources=[SOURCE_FUNDAMENTUS],
-            reason="Outstanding shares unavailable",
-        ),
-        earnings_per_share=_metric(
-            earnings,
-            as_of=as_of,
-            sources=[earnings_source] if earnings_source else [],
-            reason="Earnings per share unavailable",
-        ),
-        book_value_per_share=_metric(
-            book_value,
-            as_of=as_of,
-            sources=[book_value_source] if book_value_source else [],
-            reason="Book value per share unavailable",
-        ),
-        price_to_book=_metric(
-            price_to_book,
-            as_of=as_of,
-            sources=[price_to_book_source] if price_to_book_source else [],
-            reason="Book value per share unavailable",
-        ),
-        price_to_earnings=_metric(
-            price_to_earnings,
-            as_of=as_of,
-            sources=[price_to_earnings_source] if price_to_earnings_source else [],
-            reason="Earnings per share unavailable",
-        ),
-        dividend_yield_12m=_metric(
-            dividend_yield,
-            as_of=as_of,
-            sources=[dividend_source],
-            reason="Trailing dividends unavailable",
-        ),
-        dividends_12m=_metric(
-            dividend_total_value,
-            as_of=as_of,
-            sources=[dividend_source],
-            reason="Trailing dividends unavailable",
-        ),
-        graham_price=_metric(
+        current_price=price_metric,
+        shares_outstanding=shares_metric,
+        earnings_per_share=earnings_metric,
+        book_value_per_share=book_metric,
+        price_to_book=price_to_book_metric,
+        price_to_earnings=price_to_earnings_metric,
+        dividend_yield_12m=dividend_yield_metric,
+        dividends_12m=dividend_metric,
+        graham_price=_derived_metric(
             graham,
             as_of=as_of,
-            sources=fundamental_source,
+            sources=fundamental_sources,
+            unit="BRL",
             reason="Positive earnings and book value are required",
         ),
-        bazin_price=_metric(
+        bazin_price=_derived_metric(
             bazin,
             as_of=as_of,
-            sources=[dividend_source],
+            sources=list(dividend_metric.sources),
+            unit="BRL",
             reason="Trailing dividends unavailable",
         ),
-        min_52_weeks=_metric(
-            min_52,
-            as_of=as_of,
-            sources=[min_source] if min_source else [],
-            reason="52-week minimum unavailable",
-        ),
-        max_52_weeks=_metric(
-            max_52,
-            as_of=as_of,
-            sources=[max_source] if max_source else [],
-            reason="52-week maximum unavailable",
-        ),
-        average_daily_traded_value=_metric(
-            details.average_daily_volume_2m if details else None,
-            as_of=as_of,
-            sources=[SOURCE_FUNDAMENTUS],
-            reason="Average daily traded value unavailable",
-        ),
-        market_capitalization=_metric(
-            details.market_value if details else None,
-            as_of=as_of,
-            sources=[SOURCE_FUNDAMENTUS],
-            reason="Market capitalization unavailable",
-        ),
+        min_52_weeks=min_metric,
+        max_52_weeks=max_metric,
+        average_daily_traded_value=traded_value_metric,
+        market_capitalization=market_cap_metric,
     )
 
 
@@ -727,24 +1116,71 @@ def _merge_official_fund_metrics(
     if not series.reports:
         return metrics
     latest = max(series.reports, key=lambda item: item.as_of)
+    previous_book = metrics.book_value_per_share
+    candidates = [
+        SourceObservation(
+            value=item.value,
+            source=item.source,
+            as_of=item.as_of,
+            unit=item.unit or "BRL",
+            source_lineage=tuple(item.source_lineage),
+            independent_origin=item.independent_origin,
+        )
+        for item in previous_book.observations
+    ]
+    candidates.append(
+        SourceObservation(
+            value=latest.nav_per_share,
+            source=SOURCE_CVM,
+            as_of=latest.as_of,
+            unit="BRL",
+        )
+    )
+    official_result = resolve_consensus(
+        candidates,
+        expected_unit="BRL",
+        valid_range=(Decimal("0"), Decimal("1E100")),
+    )
+    # CVM's monthly report is the authoritative single-source policy for a
+    # fund NAV.  It is used only when the independent observations have no
+    # majority; this keeps ordinary equity fields on the vote-based rule.
+    if official_result.status is ConsensusStatus.conflict:
+        official_result = ConsensusResult(
+            value=latest.nav_per_share,
+            as_of=latest.as_of,
+            sources=(SOURCE_CVM,),
+            independent_sources=(SOURCE_CVM,),
+            source_lineage=(SOURCE_CVM,),
+            status=ConsensusStatus.single_source,
+            reason="CVM monthly NAV is the authoritative fund source",
+            confidence=Decimal("0.98"),
+            observations=(candidates[-1],),
+            rejected_observations=tuple(candidates[:-1]),
+        )
     current_price = metrics.current_price.value
+    selected_book = official_result.value
     price_to_book = (
-        current_price / latest.nav_per_share
-        if current_price is not None and current_price > 0
+        current_price / selected_book
+        if current_price is not None and current_price > 0 and selected_book
         else None
     )
+    selected_as_of = official_result.as_of or latest.as_of
+    selected_sources = [*official_result.sources, *metrics.current_price.sources]
     return metrics.model_copy(
         update={
             "book_value_per_share": _metric(
-                latest.nav_per_share,
-                as_of=latest.as_of,
-                sources=[SOURCE_CVM],
+                official_result.value,
+                as_of=selected_as_of,
+                sources=list(official_result.sources),
+                unit="BRL",
+                consensus=official_result,
                 reason="Book value per share unavailable",
             ),
-            "price_to_book": _metric(
+            "price_to_book": _derived_metric(
                 price_to_book,
-                as_of=latest.as_of,
-                sources=[SOURCE_CVM, *metrics.current_price.sources],
+                as_of=selected_as_of,
+                sources=selected_sources,
+                unit="multiple",
                 reason="Current price unavailable",
             ),
         }
@@ -755,58 +1191,334 @@ def _merge_fund_distributions(
     dividends: list[Dividend],
     status_distributions: tuple[FundDistribution, ...],
 ) -> tuple[FundDistribution, ...]:
-    by_date: dict[date, FundDistribution] = {}
+    """Merge source histories while exposing only values with a valid vote.
+
+    This compatibility wrapper retains the historical public return type.  The
+    opportunity service uses :func:`_reconcile_fund_distributions` directly so
+    it can retain conflict and missing statuses for derived metrics.
+    """
+
+    return _public_fund_distributions(
+        _reconcile_fund_distributions(dividends, status_distributions)
+    )
+
+
+def _reconcile_fund_distributions(
+    dividends: list[Dividend],
+    status_distributions: tuple[FundDistribution, ...],
+) -> tuple[_ReconciledDistribution, ...]:
+    """Return deterministic, date-keyed consensus results for fund events.
+
+    A distribution date is one event.  Each independent source contributes at
+    most its observed value for that event, and ``resolve_consensus`` decides
+    whether those values can be projected.  We intentionally do not apply
+    source-order precedence: a conflicting newest event remains unresolved and
+    is never silently replaced by an older value.
+    """
+
+    by_date: dict[date, list[SourceObservation]] = {}
+
     for distribution in status_distributions:
-        by_date[distribution.ex_date] = distribution
+        if not distribution.value.is_finite():
+            continue
+        by_date.setdefault(distribution.ex_date, []).append(
+            SourceObservation(
+                value=distribution.value,
+                source=distribution.source,
+                as_of=distribution.ex_date,
+                unit="BRL",
+                source_lineage=(distribution.source,),
+                independent_origin=distribution.source,
+            )
+        )
+
     for dividend in dividends:
         event_date = dividend.ex_date or dividend.payment_date
         if (
             event_date is None
             or dividend.value is None
-            or dividend.value < 0
+            or not dividend.value.is_finite()
             or "AMORT" in _fold(dividend.type)
         ):
             continue
-        by_date[event_date] = FundDistribution(
-            ex_date=event_date,
-            value=dividend.value,
-            source=SOURCE_FUNDAMENTUS,
+        by_date.setdefault(event_date, []).append(
+            SourceObservation(
+                value=dividend.value,
+                source=SOURCE_FUNDAMENTUS,
+                as_of=event_date,
+                unit="BRL",
+                source_lineage=(SOURCE_FUNDAMENTUS,),
+                independent_origin=SOURCE_FUNDAMENTUS,
+            )
         )
-    return tuple(by_date[key] for key in sorted(by_date, reverse=True))
+
+    reconciled: list[_ReconciledDistribution] = []
+    for event_date in sorted(by_date, reverse=True):
+        observations = tuple(
+            sorted(
+                by_date[event_date],
+                key=lambda item: (item.source, item.origin, item.value),
+            )
+        )
+        # Pass every observation through the shared resolver. It collapses
+        # duplicate rows into one independent vote, excludes origins that
+        # disagree with themselves, and still allows a majority of the other
+        # independent origins to win.
+        consensus = resolve_consensus(
+            observations,
+            expected_unit="BRL",
+            valid_range=(Decimal("0"), Decimal("1E100")),
+        )
+        reconciled.append(
+            _ReconciledDistribution(
+                ex_date=event_date,
+                consensus=consensus,
+            )
+        )
+    return tuple(reconciled)
+
+
+def _public_fund_distributions(
+    distributions: tuple[_ReconciledDistribution, ...],
+) -> tuple[FundDistribution, ...]:
+    """Project only consensus values into the legacy response contract."""
+
+    projected: list[FundDistribution] = []
+    for distribution in distributions:
+        result = distribution.consensus
+        if result.value is None:
+            # The public model cannot carry a conflict without inventing a
+            # numeric value.  Leave it out; metrics retain the full status and
+            # observations for callers that need to explain the omission.
+            continue
+        projected.append(
+            FundDistribution(
+                ex_date=distribution.ex_date,
+                value=result.value,
+                source="+".join(result.sources),
+            )
+        )
+    return tuple(projected)
+
+
+def _public_fund_distribution_evidence(
+    distributions: tuple[_ReconciledDistribution, ...],
+) -> tuple[FundDistributionEvidence, ...]:
+    """Expose one deterministic, auditable record for every event date."""
+
+    return tuple(
+        FundDistributionEvidence(
+            ex_date=distribution.ex_date,
+            value=distribution.consensus.value,
+            status=distribution.consensus.status.value,
+            reason=distribution.consensus.reason,
+            confidence=distribution.consensus.confidence,
+            sources=list(distribution.consensus.sources),
+            independent_sources=list(distribution.consensus.independent_sources),
+            source_lineage=list(distribution.consensus.source_lineage),
+            observations=_public_observations(distribution.consensus.observations),
+            rejected_observations=_public_observations(
+                distribution.consensus.rejected_observations
+            ),
+        )
+        for distribution in distributions
+    )
 
 
 def _add_distribution_metrics(
     metrics: OpportunityMetrics,
-    distributions: tuple[FundDistribution, ...],
+    distributions: tuple[_ReconciledDistribution, ...] | tuple[FundDistribution, ...],
 ) -> OpportunityMetrics:
     if not distributions:
         return metrics
-    latest = distributions[0]
+    reconciled = _coerce_reconciled_distributions(distributions)
+    latest = reconciled[0]
+    latest_result = latest.consensus
     return metrics.model_copy(
         update={
             "latest_distribution": _metric(
-                latest.value,
-                as_of=latest.ex_date,
-                sources=[latest.source],
+                latest_result.value,
+                as_of=latest_result.as_of or latest.ex_date,
+                sources=list(latest_result.sources),
                 reason="Latest distribution unavailable",
+                unit="BRL",
+                consensus=latest_result,
             ),
-            "median_distribution_3m": _distribution_median(distributions, 3),
-            "median_distribution_6m": _distribution_median(distributions, 6),
+            "median_distribution_3m": _distribution_median(reconciled, 3),
+            "median_distribution_6m": _distribution_median(reconciled, 6),
         }
     )
 
 
 def _distribution_median(
-    distributions: tuple[FundDistribution, ...],
+    distributions: tuple[_ReconciledDistribution, ...] | tuple[FundDistribution, ...],
     months: int,
 ) -> OpportunityMetric:
-    selected = distributions[:months]
-    value = _median(tuple(item.value for item in selected)) if len(selected) >= months else None
+    reconciled = _coerce_reconciled_distributions(distributions)
+    selected = reconciled[:months]
+    reason = f"At least {months} monthly distributions are required"
+    if len(selected) < months:
+        unresolved = [item for item in selected if item.consensus.value is None]
+        if unresolved:
+            status = (
+                ConsensusStatus.conflict
+                if any(item.consensus.status is ConsensusStatus.conflict for item in unresolved)
+                else ConsensusStatus.invalid_data
+            )
+            return _distribution_unavailable_metric(
+                selected,
+                status=status,
+                reason="Distribution history contains unresolved source observations",
+            )
+        return _distribution_unavailable_metric(
+            selected,
+            status=ConsensusStatus.missing_data,
+            reason=reason,
+        )
+
+    unresolved = [item for item in selected if item.consensus.value is None]
+    if unresolved:
+        status = (
+            ConsensusStatus.conflict
+            if any(item.consensus.status is ConsensusStatus.conflict for item in unresolved)
+            else ConsensusStatus.invalid_data
+        )
+        return _distribution_unavailable_metric(
+            selected,
+            status=status,
+            reason="Distribution history contains unresolved source observations",
+        )
+
+    values = tuple(item.consensus.value for item in selected)
+    # ``unresolved`` above guarantees all values are non-null.  Keeping this
+    # guard makes the invariant explicit to static type checkers and future
+    # callers that may construct a malformed private value.
+    if any(value is None for value in values):
+        return _distribution_unavailable_metric(
+            selected,
+            status=ConsensusStatus.invalid_data,
+            reason="Distribution history contains an invalid value",
+        )
+    return _distribution_derived_metric(
+        _median(tuple(value for value in values if value is not None)),
+        selected,
+        reason=reason,
+    )
+
+
+def _coerce_reconciled_distributions(
+    distributions: tuple[_ReconciledDistribution, ...] | tuple[FundDistribution, ...],
+) -> tuple[_ReconciledDistribution, ...]:
+    """Keep private helpers compatible with their pre-consensus input type."""
+
+    if not distributions:
+        return ()
+    if isinstance(distributions[0], _ReconciledDistribution):
+        return distributions
+    return tuple(
+        _ReconciledDistribution(
+            ex_date=item.ex_date,
+            consensus=ConsensusResult(
+                value=item.value,
+                as_of=item.ex_date,
+                sources=(item.source,),
+                independent_sources=(item.source,),
+                source_lineage=(item.source,),
+                status=ConsensusStatus.single_source,
+                reason="Only one independent source was available",
+                confidence=Decimal("0.55"),
+                observations=(
+                    SourceObservation(
+                        value=item.value,
+                        source=item.source,
+                        as_of=item.ex_date,
+                        unit="BRL",
+                        source_lineage=(item.source,),
+                        independent_origin=item.source,
+                    ),
+                ),
+            ),
+        )
+        for item in distributions
+    )
+
+
+def _distribution_unavailable_metric(
+    distributions: tuple[_ReconciledDistribution, ...],
+    *,
+    status: ConsensusStatus,
+    reason: str,
+) -> OpportunityMetric:
+    observations = tuple(
+        observation for item in distributions for observation in item.consensus.observations
+    )
+    rejected_observations = tuple(
+        observation
+        for item in distributions
+        for observation in item.consensus.rejected_observations
+    )
+    evidence = (*observations, *rejected_observations)
+    sources = tuple(sorted({observation.source for observation in evidence}))
+    origins = tuple(sorted({observation.origin for observation in evidence}))
+    lineage = tuple(sorted({line for observation in evidence for line in observation.lineage}))
+    result = ConsensusResult(
+        status=status,
+        reason=reason,
+        sources=sources,
+        independent_sources=origins,
+        source_lineage=lineage,
+        observations=observations,
+        rejected_observations=rejected_observations,
+    )
     return _metric(
-        value,
-        as_of=max((item.ex_date for item in selected), default=None),
-        sources=sorted({item.source for item in selected}),
-        reason=f"At least {months} monthly distributions are required",
+        None,
+        as_of=None,
+        sources=list(sources),
+        reason=reason,
+        unit="BRL",
+        consensus=result,
+    )
+
+
+def _distribution_derived_metric(
+    value: Decimal | None,
+    distributions: tuple[_ReconciledDistribution, ...],
+    *,
+    reason: str,
+) -> OpportunityMetric:
+    observations = tuple(
+        observation for item in distributions for observation in item.consensus.observations
+    )
+    rejected_observations = tuple(
+        observation
+        for item in distributions
+        for observation in item.consensus.rejected_observations
+    )
+    # Keep provenance on a derived value limited to the observations that
+    # actually contributed to its inputs.  Rejected candidates remain exposed
+    # separately below and must not make the derived source set look selected.
+    sources = sorted({source for item in distributions for source in item.consensus.sources})
+    origins = sorted(
+        {origin for item in distributions for origin in item.consensus.independent_sources}
+    )
+    lineage = sorted({line for item in distributions for line in item.consensus.source_lineage})
+    return OpportunityMetric(
+        value=value,
+        as_of=max((item.ex_date for item in distributions), default=None),
+        unit="BRL",
+        sources=sources,
+        independent_sources=origins,
+        source_lineage=lineage,
+        observations=[
+            *(_public_observations(observations)),
+        ],
+        rejected_observations=_public_observations(rejected_observations),
+        consensus_status="derived",
+        confidence=min(
+            (item.consensus.confidence for item in distributions),
+            default=Decimal("0"),
+        ),
+        unavailable_reason=None if value is not None else reason,
     )
 
 

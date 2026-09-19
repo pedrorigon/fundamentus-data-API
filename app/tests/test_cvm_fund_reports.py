@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import zipfile
 from datetime import date
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 from app.config import Settings
+from app.core.errors import APIError, ProviderInvalidResponseError, ProviderUnavailableError
 from app.models import InstrumentMetadata, InstrumentType
 from app.scrapers.cvm_fund_reports import (
     CvmFundReportProvider,
@@ -117,8 +119,10 @@ async def test_provider_rejects_oversized_or_invalid_archives() -> None:
         httpx.MockTransport(lambda _request: httpx.Response(200, content=b"not a zip")),
     )
 
-    assert await oversized._request("/oversized.zip") is None
-    assert await invalid._request("/invalid.zip") is None
+    with pytest.raises(ProviderInvalidResponseError):
+        await oversized._request("/oversized.zip")
+    with pytest.raises(ProviderInvalidResponseError):
+        await invalid._request("/invalid.zip")
 
 
 def test_fiagro_parser_accepts_legacy_isin_check_digits() -> None:
@@ -245,6 +249,261 @@ async def test_provider_loads_fi_infra_archives_once_and_handles_missing_months(
 
 
 @pytest.mark.asyncio
+async def test_report_cache_is_bounded_lru_and_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.scrapers.cvm_fund_reports as reports_module
+
+    now = [100.0]
+    calls: list[date] = []
+    provider = CvmFundReportProvider(
+        Settings(cvm_report_cache_max_entries=2, instrument_data_ttl_seconds=10)
+    )
+
+    async def listed_reports(
+        _instrument: InstrumentMetadata,
+        reference: date,
+    ) -> FundReportSeries:
+        calls.append(reference)
+        return FundReportSeries(cnpj=reference.isoformat())
+
+    monkeypatch.setattr(provider, "_listed_fund_reports", listed_reports)
+    monkeypatch.setattr(reports_module, "monotonic", lambda: now[0])
+    instrument = _instrument()
+    first_date = date(2026, 6, 1)
+    second_date = date(2026, 6, 2)
+    third_date = date(2026, 6, 3)
+
+    first = await provider.reports(instrument, today=first_date)
+    await provider.reports(instrument, today=second_date)
+    assert await provider.reports(instrument, today=first_date) is first
+
+    third = await provider.reports(instrument, today=third_date)
+
+    assert third.cnpj == third_date.isoformat()
+    assert calls == [first_date, second_date, third_date]
+    assert [key[-1] for key in provider._reports] == [first_date, third_date]
+
+    now[0] = 111.0
+    refreshed = await provider.reports(instrument, today=first_date)
+
+    assert refreshed.cnpj == first_date.isoformat()
+    assert refreshed is not first
+    assert calls == [first_date, second_date, third_date, first_date]
+    assert len(provider._reports) == 2
+
+
+@pytest.mark.asyncio
+async def test_archive_cache_is_bounded_lru_and_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.scrapers.cvm_fund_reports as reports_module
+
+    now = [100.0]
+    calls: list[str] = []
+    provider = CvmFundReportProvider(
+        Settings(
+            cvm_archive_cache_max_entries=2,
+            cvm_archive_cache_max_bytes=16,
+            instrument_data_ttl_seconds=10,
+        )
+    )
+
+    async def request(path: str) -> bytes:
+        calls.append(path)
+        return path.encode().ljust(6, b"x")
+
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(reports_module, "monotonic", lambda: now[0])
+
+    assert await provider._download("/one") == b"/onexx"
+    assert await provider._download("/two") == b"/twoxx"
+    assert await provider._download("/one") == b"/onexx"
+    assert await provider._download("/three") == b"/three"
+
+    assert calls == ["/one", "/two", "/three"]
+    assert list(provider._archives) == ["/one", "/three"]
+    assert provider._archive_cache_bytes == 12
+
+    now[0] = 111.0
+    assert await provider._download("/one") == b"/onexx"
+
+    assert calls == ["/one", "/two", "/three", "/one"]
+    assert list(provider._archives) == ["/one"]
+    assert provider._archive_cache_bytes == 6
+
+
+@pytest.mark.asyncio
+async def test_archive_cache_skips_oversized_payloads_and_purges_expired_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.scrapers.cvm_fund_reports as reports_module
+
+    now = [100.0]
+    calls: list[str] = []
+    provider = CvmFundReportProvider(
+        Settings(
+            cvm_archive_cache_max_entries=3,
+            cvm_archive_cache_max_bytes=10,
+            instrument_data_ttl_seconds=10,
+        )
+    )
+    payloads = {
+        "/expired": b"123456",
+        "/kept": b"1234",
+        "/huge": b"12345678901",
+        "/new": b"123456",
+    }
+
+    async def request(path: str) -> bytes:
+        calls.append(path)
+        return payloads[path]
+
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(reports_module, "monotonic", lambda: now[0])
+
+    assert await provider._download("/expired") == b"123456"
+    now[0] = 105.0
+    assert await provider._download("/kept") == b"1234"
+    assert list(provider._archives) == ["/expired", "/kept"]
+    assert provider._archive_cache_bytes == 10
+
+    now[0] = 111.0
+    assert await provider._download("/huge") == b"12345678901"
+    assert list(provider._archives) == ["/kept"]
+    assert provider._archive_cache_bytes == 4
+
+    assert await provider._download("/huge") == b"12345678901"
+    assert calls == ["/expired", "/kept", "/huge", "/huge"]
+    assert list(provider._archives) == ["/kept"]
+    assert provider._archive_cache_bytes == 4
+
+    now[0] = 116.0
+    assert await provider._download("/new") == b"123456"
+    assert list(provider._archives) == ["/new"]
+    assert provider._archive_cache_bytes == 6
+
+
+@pytest.mark.asyncio
+async def test_concurrent_archive_requests_share_one_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    provider = CvmFundReportProvider(Settings())
+
+    async def request(_path: str) -> bytes | None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return b"archive"
+
+    monkeypatch.setattr(provider, "_request", request)
+    first = asyncio.create_task(provider._download("/archive.zip"))
+    await started.wait()
+    second = asyncio.create_task(provider._download("/archive.zip"))
+    await asyncio.sleep(0)
+    release.set()
+
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == b"archive"
+    assert second_result == b"archive"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_archive_request_is_removed_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    provider = CvmFundReportProvider(Settings())
+    started = asyncio.Event()
+
+    async def request(_path: str) -> bytes | None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        if calls == 1:
+            await asyncio.Future()
+        return b"archive"
+
+    monkeypatch.setattr(provider, "_request", request)
+    download = asyncio.create_task(provider._download("/archive.zip"))
+    await started.wait()
+    download.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await download
+
+    shared = provider._archive_tasks["/archive.zip"]
+    shared.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shared
+
+    assert "/archive.zip" not in provider._archive_tasks
+    assert await provider._download("/archive.zip") == b"archive"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_archive_waiter_keeps_shared_download_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    provider = CvmFundReportProvider(Settings())
+
+    async def request(_path: str) -> bytes:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return b"archive"
+
+    monkeypatch.setattr(provider, "_request", request)
+    first = asyncio.create_task(provider._download("/archive.zip"))
+    await started.wait()
+    second = asyncio.create_task(provider._download("/archive.zip"))
+    await asyncio.sleep(0)
+    first.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    release.set()
+    assert await second == b"archive"
+    assert await provider._download("/archive.zip") == b"archive"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unexpected_archive_failure_is_removed_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    provider = CvmFundReportProvider(Settings())
+
+    async def request(_path: str) -> bytes | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("unexpected parser failure")
+        return b"archive"
+
+    monkeypatch.setattr(provider, "_request", request)
+
+    with pytest.raises(RuntimeError, match="unexpected parser failure"):
+        await provider._download("/archive.zip")
+
+    assert "/archive.zip" not in provider._archive_tasks
+    assert await provider._download("/archive.zip") == b"archive"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_provider_combines_legacy_and_current_listed_fund_reports() -> None:
     fii_payload = _zip(
         {
@@ -316,4 +575,120 @@ async def test_provider_ignores_unsupported_or_unidentified_instruments() -> Non
         Settings(),
         httpx.MockTransport(lambda _: httpx.Response(500)),
     )
-    assert await failing.reports(_instrument(), today=date(2026, 6, 30)) == FundReportSeries()
+    with pytest.raises(ProviderUnavailableError):
+        await failing.reports(_instrument(), today=date(2026, 6, 30))
+
+
+@pytest.mark.asyncio
+async def test_provider_surfaces_fiagro_and_fi_infra_archive_failures() -> None:
+    def fiagro_handler(request: httpx.Request) -> httpx.Response:
+        if "inf_mensal_fiagro_" in request.url.path:
+            return httpx.Response(500)
+        return httpx.Response(404)
+
+    fiagro_provider = CvmFundReportProvider(
+        Settings(),
+        httpx.MockTransport(fiagro_handler),
+    )
+    with pytest.raises(ProviderUnavailableError):
+        await fiagro_provider.reports(
+            _instrument(InstrumentType.fiagro),
+            today=date(2026, 6, 30),
+        )
+
+    fi_infra_provider = CvmFundReportProvider(
+        Settings(),
+        httpx.MockTransport(lambda _request: httpx.Response(500)),
+    )
+    with pytest.raises(ProviderUnavailableError):
+        await fi_infra_provider.reports(
+            InstrumentMetadata(
+                ticker="JURO11",
+                instrument_type=InstrumentType.fi_infra,
+            ),
+            cnpj="42.730.834/0001-00",
+            today=date(2026, 6, 30),
+        )
+
+
+@pytest.mark.asyncio
+async def test_fiagro_failure_is_not_hidden_by_empty_fii_archives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.scrapers.cvm_fund_reports as reports_module
+
+    provider = CvmFundReportProvider(Settings())
+    calls = 0
+
+    async def download_many(
+        paths: list[str],
+    ) -> tuple[list[bytes], list[tuple[str, APIError]]]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [b"valid but unrelated FII archive"], []
+        return [], [(paths[0], ProviderUnavailableError())]
+
+    monkeypatch.setattr(provider, "_download_many", download_many)
+    monkeypatch.setattr(
+        reports_module,
+        "parse_fii_reports",
+        lambda _payload, _instrument: FundReportSeries(),
+    )
+
+    with pytest.raises(ProviderUnavailableError):
+        await provider.reports(
+            _instrument(InstrumentType.fiagro),
+            today=date(2026, 6, 30),
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_exposes_partial_archive_failures_with_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _zip(
+        {
+            "geral.csv": (
+                "CNPJ_Fundo_Classe;Data_Referencia;Nome_Fundo_Classe;Codigo_ISIN\n"
+                "28.757.546/0001-00;2026-06-01;XP MALLS FII;BRXPMLCTF000\n"
+            ),
+            "complemento.csv": (
+                "CNPJ_Fundo_Classe;Data_Referencia;Valor_Patrimonial_Cotas\n"
+                "28.757.546/0001-00;2026-06-01;102.50\n"
+            ),
+        }
+    )
+    provider = CvmFundReportProvider(Settings())
+
+    async def partial_download(paths: list[str]) -> tuple[list[bytes], list[tuple[str, APIError]]]:
+        return [payload], [(paths[-1], ProviderUnavailableError())]
+
+    monkeypatch.setattr(provider, "_download_many", partial_download)
+
+    result = await provider.reports(_instrument(), today=date(2026, 6, 30))
+
+    assert result.reports[0].nav_per_share == Decimal("102.50")
+    assert result.archive_failures[-1].path.endswith("inf_mensal_fii_2026.zip")
+    assert result.archive_failures[-1].code == "PROVIDER_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_provider_preserves_unexpected_download_failures_and_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CvmFundReportProvider(Settings())
+
+    async def broken_download(_path: str) -> bytes:
+        raise RuntimeError("unexpected parser failure")
+
+    monkeypatch.setattr(provider, "_download", broken_download)
+    with pytest.raises(RuntimeError, match="unexpected parser failure"):
+        await provider._download_many(["/one.zip"])
+
+    def request_failure(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=_request)
+
+    failing = CvmFundReportProvider(Settings(), httpx.MockTransport(request_failure))
+    with pytest.raises(ProviderUnavailableError):
+        await failing._request("/archive.zip")

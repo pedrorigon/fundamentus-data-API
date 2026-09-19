@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -325,6 +326,107 @@ async def test_sec_retry_handles_transport_exception() -> None:
         httpx.MockTransport(handler),
     )
     assert await provider._fetch_json("https://data.sec.test", "/facts") == {}
+
+
+@pytest.mark.asyncio
+async def test_sec_cached_json_shields_shared_loader_when_first_waiter_is_cancelled() -> None:
+    provider = SecCompanyFactsProvider(Settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def loader() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"calls": calls}
+
+    first = asyncio.create_task(provider._cached_json("shared", loader, 60))
+    await started.wait()
+    second = asyncio.create_task(provider._cached_json("shared", loader, 60))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not second.done()
+
+    release.set()
+    assert await second == {"calls": 1}
+    await asyncio.sleep(0)
+    assert calls == 1
+    assert provider._cache["shared"].value == {"calls": 1}
+    assert not provider._inflight
+
+
+@pytest.mark.asyncio
+async def test_sec_cached_json_failure_cleans_inflight_and_allows_retry() -> None:
+    provider = SecCompanyFactsProvider(Settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def loader() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("upstream failed")
+        return {"calls": calls}
+
+    first = asyncio.create_task(provider._cached_json("retry", loader, 60))
+    await started.wait()
+    second = asyncio.create_task(provider._cached_json("retry", loader, 60))
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        await first
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        await second
+    await asyncio.sleep(0)
+    assert not provider._inflight
+
+    assert await provider._cached_json("retry", loader, 60) == {"calls": 2}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_sec_cached_json_uses_bounded_lru_without_evicting_inflight_loads() -> None:
+    provider = SecCompanyFactsProvider(Settings(ticker_cache_max_entries=2))
+
+    async def immediate_loader(key: str) -> dict[str, str]:
+        return {"key": key}
+
+    await provider._cached_json("first", lambda: immediate_loader("first"), 60)
+    await provider._cached_json("second", lambda: immediate_loader("second"), 60)
+    await provider._cached_json("first", lambda: immediate_loader("first"), 60)
+    await provider._cached_json("third", lambda: immediate_loader("third"), 60)
+
+    assert list(provider._cache) == ["first", "third"]
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pending_loader() -> dict[str, str]:
+        started.set()
+        await release.wait()
+        return {"key": "pending"}
+
+    pending = asyncio.create_task(provider._cached_json("pending", pending_loader, 60))
+    await started.wait()
+    assert "pending" in provider._inflight
+    assert "pending" not in provider._cache
+    assert len(provider._cache) == 2
+
+    release.set()
+    assert await pending == {"key": "pending"}
+    await asyncio.sleep(0)
+    assert len(provider._cache) == 2
+    assert "pending" in provider._cache
+    assert "third" in provider._cache
 
 
 def test_sec_parser_helpers_cover_invalid_units_and_dates() -> None:

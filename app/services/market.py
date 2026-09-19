@@ -203,12 +203,20 @@ class InstrumentDataService:
             if task is None:
                 task = asyncio.create_task(self._refresh_directory())
                 self._directory_task = task
-        try:
-            await task
-        finally:
-            async with self._directory_lock:
-                if self._directory_task is task:
-                    self._directory_task = None
+                task.add_done_callback(self._directory_complete)
+        # Directory refresh is process-shared.  Cancellation of one request
+        # must not abort the refresh observed by other callers.
+        await asyncio.shield(task)
+
+    def _directory_complete(self, task: asyncio.Task[None]) -> None:
+        """Release the refresh slot only after its owning task completes."""
+        if self._directory_task is task:
+            self._directory_task = None
+        # If all callers were cancelled, consume a failed refresh exception so
+        # asyncio does not report an unhandled task while preserving it for
+        # callers that still await the shared task.
+        if not task.cancelled():
+            task.exception()
 
     async def refresh_directory(self) -> None:
         """Force a bounded bulk refresh, retaining the prior snapshot on failure."""
@@ -275,30 +283,38 @@ class InstrumentDataService:
         brapi_task = asyncio.create_task(
             _invoke_directory(cast(Any, self.brapi_directory), "directory", "instruments")
         )
-        gathered: tuple[
-            list[Any] | BaseException, list[Any] | BaseException
-        ] = await asyncio.gather(sec_task, brapi_task, return_exceptions=True)
-        sec_result, brapi_result = gathered
-        if isinstance(sec_result, BaseException):
-            warnings.append(f"{SEC_TICKER_DIRECTORY} unavailable: {sec_result}")
-        else:
-            sources.extend(_metadata_from_sec(item) for item in sec_result)
-            if not sec_result:
-                warnings.append(f"{SEC_TICKER_DIRECTORY} returned no records")
-        if isinstance(brapi_result, BaseException):
-            warnings.append(f"{SOURCE_BRAPI_DIRECTORY} unavailable: {brapi_result}")
-        else:
-            sources.extend(brapi_result)
-            if not brapi_result:
-                reason = getattr(self.brapi_directory, "last_error", None) or "returned no records"
-                warnings.append(f"{SOURCE_BRAPI_DIRECTORY} unavailable: {reason}")
-        if sources:
-            for item in sources:
-                self._remember(item)
-            self._link_underlying_names()
-            self._directory_loaded = True
-            self._directory_refreshed_at = asyncio.get_running_loop().time()
-        self._directory_warnings = warnings
+        gathered: tuple[list[Any] | BaseException, list[Any] | BaseException]
+        try:
+            gathered = await asyncio.gather(sec_task, brapi_task, return_exceptions=True)
+            sec_result, brapi_result = gathered
+            if isinstance(sec_result, BaseException):
+                warnings.append(f"{SEC_TICKER_DIRECTORY} unavailable: {sec_result}")
+            else:
+                sources.extend(_metadata_from_sec(item) for item in sec_result)
+                if not sec_result:
+                    warnings.append(f"{SEC_TICKER_DIRECTORY} returned no records")
+            if isinstance(brapi_result, BaseException):
+                warnings.append(f"{SOURCE_BRAPI_DIRECTORY} unavailable: {brapi_result}")
+            else:
+                sources.extend(brapi_result)
+                if not brapi_result:
+                    reason = getattr(self.brapi_directory, "last_error", None) or (
+                        "returned no records"
+                    )
+                    warnings.append(f"{SOURCE_BRAPI_DIRECTORY} unavailable: {reason}")
+            if sources:
+                for item in sources:
+                    self._remember(item)
+                self._link_underlying_names()
+                self._directory_loaded = True
+                self._directory_refreshed_at = asyncio.get_running_loop().time()
+            self._directory_warnings = warnings
+        finally:
+            # ``warm_directory`` can be cancelled while the two provider tasks
+            # are still opening an HTTP connection.  Explicitly cancel and
+            # await both children so their async clients finish closing before
+            # the parent task is allowed to return during application shutdown.
+            await _cancel_and_wait((sec_task, brapi_task))
 
     def _link_underlying_names(self) -> None:
         """Give each depositary receipt the issuer name of its underlying.
@@ -576,6 +592,16 @@ async def _invoke_directory(provider: Any, preferred: str, fallback: str) -> lis
         raise RuntimeError(f"Directory provider has no {preferred}/{fallback} method")
     result = await loader()
     return result if isinstance(result, list) else []
+
+
+async def _cancel_and_wait(tasks: tuple[asyncio.Task[Any], ...]) -> None:
+    """Cancel provider children and wait for their async cleanup to finish."""
+
+    pending = tuple(task for task in tasks if not task.done())
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _merge_instruments(

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -362,6 +363,103 @@ async def test_snd_provider_downloads_one_public_year_per_identifier() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snd_provider_shields_shared_download_from_cancelled_waiter() -> None:
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    payload = (
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "14/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t100\t101,25\t102\t100\r\n"
+    ).encode("latin-1")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(Settings(), httpx.MockTransport(handler))
+    reference = date(2024, 8, 14)
+    first = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+    await started.wait()
+    second = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    release.set()
+    assert await second == {"CRMG15": Decimal("101.25")}
+    assert await provider.prices_for(reference, {"CRMG15"}) == {"CRMG15": Decimal("101.25")}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_cleans_failed_shared_download_for_later_retry() -> None:
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    payload = (
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "14/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t100\t101,25\t102\t100\r\n"
+    ).encode("latin-1")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("provider failed")
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(Settings(), httpx.MockTransport(handler))
+    reference = date(2024, 8, 14)
+    key = ("CRMG15", reference.year)
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+
+    def capture_loop_error(
+        _loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_errors.append(context)
+
+    loop.set_exception_handler(capture_loop_error)
+    try:
+        first = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+        await started.wait()
+        second = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+        await asyncio.sleep(0)
+        shared = provider._inflight[key]
+
+        first.cancel()
+        second.cancel()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if shared.done() and key not in provider._inflight:
+                break
+        assert shared.done()
+        assert key not in provider._inflight
+
+        assert await provider.prices_for(reference, {"CRMG15"}) == {"CRMG15": Decimal("101.25")}
+        assert calls == 2
+        assert loop_errors == []
+    finally:
+        release.set()
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
 async def test_snd_provider_keeps_missing_and_unsafe_downloads_unavailable() -> None:
     responses = iter(
         (
@@ -445,6 +543,54 @@ async def test_b3_provider_resolves_exact_identifier_and_caches_result() -> None
     }
     assert await provider.prices_for(reference, {"CDB123"}) == {"CDB123": Decimal("100")}
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_b3_provider_uses_bounded_lru_cache() -> None:
+    calls: list[str] = []
+    reference = date(2026, 7, 31)
+    payload = {
+        "table": {
+            "values": [
+                [
+                    None,
+                    None,
+                    identifier,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "100",
+                ]
+                for identifier in ("AAA1", "BBB1", "CCC1")
+            ]
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        encoded = request.url.params["filter"]
+        calls.append(base64.b64decode(encoded).decode("ascii"))
+        return httpx.Response(200, json=payload)
+
+    provider = B3FixedIncomeProvider(
+        Settings(memory_cache_max_entries=2),
+        httpx.MockTransport(handler),
+    )
+
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100")}
+    assert await provider.prices_for(reference, {"BBB1"}) == {"BBB1": Decimal("100")}
+    # A hit promotes AAA1, so CCC1 evicts BBB1 as the least recently used item.
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100")}
+    assert await provider.prices_for(reference, {"CCC1"}) == {"CCC1": Decimal("100")}
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100")}
+    assert await provider.prices_for(reference, {"BBB1"}) == {"BBB1": Decimal("100")}
+
+    assert calls == ["AAA1", "BBB1", "CCC1", "BBB1"]
 
 
 @pytest.mark.asyncio
@@ -909,7 +1055,23 @@ def test_fixed_income_dependency_reads_application_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lifespan_registers_fixed_income_service() -> None:
+async def test_lifespan_registers_fixed_income_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoopInstrumentDataService:
+        def __init__(self, _settings: object) -> None:
+            pass
+
+        async def warm_directory(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    # This lifecycle assertion must not start the production directory warm-up
+    # against SEC/brapi; the providers are covered with deterministic transports
+    # in the instrument-directory tests.
+    monkeypatch.setattr("app.main.InstrumentDataService", NoopInstrumentDataService)
     app = create_app()
 
     async with lifespan(app):
