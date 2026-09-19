@@ -54,6 +54,7 @@ from app.models.historical_quotes import (
 from app.models.income_events import (
     CanonicalIncomeEvent,
     IncomeEventAsyncRefreshResponse,
+    IncomeEventBackfillRequest,
     IncomeEventBatchRequest,
     IncomeEventBatchResponse,
     IncomeEventChangesResponse,
@@ -127,6 +128,7 @@ __all__ = [
     "HistoricalQuoteResponse",
     "CanonicalIncomeEvent",
     "IncomeEventAsyncRefreshResponse",
+    "IncomeEventBackfillRequest",
     "IncomeEventCoverageItem",
     "IncomeEventCoverageResponse",
     "IncomeEventRefreshJobItem",

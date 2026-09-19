@@ -41,6 +41,7 @@ from app.models import (
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
     IncomeEventAsyncRefreshResponse,
+    IncomeEventBackfillRequest,
     IncomeEventBatchRequest,
     IncomeEventBatchResponse,
     IncomeEventChangesResponse,
@@ -108,6 +109,21 @@ async def refresh_income_events(
         response.status_code = status.HTTP_202_ACCEPTED
         return await service.refresh_async(payload)
     return await service.refresh(payload)
+
+
+@router.post(
+    "/v2/income-events/backfill",
+    response_model=IncomeEventAsyncRefreshResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["income-events"],
+)
+async def backfill_income_events(
+    payload: IncomeEventBackfillRequest,
+    service: IncomeEventServiceDep,
+    x_cache_token: CacheTokenHeader = None,
+) -> IncomeEventAsyncRefreshResponse:
+    _require_refresh_authorization(x_cache_token)
+    return await service.backfill(payload)
 
 
 @router.get(

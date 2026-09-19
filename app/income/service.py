@@ -14,6 +14,7 @@ from app.income.store import (
 )
 from app.models.income_events import (
     IncomeEventAsyncRefreshResponse,
+    IncomeEventBackfillRequest,
     IncomeEventBatchRequest,
     IncomeEventBatchResponse,
     IncomeEventChangesResponse,
@@ -43,6 +44,9 @@ class IncomeEventService:
     ) -> None:
         self.store = store
         self.sources = sources
+        # ``getattr`` keeps lightweight embedding and test doubles compatible
+        # while the protocol marks the official publications.
+        self.official_sources = [source for source in sources if getattr(source, "official", False)]
         self.snapshot_overlap_days = snapshot_overlap_days
         self.refresh_ttl_seconds = refresh_ttl_seconds
         self.job_batch_size = max(job_batch_size, 1)
@@ -203,10 +207,37 @@ class IncomeEventService:
         request: IncomeEventRefreshRequest,
     ) -> IncomeEventAsyncRefreshResponse:
         """Persist a durable refresh job and wake the background worker."""
-        instruments = _unique_instruments(request.instruments)
-        as_of = request.as_of or date.today()
+        return await self._submit_job(
+            self.sources,
+            _unique_instruments(request.instruments),
+            request.as_of or date.today(),
+        )
+
+    async def backfill(
+        self,
+        request: IncomeEventBackfillRequest,
+    ) -> IncomeEventAsyncRefreshResponse:
+        """Queue one durable official backfill for a large instrument list.
+
+        Only official B3/CVM publications are collected, so a catalog backfill
+        never scrapes the complementary HTML providers. The source keeps the
+        CVM open-data index and the parsed documents cached while the worker
+        drains the job pages, so a listing shared by many tickers is read once.
+        """
+        return await self._submit_job(
+            self.official_sources,
+            _unique_instruments(request.instruments),
+            request.as_of or date.today(),
+        )
+
+    async def _submit_job(
+        self,
+        sources: list[IncomeSource],
+        instruments: list[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeEventAsyncRefreshResponse:
         items: list[tuple[str, str]] = []
-        for source in self.sources:
+        for source in sources:
             items.extend(
                 (source.name, item.ticker)
                 for item in await self._stale_instruments(source, instruments)

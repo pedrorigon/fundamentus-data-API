@@ -40,6 +40,7 @@ from app.income.store import IncomeEventStore
 from app.main import create_app
 from app.models import (
     Dividend,
+    IncomeEventBackfillRequest,
     IncomeEventBatchRequest,
     IncomeEventObservation,
     IncomeEventRefreshRequest,
@@ -728,6 +729,7 @@ async def test_snapshot_replacement_retires_only_the_mutable_overlap(tmp_path: P
 class _Source:
     name = "fake"
     snapshot_sources: tuple[str, ...] = ("official",)
+    official = False
 
     def __init__(self, *, delay: float = 0, fail: bool = False) -> None:
         self.delay = delay
@@ -758,6 +760,7 @@ class _Source:
 class _EventGatedSource:
     name = "gated"
     snapshot_sources: tuple[str, ...] = ("official",)
+    official = False
 
     def __init__(self) -> None:
         self.calls = 0
@@ -1373,6 +1376,51 @@ async def test_official_company_source_uses_b3_without_cvm_code() -> None:
 
 
 @pytest.mark.asyncio
+async def test_official_company_source_reads_each_issuer_once() -> None:
+    rows = [
+        {
+            "isinCode": "BRBBASACNOR3",
+            "label": "DIVIDENDO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,5",
+        },
+        {
+            "isinCode": "BRBBASACNOR4",
+            "label": "DIVIDENDO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,7",
+        },
+    ]
+    requests = {"b3": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        requests["b3"] += 1
+        return httpx.Response(200, json=[{"cashDividends": rows}])
+
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(handler),
+    )
+    result = await source.collect(
+        [
+            IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3"),
+            IncomeInstrumentRequest(ticker="BBAS4", isin="BRBBASACNOR4"),
+        ],
+        date(2026, 8, 27),
+    )
+    await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3")],
+        date(2026, 8, 27),
+    )
+
+    assert len(result.observations) == 2
+    assert requests["b3"] == 1
+    assert source._b3_tasks == {}
+
+
+@pytest.mark.asyncio
 async def test_official_company_source_requires_isin_for_multiple_share_classes() -> None:
     common = {
         "label": "JRS CAP PROPRIO",
@@ -1722,6 +1770,76 @@ def _job_item(state: dict[str, object] | None) -> dict[str, object]:
     item = items[0]
     assert isinstance(item, dict)
     return item
+
+
+class _OfficialSource(_Source):
+    name = "official_companies"
+    official = True
+
+
+@pytest.mark.asyncio
+async def test_backfill_queues_only_official_sources(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    official = _OfficialSource()
+    complementary = _Source()
+    service = IncomeEventService(store, [official, complementary])
+    request = IncomeEventBackfillRequest(
+        instruments=[
+            IncomeInstrumentRequest(ticker="BBAS3"),
+            IncomeInstrumentRequest(ticker="PETR4"),
+        ],
+    )
+
+    job = await service.backfill(request)
+
+    assert (job.requested, job.queued, job.deduplicated) == (2, 2, 0)
+    state = await service.refresh_job(job.job_id)
+    assert state is not None
+    items = state["items"]
+    assert isinstance(items, list)
+    assert {item["source"] for item in items} == {"official_companies"}
+    assert {item["ticker"] for item in items} == {"BBAS3", "PETR4"}
+
+    assert await service.process_pending_once() == 2
+    assert official.calls == 1
+    assert complementary.calls == 0
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_route_queues_a_single_official_job(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_OfficialSource(), _Source()])
+    app = create_app()
+    app.dependency_overrides[get_income_event_service] = lambda: service
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post(
+            "/v2/income-events/backfill",
+            json={"instruments": [{"ticker": "BBAS3"}, {"ticker": "bbas3"}, {"ticker": "PETR4"}]},
+        )
+        assert accepted.status_code == 202
+        body = accepted.json()
+        assert body["requested"] == 2
+        assert body["queued"] == 2
+
+        await service.process_pending_once()
+        job = await client.get(f"/v2/income-events/refresh-jobs/{body['job_id']}")
+        assert job.status_code == 200
+        assert job.json()["status"] == "completed"
+        assert {item["source"] for item in job.json()["items"]} == {"official_companies"}
+
+        too_many = await client.post(
+            "/v2/income-events/backfill",
+            json={"instruments": [{"ticker": f"T{index:04d}"} for index in range(501)]},
+        )
+        assert too_many.status_code == 422
+    await store.close()
 
 
 @pytest.mark.asyncio

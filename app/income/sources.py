@@ -45,6 +45,8 @@ class IncomeSourceResult:
 class IncomeSource(Protocol):
     name: str
     snapshot_sources: tuple[str, ...]
+    #: Official publications are the only sources a bulk backfill collects.
+    official: bool
 
     async def collect(
         self,
@@ -84,6 +86,7 @@ async def _drain_shared_tasks[Key, Value](
 
 class FundamentusIncomeSource:
     name = "fundamentus"
+    official = False
     snapshot_sources: tuple[str, ...] = ("fundamentus",)
 
     def __init__(self, assets: AssetService) -> None:
@@ -117,6 +120,7 @@ class FundamentusIncomeSource:
 
 class StatusInvestIncomeSource:
     name = "status_invest"
+    official = False
     snapshot_sources: tuple[str, ...] = ("status_invest",)
 
     def __init__(
@@ -244,6 +248,7 @@ class StatusInvestIncomeSource:
 
 class OfficialCompanyIncomeSource:
     name = "official_companies"
+    official = True
     snapshot_sources: tuple[str, ...] = ("b3", "cvm")
 
     def __init__(
@@ -261,6 +266,11 @@ class OfficialCompanyIncomeSource:
         self._cvm_download_semaphore = asyncio.Semaphore(
             min(max(settings.upstream_concurrency, 1), 2)
         )
+        # One B3 listed-company payload covers every share class of an issuer,
+        # so a bulk backfill reads each issuer once per index window.
+        self._b3_payloads: dict[str, tuple[float, Any]] = {}
+        self._b3_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._b3_lock = asyncio.Lock()
 
     async def collect(
         self,
@@ -275,6 +285,7 @@ class OfficialCompanyIncomeSource:
                 )
             finally:
                 await _drain_shared_tasks(self._cvm_document_tasks, self._cvm_document_lock)
+                await _drain_shared_tasks(self._b3_tasks, self._b3_lock)
         return _instrument_results(self.name, instruments, results)
 
     def _client(self) -> httpx.AsyncClient:
@@ -316,6 +327,26 @@ class OfficialCompanyIncomeSource:
 
     async def _b3_payload(self, client: httpx.AsyncClient, ticker: str) -> Any:
         issuer = _issuer_code(ticker)
+        async with self._b3_lock:
+            cached = self._b3_payloads.get(issuer)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._b3_tasks.get(issuer)
+            if task is None:
+                task = asyncio.create_task(self._fetch_b3_payload(client, issuer))
+                self._b3_tasks[issuer] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._b3_tasks,
+                        issuer,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_b3_payload(self, client: httpx.AsyncClient, issuer: str) -> Any:
         encoded = base64.b64encode(
             json.dumps(
                 {"language": "pt-br", "issuingCompany": issuer}, separators=(",", ":")
@@ -325,10 +356,15 @@ class OfficialCompanyIncomeSource:
         url = f"{self.settings.b3_listed_companies_base_url.rstrip('/')}{endpoint}"
         response = await client.get(url)
         if response.status_code == 404:
-            return []
-        response.raise_for_status()
-        payload = response.json()
-        return json.loads(payload) if isinstance(payload, str) else payload
+            payload: Any = []
+        else:
+            response.raise_for_status()
+            raw = response.json()
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        async with self._b3_lock:
+            self._b3_payloads[issuer] = (time.monotonic(), payload)
+            _trim_ttl_cache(self._b3_payloads, self.settings.ticker_cache_max_entries)
+        return payload
 
     async def _cvm_events(
         self,
@@ -459,6 +495,7 @@ class OfficialCompanyIncomeSource:
 
 class FundosNetIncomeSource:
     name = "fundos_net"
+    official = False
     snapshot_sources: tuple[str, ...] = ("fundos_net",)
 
     def __init__(

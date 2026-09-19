@@ -97,6 +97,13 @@ class IncomeEventRefreshRequest(APIModel):
     mode: Literal["sync", "async"] = "sync"
 
 
+class IncomeEventBackfillRequest(APIModel):
+    """A bounded bulk request for the official B3/CVM backfill job."""
+
+    instruments: list[IncomeInstrumentRequest] = Field(min_length=1, max_length=500)
+    as_of: date | None = None
+
+
 class IncomeEventRefreshResponse(APIModel):
     requested: int
     observations: int
@@ -173,6 +180,7 @@ class IncomeEventChangesResponse(APIModel):
 __all__ = [
     "CanonicalIncomeEvent",
     "IncomeEventAsyncRefreshResponse",
+    "IncomeEventBackfillRequest",
     "IncomeEventBatchRequest",
     "IncomeEventBatchResponse",
     "IncomeEventChangesResponse",
