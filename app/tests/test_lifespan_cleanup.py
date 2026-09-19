@@ -108,7 +108,7 @@ def lifespan_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             resources["client"] = self
 
     class Income(_Resource):
-        def __init__(self, _path: Path) -> None:
+        def __init__(self, _path: Path, **_kwargs: Any) -> None:
             close_error = (
                 _Failure("income close failed") if config["close_name"] == "income" else None
             )

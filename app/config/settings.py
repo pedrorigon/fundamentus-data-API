@@ -135,6 +135,13 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("FUNDAMENTUS_API_DATABASE_URL", "DATABASE_URL"),
     )
+    income_store_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "FUNDAMENTUS_API_INCOME_STORE_URL",
+            "INCOME_STORE_URL",
+        ),
+    )
     assessment_sqlite_path: Path | None = None
     # The longest CVM archive request is measured in minutes.  A lease shorter
     # than that window permits a second worker to start the same paid/requested
@@ -147,7 +154,12 @@ class Settings(BaseSettings):
     batch_limit: int = 20
     cache_invalidate_token: SecretStr | None = None
 
-    @field_validator("database_url", "assessment_sqlite_path", mode="before")
+    @field_validator(
+        "database_url",
+        "income_store_url",
+        "assessment_sqlite_path",
+        mode="before",
+    )
     @classmethod
     def empty_optional_storage_settings(cls, value: object) -> object:
         """Treat blank compose substitutions as unset optional settings."""

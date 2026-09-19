@@ -45,6 +45,7 @@ from app.assessment.store import (
     _is_publishable,
     _normalize_database_url,
     _postgres_connect,
+    _postgres_row_factory,
 )
 from app.core.errors import (
     InvalidTickerError,
@@ -1018,13 +1019,24 @@ def test_settings_reject_an_unbounded_assessment_lease() -> None:
 def test_settings_treat_blank_optional_storage_paths_as_unset() -> None:
     from app.config import Settings
 
-    settings = Settings(database_url="", assessment_sqlite_path="")
+    settings = Settings(database_url="", assessment_sqlite_path="", income_store_url="")
 
     assert settings.database_url is None
+    assert settings.income_store_url is None
     assert settings.assessment_sqlite_path is None
     assert settings.resolved_assessment_sqlite_path.name == "fundamentus_cache_assessments.sqlite3"
     custom = Settings(assessment_sqlite_path=Path("/tmp/custom-assessments.sqlite3"))
     assert custom.resolved_assessment_sqlite_path == Path("/tmp/custom-assessments.sqlite3")
+
+
+def test_settings_read_the_income_store_url_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import Settings
+
+    monkeypatch.setenv("INCOME_STORE_URL", "postgresql://user:pass@db/income")
+    assert str(Settings().income_store_url) == "postgresql://user:pass@db/income"
+    monkeypatch.delenv("INCOME_STORE_URL")
+    monkeypatch.setenv("FUNDAMENTUS_API_INCOME_STORE_URL", "postgresql://user:pass@db/other")
+    assert str(Settings().income_store_url) == "postgresql://user:pass@db/other"
 
 
 @pytest.mark.asyncio
@@ -1864,6 +1876,8 @@ def test_assessment_store_helpers_normalize_database_urls_and_publishability() -
     assert _normalize_database_url("postgresql+psycopg://db/app") == "postgresql://db/app"
     assert _normalize_database_url(" sqlite://local ") == "sqlite://local"
     assert _normalize_database_url("") is None
+    cursor = type("_Cursor", (), {"pgresult": None})()
+    assert callable(_postgres_row_factory(cursor))
     assert not _is_publishable(
         _response(_period()).model_copy(update={"status": AssessmentRunStatus.failed})
     )

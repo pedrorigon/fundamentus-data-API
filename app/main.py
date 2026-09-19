@@ -87,7 +87,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scraper = FundamentusScraper(client, settings)
         asset_service = AssetService(scraper, cache, settings)
         app.state.asset_service = asset_service
-        income_event_store = IncomeEventStore(settings.sqlite_cache_path)
+        income_event_store = IncomeEventStore(
+            settings.sqlite_cache_path,
+            # ``getattr`` keeps lightweight lifecycle test doubles compatible
+            # while Settings supplies the configured shared store.
+            database_url=(
+                getattr(settings, "income_store_url", None)
+                or getattr(settings, "database_url", None)
+            ),
+        )
         await income_event_store.startup()
         status_income_source = StatusInvestIncomeSource(settings)
         income_event_service = IncomeEventService(

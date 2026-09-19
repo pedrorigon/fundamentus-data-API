@@ -16,6 +16,26 @@ from app.assessment.models import (
     AssessmentRunStatus,
     AssessmentSnapshotResponse,
 )
+from app.core.postgres import (
+    normalize_database_url,
+    postgres_connect,
+    postgres_row_factory,
+)
+
+
+# Thin aliases keep the historical private names importable and patchable
+# while the shared implementation lives in one place.
+def _normalize_database_url(value: str | None) -> str | None:
+    return normalize_database_url(value)
+
+
+async def _postgres_connect(database_url: str | None) -> Any:
+    return await postgres_connect(database_url)
+
+
+def _postgres_row_factory(cursor: Any) -> Any:
+    return postgres_row_factory(cursor)
+
 
 ASSESSMENT_TABLE = "fundamentus_assessment_snapshots"
 MAX_LEASE_SECONDS = 3600
@@ -974,39 +994,6 @@ def _assessment_period_closed(period_at: datetime, now: datetime) -> bool:
         else start.replace(hour=next_hour)
     )
     return local_now >= end
-
-
-def _normalize_database_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    normalized = value.strip()
-    for prefix in (
-        "postgresql+asyncpg://",
-        "postgres+asyncpg://",
-        "postgresql+psycopg://",
-        "postgres+psycopg://",
-    ):
-        if normalized.startswith(prefix):
-            return "postgresql://" + normalized.removeprefix(prefix)
-    return normalized
-
-
-async def _postgres_connect(database_url: str | None) -> Any:
-    if not database_url:
-        raise RuntimeError("A PostgreSQL database URL is required")
-    try:
-        import psycopg
-    except ImportError as exc:  # pragma: no cover - exercised in deployment images
-        raise RuntimeError("PostgreSQL assessment storage requires psycopg[binary]") from exc
-    return await psycopg.AsyncConnection.connect(database_url)
-
-
-def _postgres_row_factory(cursor: Any) -> Any:
-    try:
-        from psycopg.rows import dict_row
-    except ImportError as exc:  # pragma: no cover - deployment dependency
-        raise RuntimeError("PostgreSQL assessment storage requires psycopg[binary]") from exc
-    return dict_row(cursor)
 
 
 _SCHEMA = f"""
