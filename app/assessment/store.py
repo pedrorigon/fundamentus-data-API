@@ -19,6 +19,7 @@ from app.assessment.models import (
 from app.core.postgres import (
     normalize_database_url,
     postgres_connect,
+    postgres_lock_schema,
     postgres_row_factory,
 )
 
@@ -499,6 +500,7 @@ class AssessmentStore:
 
     async def _postgres_setup(self) -> None:
         async with await _postgres_connect(self.database_url) as conn:
+            await postgres_lock_schema(conn, "fundamentus_assessment_schema")
             await conn.execute(_POSTGRES_SCHEMA)
             for statement in _POSTGRES_MIGRATIONS:
                 await conn.execute(statement)

@@ -185,6 +185,7 @@ async def test_postgres_startup_creates_the_shared_schema(
     await store.startup()
 
     statements = [query for query, _params in database.statements]
+    assert "pg_advisory_xact_lock" in statements[0]
     assert any("CREATE TABLE IF NOT EXISTS canonical_income_events" in q for q in statements)
     assert any("CREATE TABLE IF NOT EXISTS income_refresh_job_items" in q for q in statements)
     partial = next(q for q in statements if "uq_income_refresh_item_inflight" in q)

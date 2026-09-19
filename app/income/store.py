@@ -26,7 +26,12 @@ import aiosqlite
 import orjson
 
 from app.cache.sqlite import configure_sqlite_connection, sqlite_path_lock, sqlite_transaction
-from app.core.postgres import normalize_database_url, postgres_connect, postgres_row_factory
+from app.core.postgres import (
+    normalize_database_url,
+    postgres_connect,
+    postgres_lock_schema,
+    postgres_row_factory,
+)
 from app.models.income_events import (
     CanonicalIncomeEvent,
     IncomeEventObservation,
@@ -851,6 +856,7 @@ class IncomeEventStore:
         connection = await postgres_connect(self.database_url)
         try:
             async with connection.transaction():
+                await postgres_lock_schema(connection, "fundamentus_income_schema")
                 for statement in _POSTGRES_SCHEMA:
                     await connection.execute(statement)
         finally:

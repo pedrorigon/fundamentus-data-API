@@ -216,6 +216,7 @@ async def test_postgres_setup_applies_migrations_before_venue_index(
     await store.startup()
     await store.close()
 
+    assert "pg_advisory_xact_lock" in connection.setup_statements[0]
     index_position = next(
         index
         for index, statement in enumerate(connection.setup_statements)
