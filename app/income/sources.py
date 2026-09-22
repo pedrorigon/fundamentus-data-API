@@ -443,7 +443,7 @@ class OfficialCompanyIncomeSource:
         )
         if instrument.isin:
             return [item for item in events if item.isin in {None, instrument.isin}]
-        return events
+        return [item for item in events if not _debt_isin(item.isin)]
 
     async def _cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
         async with self._cvm_document_lock:
@@ -945,6 +945,22 @@ def _latest_cvm_documents(
     return sorted(latest.values(), key=lambda row: row.get("Data_Entrega", ""), reverse=True)[
         : max(limit, 0)
     ]
+
+
+_DEBT_ISIN = re.compile(r"^BR[A-Z0-9]{4}DB")
+
+
+def _debt_isin(isin: str | None) -> bool:
+    """Whether an ISIN identifies a debenture rather than a listed share.
+
+    One CVM notice often covers every security an issuer pays on, so a single
+    document lists the shares and the debentures side by side. Their amounts are
+    not comparable: a debenture pays on a face value in the hundreds while a
+    share pays cents. Rows are attributed by the instrument's own ISIN, but when
+    that is unknown the debenture rows would otherwise be read as the share's
+    income and overstate it by orders of magnitude.
+    """
+    return bool(isin and _DEBT_ISIN.match(isin.upper()))
 
 
 def _cvm_income_adjustment(row: dict[str, str]) -> bool:

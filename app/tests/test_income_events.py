@@ -32,6 +32,7 @@ from app.income.sources import (
     IncomeSourceResult,
     OfficialCompanyIncomeSource,
     StatusInvestIncomeSource,
+    _debt_isin,
     _fundos_net_candidates,
     _latest_cvm_documents,
     _read_cvm_zip,
@@ -143,6 +144,65 @@ def test_b3_parser_rejects_unknown_payment_date_sentinel() -> None:
     )
 
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_skips_debenture_rows_without_a_known_isin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;"
+        "Assunto;Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;ENGIE;9512;2026-07-10;Relatório Proventos;;;Provento;"
+        "2026-07-10;AP;;1;https://cvm.test/provento.pdf\n"
+    ).encode("iso-8859-1")
+    archive = _zip(csv_payload)
+    b3 = [{"codeCVM": "9512", "cashDividends": []}]
+    # One notice pays the shares and the debentures of the same issuer.
+    report = (
+        "Provento\n"
+        "Ultimo dia de negociação com Direitos 14/07/2026\n"
+        "Código ISIN Valor Bruto (R$/Unidade) Data Pagamento\n"
+        "BREGIEACNOR9 0,48828976 Anual 2026 15/07/2026\n"
+        "BREGIEDBS043 333,30000000 Anual 2026 15/07/2026\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cvm.test":
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: report)
+    source = OfficialCompanyIncomeSource(
+        Settings(
+            b3_listed_companies_base_url="https://b3.test",
+            cvm_open_data_base_url="https://dados.test",
+        ),
+        httpx.MockTransport(handler),
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="EGIE3")],
+        date(2026, 7, 20),
+    )
+
+    assert [item.unit_price for item in result.observations] == [Decimal("0.48828976")]
+
+
+def test_issuer_debentures_are_not_read_as_share_income() -> None:
+    # A CVM notice covers every security the issuer pays on, so the shares and
+    # the debentures appear side by side. A debenture pays on a face value in
+    # the hundreds while the share pays cents, and only the ISIN separates them.
+    assert _debt_isin("BRVALEDBS077") is True
+    assert _debt_isin("BREGIEDBS043") is True
+    assert _debt_isin("BRVALEACNOR0") is False
+    assert _debt_isin("BREGIEACNOR9") is False
+    assert _debt_isin("BRHGLGCTF004") is False
+    assert _debt_isin(None) is False
 
 
 def test_fundos_net_parser_reads_income_and_amortization() -> None:
