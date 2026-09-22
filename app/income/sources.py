@@ -19,6 +19,7 @@ from pypdf import PdfReader
 
 from app.config import Settings
 from app.core.archive_safety import open_validated_zip, read_bounded_body
+from app.core.errors import APIError
 from app.income.parsers import (
     parse_b3_income_events,
     parse_cvm_income_adjustment_text,
@@ -26,7 +27,7 @@ from app.income.parsers import (
     parse_fundos_net_xml,
     parse_status_invest_income_events,
 )
-from app.models import Dividend
+from app.models import Dividend, InstrumentMetadata
 from app.models.income_events import (
     IncomeEventObservation,
     IncomeInstrumentRequest,
@@ -34,6 +35,7 @@ from app.models.income_events import (
 )
 from app.parsers.status_invest import parse_status_invest_cnpj
 from app.services.assets import AssetService
+from app.services.opportunity import B3InstrumentProvider
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,12 @@ class IncomeSource(Protocol):
         instruments: Sequence[IncomeInstrumentRequest],
         as_of: date,
     ) -> IncomeSourceResult: ...
+
+
+class InstrumentIdentityProvider(Protocol):
+    """Authoritative ticker-to-instrument identity lookup."""
+
+    async def get(self, ticker: str) -> InstrumentMetadata | None: ...
 
 
 def _cleanup_shared_task[Key, Value](
@@ -255,9 +263,12 @@ class OfficialCompanyIncomeSource:
         self,
         settings: Settings,
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        identity_provider: InstrumentIdentityProvider | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport
+        self._identity_provider = identity_provider or B3InstrumentProvider(settings, transport)
         self._cvm_index: dict[int, tuple[float, list[dict[str, str]]]] = {}
         self._cvm_lock = asyncio.Lock()
         self._cvm_documents: dict[str, tuple[float, str]] = {}
@@ -271,6 +282,9 @@ class OfficialCompanyIncomeSource:
         self._b3_payloads: dict[str, tuple[float, Any]] = {}
         self._b3_tasks: dict[str, asyncio.Task[Any]] = {}
         self._b3_lock = asyncio.Lock()
+        self._identity_tasks: dict[str, asyncio.Task[InstrumentMetadata | None]] = {}
+        self._identity_lock = asyncio.Lock()
+        self._identity_semaphore = asyncio.Semaphore(max(settings.upstream_concurrency, 1))
 
     async def collect(
         self,
@@ -286,6 +300,7 @@ class OfficialCompanyIncomeSource:
             finally:
                 await _drain_shared_tasks(self._cvm_document_tasks, self._cvm_document_lock)
                 await _drain_shared_tasks(self._b3_tasks, self._b3_lock)
+                await _drain_shared_tasks(self._identity_tasks, self._identity_lock)
         return _instrument_results(self.name, instruments, results)
 
     def _client(self) -> httpx.AsyncClient:
@@ -314,7 +329,12 @@ class OfficialCompanyIncomeSource:
         )
         requested_isin = instrument.isin or inferred_isin
         if requested_isin is None and _distinct_b3_isins(b3_payload) > 1:
-            raise ValueError(f"B3 returned multiple ISINs for {instrument.ticker}")
+            requested_isin = await self._resolve_ambiguous_isin(instrument.ticker, b3_payload)
+        effective_instrument = (
+            instrument
+            if requested_isin == instrument.isin
+            else instrument.model_copy(update={"isin": requested_isin})
+        )
         b3_events, cvm_code = parse_b3_income_events(
             b3_payload,
             ticker=instrument.ticker,
@@ -322,8 +342,54 @@ class OfficialCompanyIncomeSource:
         )
         if cvm_code is None:
             return b3_events
-        cvm_events = await self._cvm_events(client, instrument, cvm_code, as_of)
+        cvm_events = await self._cvm_events(client, effective_instrument, cvm_code, as_of)
         return [*b3_events, *cvm_events]
+
+    async def _resolve_ambiguous_isin(self, ticker: str, payload: Any) -> str:
+        try:
+            metadata = await self._instrument_identity(ticker)
+        except APIError as exc:
+            raise ValueError(
+                f"B3 returned multiple ISINs for {ticker}; "
+                f"authoritative identity lookup failed ({exc.code})"
+            ) from exc
+        if metadata is not None and metadata.ticker.upper() != ticker.upper():
+            raise ValueError(f"B3 identity for {ticker} returned metadata for {metadata.ticker}")
+        resolved_isin = (metadata.isin if metadata is not None else None) or ""
+        resolved_isin = resolved_isin.strip().upper()
+        if not resolved_isin:
+            raise ValueError(
+                f"B3 returned multiple ISINs for {ticker}; "
+                "authoritative identity did not return an ISIN"
+            )
+        if _debt_isin(resolved_isin):
+            raise ValueError(f"B3 identity for {ticker} resolved to debenture ISIN {resolved_isin}")
+        if resolved_isin not in _b3_isins(payload):
+            raise ValueError(
+                f"B3 identity for {ticker} resolved to ISIN {resolved_isin}, "
+                "which is absent from the issuer income payload"
+            )
+        return resolved_isin
+
+    async def _instrument_identity(self, ticker: str) -> InstrumentMetadata | None:
+        key = ticker.upper()
+        async with self._identity_lock:
+            task = self._identity_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(self._fetch_instrument_identity(key))
+                self._identity_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._identity_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_instrument_identity(self, ticker: str) -> InstrumentMetadata | None:
+        async with self._identity_semaphore:
+            return await self._identity_provider.get(ticker)
 
     async def _b3_payload(self, client: httpx.AsyncClient, ticker: str) -> Any:
         issuer = _issuer_code(ticker)

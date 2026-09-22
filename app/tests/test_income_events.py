@@ -49,6 +49,8 @@ from app.models import (
     IncomeFieldConfidence,
     IncomeInstrumentRequest,
     IncomeSourceCoverage,
+    InstrumentMetadata,
+    InstrumentType,
 )
 
 
@@ -77,6 +79,36 @@ def _observation(
         authority=authority,
         payload_hash=f"hash-{source}-{version}",
     )
+
+
+class _IdentityProvider:
+    def __init__(
+        self,
+        result: InstrumentMetadata | None = None,
+        *,
+        error: Exception | None = None,
+        delay: float = 0,
+    ) -> None:
+        self.result = result
+        self.error = error
+        self.delay = delay
+        self.calls = 0
+
+    async def get(self, _ticker: str) -> InstrumentMetadata | None:
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def _identity(
+    ticker: str,
+    isin: str | None,
+    instrument_type: InstrumentType = InstrumentType.stock,
+) -> InstrumentMetadata:
+    return InstrumentMetadata(ticker=ticker, isin=isin, instrument_type=instrument_type)
 
 
 def test_b3_parser_filters_isin_deduplicates_and_returns_cvm_code() -> None:
@@ -1324,6 +1356,268 @@ async def test_official_company_source_combines_b3_and_cvm(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ticker", "selected_isin", "other_isin"),
+    [
+        ("BBAS3", "BRBBASACNOR3", "BRBBASA04OR8"),
+        ("PETR4", "BRPETRACNPR6", "BRPETRACNOR9"),
+    ],
+)
+async def test_official_company_source_resolves_multiple_isins_with_b3_identity(
+    ticker: str,
+    selected_isin: str,
+    other_isin: str,
+) -> None:
+    rows = [
+        {
+            "isinCode": selected_isin,
+            "label": "RENDIMENTO",
+            "lastDatePrior": "22/04/2026",
+            "paymentDate": "20/05/2026",
+            "rate": "0,02",
+        },
+        {
+            "isinCode": other_isin,
+            "label": "RENDIMENTO",
+            "lastDatePrior": "22/04/2026",
+            "paymentDate": "20/05/2026",
+            "rate": "0,03",
+        },
+    ]
+    identity = _IdentityProvider(_identity(ticker, selected_isin))
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])),
+        identity_provider=identity,
+    )
+
+    result = await source.collect([IncomeInstrumentRequest(ticker=ticker)], date(2026, 8, 27))
+
+    assert [event.isin for event in result.observations] == [selected_isin]
+    assert identity.calls == 1
+    assert result.coverage[0].complete is True
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_fails_closed_when_identity_is_not_authoritative() -> None:
+    rows = [
+        {
+            "isinCode": "BRBBASACNOR3",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,02",
+        },
+        {
+            "isinCode": "BRBBASA04OR8",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,03",
+        },
+    ]
+
+    for identity in (
+        _IdentityProvider(),
+        _IdentityProvider(_identity("BBAS3", "BRMISMATCH000")),
+        _IdentityProvider(_identity("PETR4", "BRBBASACNOR3")),
+        _IdentityProvider(_identity("BBAS3", "BRVALEDBS077")),
+        _IdentityProvider(error=RuntimeError("offline")),
+    ):
+        source = OfficialCompanyIncomeSource(
+            Settings(b3_listed_companies_base_url="https://b3.test"),
+            httpx.MockTransport(
+                lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])
+            ),
+            identity_provider=identity,
+        )
+
+        result = await source.collect(
+            [IncomeInstrumentRequest(ticker="BBAS3")],
+            date(2026, 8, 27),
+        )
+
+        assert result.observations == []
+        assert result.coverage[0].complete is False
+        assert result.coverage[0].detail is not None
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_applies_resolved_isin_to_cvm_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;Assunto;"
+        "Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;BB;1023;2026-08-19;Relatório Proventos;;;;2026-08-19;AP;;2;https://cvm.test/report.pdf\n"
+    ).encode("iso-8859-1")
+    report = (
+        "Ultimo dia de negociação com Direitos\n14/08/2026\n01/09/2026\n"
+        "Código ISIN\nBRBBASACNOR3 0,5 11/09/2026\n"
+        "BRBBASA04OR8 0,7 11/09/2026"
+    )
+    b3 = [
+        {
+            "codeCVM": "1023",
+            "cashDividends": [
+                {
+                    "isinCode": "BRBBASACNOR3",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,02",
+                },
+                {
+                    "isinCode": "BRBBASA04OR8",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,03",
+                },
+            ],
+        }
+    ]
+    archive = _zip(csv_payload)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cvm.test":
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: report)
+    identity = _IdentityProvider(_identity("BBAS3", "BRBBASACNOR3"))
+    source = OfficialCompanyIncomeSource(
+        Settings(
+            b3_listed_companies_base_url="https://b3.test",
+            cvm_open_data_base_url="https://dados.test",
+        ),
+        httpx.MockTransport(handler),
+        identity_provider=identity,
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3")],
+        date(2026, 8, 27),
+    )
+
+    assert identity.calls == 1
+    assert [event.isin for event in result.observations] == [
+        "BRBBASACNOR3",
+        "BRBBASACNOR3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_does_not_resolve_known_isins() -> None:
+    identity = _IdentityProvider(_identity("BBAS3", "BRBBASACNOR3"))
+    cases = (
+        (
+            "BBAS3",
+            [
+                {
+                    "isinCode": "BRBBASACNOR3",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,02",
+                },
+                {
+                    "isinCode": "BRBBASA04OR8",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,03",
+                },
+            ],
+            IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3"),
+        ),
+        (
+            "WEGE3",
+            [
+                {
+                    "isinCode": "BRWEGEACNOR0",
+                    "label": "DIVIDENDO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,02",
+                }
+            ],
+            IncomeInstrumentRequest(ticker="WEGE3"),
+        ),
+        (
+            "SNAG11",
+            [
+                {
+                    "assetIssued": "BRSNAGCTF000",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "31/07/2026",
+                    "paymentDate": "24/08/2026",
+                    "rate": "0,12",
+                },
+                {
+                    "assetIssued": "BRSNAGR12M14",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "31/07/2026",
+                    "paymentDate": "24/08/2026",
+                    "rate": "0,07",
+                },
+            ],
+            IncomeInstrumentRequest(ticker="SNAG11"),
+        ),
+    )
+    for _ticker, rows, instrument in cases:
+        source = OfficialCompanyIncomeSource(
+            Settings(b3_listed_companies_base_url="https://b3.test"),
+            httpx.MockTransport(
+                lambda _request, rows=rows: httpx.Response(200, json=[{"cashDividends": rows}])
+            ),
+            identity_provider=identity,
+        )
+        await source.collect([instrument], date(2026, 8, 27))
+        assert identity.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_singleflights_identity_lookups() -> None:
+    rows = [
+        {
+            "isinCode": "BRBBASACNOR3",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,02",
+        },
+        {
+            "isinCode": "BRBBASA04OR8",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,03",
+        },
+    ]
+    identity = _IdentityProvider(_identity("BBAS3", "BRBBASACNOR3"), delay=0.01)
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])),
+        identity_provider=identity,
+    )
+
+    await asyncio.gather(
+        *(
+            source.collect([IncomeInstrumentRequest(ticker="BBAS3")], date(2026, 8, 27))
+            for _ in range(3)
+        )
+    )
+
+    assert identity.calls == 1
+    assert source._identity_tasks == {}
+
+
+@pytest.mark.asyncio
 async def test_official_cvm_document_singleflight_survives_cancelled_waiter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1510,7 +1804,10 @@ async def test_official_company_source_requires_isin_for_multiple_share_classes(
 
     assert ambiguous.observations == []
     assert ambiguous.coverage[0].complete is False
-    assert ambiguous.coverage[0].detail == "B3 returned multiple ISINs for TAEE11"
+    assert ambiguous.coverage[0].detail is not None
+    assert ambiguous.coverage[0].detail.startswith(
+        "B3 returned multiple ISINs for TAEE11; authoritative identity lookup failed ("
+    )
     assert len(identified.observations) == 1
     assert identified.observations[0].isin == "BRTAEECDAM10"
     assert identified.observations[0].unit_price == Decimal("0.55899814398")
@@ -1580,7 +1877,10 @@ async def test_official_company_source_keeps_mixed_fund_isins_ambiguous() -> Non
 
     assert result.observations == []
     assert result.coverage[0].complete is False
-    assert result.coverage[0].detail == "B3 returned multiple ISINs for SNAG11"
+    assert result.coverage[0].detail is not None
+    assert result.coverage[0].detail.startswith(
+        "B3 returned multiple ISINs for SNAG11; authoritative identity lookup failed ("
+    )
 
 
 @pytest.mark.asyncio
