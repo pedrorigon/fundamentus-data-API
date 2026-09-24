@@ -39,6 +39,7 @@ from app.services.bcb_quality import (
     BcbMacroProvider,
     MacroQualitySnapshot,
 )
+from app.services.fund_units import normalize_fund_units
 from app.services.fundamentals import FundamentalsService
 from app.services.market import InstrumentDataService
 from app.services.opportunity import OpportunityService
@@ -830,43 +831,40 @@ def _fund_facts(
         opportunity.fund_distributions if opportunity is not None else [],
         key=lambda item: item.ex_date,
     )
+    units = normalize_fund_units(
+        request.ticker,
+        (
+            opportunity.fund_reports.cnpj
+            if opportunity is not None and opportunity.fund_reports
+            else None
+        ),
+        reports,
+        distributions,
+    )
+    reports = units.reports
+    distributions = units.distributions
     distribution_evidence = (
         opportunity.fund_distribution_evidence if opportunity is not None else []
     )
     unresolved_distribution_dates = _recent_unresolved_distribution_dates(distribution_evidence)
     report_source = _CVM_SOURCE
     distribution_provenance = _distribution_provenance(distributions, distribution_evidence)
-    if unresolved_distribution_dates:
-        distribution_history = _missing_fact(
-            "distribution_history_months",
-            "count",
-            _DISTRIBUTION_HISTORY_CONFLICT_REASON,
-        )
-        distribution_stability = _missing_fact(
-            "distribution_stability",
-            "ratio",
-            _DISTRIBUTION_HISTORY_CONFLICT_REASON,
-        )
-        distribution_frequency = _missing_fact(
-            "positive_distribution_frequency",
-            "ratio",
-            _DISTRIBUTION_HISTORY_CONFLICT_REASON,
-        )
-        distribution_growth = _missing_fact(
-            "distribution_growth",
-            "ratio",
-            _DISTRIBUTION_HISTORY_CONFLICT_REASON,
-        )
-        distribution_cuts = _missing_fact(
-            "distribution_cut_frequency",
-            "ratio",
-            _DISTRIBUTION_HISTORY_CONFLICT_REASON,
-        )
-        distribution_consistency = _missing_fact(
-            "distribution_report_consistency_error",
-            "ratio",
-            _DISTRIBUTION_HISTORY_CONFLICT_REASON,
-        )
+    missing_distribution_reason = (
+        _DISTRIBUTION_HISTORY_CONFLICT_REASON
+        if unresolved_distribution_dates
+        else "Distribution quota basis is unresolved"
+        if units.uncertain_distributions
+        else None
+    )
+    if missing_distribution_reason is not None:
+        (
+            distribution_history,
+            distribution_stability,
+            distribution_frequency,
+            distribution_growth,
+            distribution_cuts,
+            distribution_consistency,
+        ) = _missing_distribution_facts(missing_distribution_reason)
     else:
         distribution_history = _value_fact(
             "distribution_history_months",
@@ -899,12 +897,37 @@ def _fund_facts(
             distributions,
             provenance=distribution_provenance,
         )
+        if units.uncertain_reports:
+            distribution_consistency = _missing_fact(
+                "distribution_report_consistency_error",
+                "ratio",
+                "Report quota basis is unresolved",
+            )
     latest = reports[-1] if reports else None
     profile = (
         request.profile
         if request.profile and request.profile != "indeterminado"
         else _fund_profile(latest, opportunity.instrument if opportunity is not None else None)
     )
+    nav_growth = _nav_growth(reports)
+    nav_volatility = _nav_return_volatility(reports)
+    nav_frequency = _positive_nav_return_frequency(reports)
+    nav_drawdown = _nav_max_drawdown(reports)
+    issuance_preservation = _issuance_nav_preservation(reports)
+    if units.uncertain_reports:
+        nav_growth = _missing_fact("nav_growth", "ratio", "Report quota basis is unresolved")
+        nav_volatility = _missing_fact(
+            "nav_return_volatility", "ratio", "Report quota basis is unresolved"
+        )
+        nav_frequency = _missing_fact(
+            "positive_nav_return_frequency", "ratio", "Report quota basis is unresolved"
+        )
+        nav_drawdown = _missing_fact(
+            "nav_max_drawdown", "ratio", "Report quota basis is unresolved"
+        )
+        issuance_preservation = _missing_fact(
+            "issuance_nav_preservation", "ratio", "Report quota basis is unresolved"
+        )
     facts = [
         _value_fact(
             "reporting_history_months",
@@ -920,10 +943,10 @@ def _fund_facts(
         distribution_cuts,
         _reporting_regularity(reports),
         _report_completeness(reports),
-        _nav_growth(reports),
-        _nav_return_volatility(reports),
-        _positive_nav_return_frequency(reports),
-        _nav_max_drawdown(reports),
+        nav_growth,
+        nav_volatility,
+        nav_frequency,
+        nav_drawdown,
         distribution_consistency,
         _value_fact(
             "net_assets",
@@ -985,7 +1008,7 @@ def _fund_facts(
             latest.total_assets if latest else None,
             latest.as_of if latest else None,
         ),
-        _issuance_nav_preservation(reports),
+        issuance_preservation,
         _shareholder_growth(reports),
         _nav_total_consistency(latest),
     ]
@@ -1002,11 +1025,13 @@ def _fund_facts(
             f"{_DISTRIBUTION_HISTORY_CONFLICT_REASON}; "
             "distribution-derived history facts were withheld",
         )
+    warnings.extend(units.warnings)
     has_distribution_history = bool(distributions or distribution_evidence)
     market_metric = (
         opportunity.metrics.average_daily_traded_value if opportunity is not None else None
     )
     sources = set(distribution_provenance.observed_sources)
+    sources.update(units.sources)
     if reports:
         sources.add(report_source)
     if market_metric is not None and market_metric.value is not None:
@@ -1022,6 +1047,20 @@ def _fund_facts(
         unavailable_reason=None
         if reports or has_distribution_history
         else "No public fund history was resolved",
+    )
+
+
+def _missing_distribution_facts(reason: str) -> tuple[QualityFact, ...]:
+    return tuple(
+        _missing_fact(key, unit, reason)
+        for key, unit in (
+            ("distribution_history_months", "count"),
+            ("distribution_stability", "ratio"),
+            ("positive_distribution_frequency", "ratio"),
+            ("distribution_growth", "ratio"),
+            ("distribution_cut_frequency", "ratio"),
+            ("distribution_report_consistency_error", "ratio"),
+        )
     )
 
 

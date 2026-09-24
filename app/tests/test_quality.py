@@ -138,12 +138,13 @@ def opportunity(
     reports: list[FundMonthlyReport] | None = None,
     distributions: list[FundDistribution] | None = None,
     distribution_evidence: list[FundDistributionEvidence] | None = None,
+    cnpj: str = "123",
 ) -> OpportunityResponse:
     return OpportunityResponse(
         ticker=ticker,
         instrument=instrument,
         metrics=opportunity_metrics(),
-        fund_reports=FundReportSeries(cnpj="123", reports=reports or []),
+        fund_reports=FundReportSeries(cnpj=cnpj, reports=reports or []),
         fund_distributions=distributions or [],
         fund_distribution_evidence=distribution_evidence or [],
         refreshed_at=NOW,
@@ -1252,6 +1253,110 @@ async def test_resolves_fund_reporting_and_distribution_stability() -> None:
     assert facts["reporting_history_months"] == Decimal("6")
     assert facts["distribution_stability"] == Decimal("0")
     assert facts["positive_distribution_frequency"] == Decimal("1")
+
+
+async def test_fund_quality_facts_use_confirmed_quota_basis() -> None:
+    instrument = InstrumentMetadata(ticker="ALZR11", instrument_type=InstrumentType.fii)
+    months = [(2024 + (month + 7) // 12, (month + 7) % 12 + 1) for month in range(18)]
+    reports = [
+        FundMonthlyReport(
+            as_of=date(year, month, 1),
+            nav_per_share=Decimal("100") if index < 8 else Decimal("10"),
+            issued_shares=Decimal("1000000") if index < 8 else Decimal("10000000"),
+        )
+        for index, (year, month) in enumerate(months)
+    ]
+    distributions = [
+        FundDistribution(
+            ex_date=date(year, month, 15),
+            value=Decimal("1") if index < 9 else Decimal("0.1"),
+            source="cvm",
+        )
+        for index, (year, month) in enumerate(months)
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ALZR11": instrument_data("ALZR11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "ALZR11": opportunity(
+                    "ALZR11",
+                    instrument,
+                    reports=reports,
+                    distributions=distributions,
+                    cnpj="28.737.771/0001-85",
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    asset = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[
+                    QualityAssetRequest(ticker="ALZR11", kind=QualityAssetKind.real_estate_fund)
+                ]
+            )
+        )
+    ).assets[0]
+
+    facts = {fact.key: fact for fact in asset.facts}
+    assert facts["nav_growth"].value == Decimal("0")
+    assert facts["nav_max_drawdown"].value == Decimal("0")
+    assert facts["distribution_growth"].value == Decimal("0")
+    assert facts["distribution_cut_frequency"].value == Decimal("0")
+    assert asset.warnings[0].startswith("Quota units adjusted")
+
+
+async def test_unverified_quota_jump_withholds_score_affecting_facts() -> None:
+    instrument = InstrumentMetadata(ticker="FUND11", instrument_type=InstrumentType.fii)
+    reports = [
+        FundMonthlyReport(
+            as_of=date(2024 + index // 12, index % 12 + 1, 1),
+            nav_per_share=Decimal("100") if index < 12 else Decimal("10"),
+            issued_shares=Decimal("1000000") if index < 12 else Decimal("10000000"),
+        )
+        for index in range(24)
+    ]
+    distributions = [
+        FundDistribution(
+            ex_date=date(2024 + index // 12, index % 12 + 1, 15),
+            value=Decimal("1") if index < 12 else Decimal("0.1"),
+            source="cvm",
+        )
+        for index in range(24)
+    ]
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"FUND11": instrument_data("FUND11", instrument)}),  # type: ignore[arg-type]
+        OpportunityStub(
+            {
+                "FUND11": opportunity(
+                    "FUND11", instrument, reports=reports, distributions=distributions
+                )
+            }
+        ),  # type: ignore[arg-type]
+    )
+
+    asset = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[
+                    QualityAssetRequest(ticker="FUND11", kind=QualityAssetKind.real_estate_fund)
+                ]
+            )
+        )
+    ).assets[0]
+
+    facts = {fact.key: fact for fact in asset.facts}
+    for key in (
+        "nav_growth",
+        "nav_max_drawdown",
+        "distribution_growth",
+        "distribution_cut_frequency",
+    ):
+        assert facts[key].value is None
+    assert "unverified discontinuity" in asset.warnings[0]
 
 
 async def test_fund_with_short_history_explains_missing_stability() -> None:
