@@ -1046,6 +1046,51 @@ async def test_resolves_etf_cost_scale_and_diversification_facts() -> None:
     assert facts["fund_age_years"] is not None
 
 
+async def test_domestic_crypto_etf_preserves_official_cost_and_assets_dates() -> None:
+    instrument = InstrumentMetadata(
+        ticker="ABTC11",
+        instrument_type=InstrumentType.etf,
+        isin="BRABTCCTF002",
+    )
+    source = "https://www.btgpactual.com/asset-management/etf/ABTC11"
+    profile = FundProfile(
+        net_assets=Decimal("23141900.56"),
+        net_assets_date=date(2026, 9, 23),
+        net_assets_source=source,
+        net_expense_ratio=Decimal("0.0039"),
+        inception_date=date(2026, 7, 14),
+        description="TEVA BITCOIN FEAR ARBITRAGE",
+        source=source,
+    )
+    data = instrument_data("ABTC11", instrument, fund_profile=profile).model_copy(
+        update={"refreshed_at": datetime(2026, 9, 24, tzinfo=UTC)}
+    )
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ABTC11": data}),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    asset = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="ABTC11", kind=QualityAssetKind.etf)]
+            )
+        )
+    ).assets[0]
+    facts = {fact.key: fact for fact in asset.facts}
+
+    assert asset.profile == "crypto"
+    assert asset.canonical_id == "BRABTCCTF002"
+    assert asset.sources == [source]
+    assert facts["expense_ratio"].value == Decimal("0.0039")
+    assert facts["expense_ratio"].as_of == date(2026, 9, 24)
+    assert facts["net_assets"].value == Decimal("23141900.56")
+    assert facts["net_assets"].as_of == date(2026, 9, 23)
+    assert facts["net_assets"].source == source
+    assert facts["holdings_count"].value is None
+
+
 async def test_assessment_can_reuse_opportunity_without_a_second_provider_call() -> None:
     instrument = InstrumentMetadata(ticker="TEST3", instrument_type=InstrumentType.stock)
     opportunity_provider = OpportunityStub({"TEST3": opportunity("TEST3", instrument)})

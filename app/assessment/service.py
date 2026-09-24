@@ -40,9 +40,9 @@ class InvalidAssessmentPeriodError(APIError):
 
 
 T = TypeVar("T")
-# Version 6 invalidates snapshots built before verified exchange issuer and
-# traded-fund identities became part of public evidence.
-ASSESSMENT_EVIDENCE_VERSION = "v6"
+# Version 7 invalidates snapshots built before documented domestic ETF costs
+# and dated fund assets became part of public quality evidence.
+ASSESSMENT_EVIDENCE_VERSION = "v7"
 _COMPONENT_ERRORS = (
     APIError,
     ArithmeticError,

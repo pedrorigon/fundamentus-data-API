@@ -140,6 +140,8 @@ class FundHolding(APIModel):
 
 class FundProfile(APIModel):
     net_assets: Decimal | None = None
+    net_assets_date: date | None = None
+    net_assets_source: str | None = None
     net_expense_ratio: Decimal | None = None
     portfolio_turnover: Decimal | None = None
     dividend_yield: Decimal | None = None

@@ -22,6 +22,7 @@ from app.models import (
     InternationalFundamentals,
     MarketQuote,
 )
+from app.scrapers.official_etf_profile import OfficialEtfProfileProvider
 from app.scrapers.sec_companyfacts import SEC_TICKER_DIRECTORY, SecCompanyFactsProvider
 from app.services.bounded_cache import BoundedMap, BoundedTTLCache
 from app.services.instrument_directory import (
@@ -163,6 +164,7 @@ class InstrumentDataService:
         brapi: BrapiInstrumentDataProvider | None = None,
         alpha: AlphaVantageInstrumentDataProvider | None = None,
         sec: SecCompanyFactsProvider | None = None,
+        etf_profiles: OfficialEtfProfileProvider | None = None,
         brapi_directory: BrapiInstrumentDirectoryProvider | None = None,
         directory_provider: BrapiInstrumentDirectoryProvider | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -172,6 +174,7 @@ class InstrumentDataService:
         self.brapi = brapi or BrapiInstrumentDataProvider(settings, transport)
         self.alpha = alpha or AlphaVantageInstrumentDataProvider(settings, transport)
         self.sec = sec or SecCompanyFactsProvider(settings, transport)
+        self.etf_profiles = etf_profiles or OfficialEtfProfileProvider(settings, transport)
         self.brapi_directory = (
             brapi_directory
             or directory_provider
@@ -403,11 +406,25 @@ class InstrumentDataService:
         InstrumentMetadata,
     ]:
         if instrument is not None:
+            if resolved_type is InstrumentType.etf:
+                (quote, fundamentals), fund_profile = await asyncio.gather(
+                    self._brapi_etf_data(ticker),
+                    self.etf_profiles.get(instrument),
+                )
+                return quote, fund_profile, fundamentals, instrument
             quote, fundamentals = await self.brapi.get(ticker)
             return quote, None, fundamentals, instrument
         fund_profile, fundamentals = await self.alpha.get(ticker, resolved_type)
         resolved_instrument = _international_instrument(ticker, resolved_type, fundamentals)
         return None, fund_profile, fundamentals, resolved_instrument
+
+    async def _brapi_etf_data(
+        self, ticker: str
+    ) -> tuple[MarketQuote | None, InternationalFundamentals | None]:
+        try:
+            return await self.brapi.get(ticker)
+        except (httpx.HTTPError, ValueError):
+            return None, None
 
 
 def _first_result_data(payload: Any) -> dict[str, Any] | None:

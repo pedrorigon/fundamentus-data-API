@@ -761,8 +761,8 @@ def _etf_facts(
             "net_assets",
             profile.net_assets,
             "currency",
-            reference,
-            profile.source,
+            profile.net_assets_date or reference,
+            profile.net_assets_source or profile.source,
         ),
         _value_fact(
             "fund_age_years",
@@ -813,7 +813,9 @@ def _etf_facts(
         canonical_id=data.instrument.isin if data.instrument else None,
         profile=_etf_profile(profile.description, profile.asset_types, profile.sectors),
         facts=facts,
-        sources=[profile.source],
+        sources=sorted(
+            source for source in {profile.source, profile.net_assets_source} if source is not None
+        ),
     )
 
 
