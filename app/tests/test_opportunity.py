@@ -45,6 +45,7 @@ from app.services.opportunity import (
     _public_fund_distribution_evidence,
     _public_fund_distributions,
     _reconcile_fund_distributions,
+    _verified_fund_cnpj,
     parse_status_invest_profile,
     parse_status_invest_snapshot,
 )
@@ -519,6 +520,87 @@ async def test_fund_opportunity_prefers_official_nav_and_exposes_income_horizons
         reverse=True,
     )
     assert all(item.value is not None for item in result.fund_distribution_evidence)
+
+
+@pytest.mark.parametrize(
+    ("status_cnpj", "failure_key", "failure_code"),
+    [
+        (None, "status_invest", "PROVIDER_UNAVAILABLE"),
+        ("43.140.450/0001-92", "status_invest:fund_cnpj", "IDENTITY_CONFLICT"),
+    ],
+)
+async def test_juro11_uses_verified_traded_fund_cnpj(
+    status_cnpj: str | None, failure_key: str, failure_code: str
+) -> None:
+    class JuroB3Provider(FakeB3Provider):
+        async def get(self, ticker: str) -> InstrumentMetadata:
+            return InstrumentMetadata(
+                ticker=ticker,
+                name="SPARTA INFRA FIC FI INFRA RENDA FIXA CP",
+                instrument_type=InstrumentType.fi_infra,
+                isin="BRJUROCTF002",
+                source="b3",
+                confidence="high",
+            )
+
+    class JuroStatusProvider(FakeStatusProvider):
+        async def profile(
+            self, ticker: str, instrument_type: InstrumentType | None
+        ) -> StatusInvestProfile:
+            if status_cnpj is None:
+                raise ProviderUnavailableError(ticker=ticker)
+            return StatusInvestProfile(values={}, cnpj=status_cnpj)
+
+    class CapturedCvmProvider(FakeCvmProvider):
+        cnpj_requested: str | None = None
+
+        async def reports(
+            self,
+            instrument: InstrumentMetadata | None,
+            *,
+            cnpj: str | None = None,
+            today: date | None = None,
+        ) -> FundReportSeries:
+            self.cnpj_requested = cnpj
+            return await super().reports(instrument, cnpj=cnpj, today=today)
+
+    cvm = CapturedCvmProvider()
+    service = OpportunityService(
+        FakeAssetService(),  # type: ignore[arg-type]
+        Settings(),
+        b3_provider=JuroB3Provider(),  # type: ignore[arg-type]
+        status_provider=JuroStatusProvider(),  # type: ignore[arg-type]
+        cvm_provider=cvm,  # type: ignore[arg-type]
+    )
+
+    result = await service.opportunity("JURO11")
+
+    assert cvm.cnpj_requested == "42730834000100"
+    assert result.fund_reports is not None
+    assert result.fund_reports.cnpj == "42730834000100"
+    assert result.source_failures[failure_key] == failure_code
+
+
+@pytest.mark.parametrize(
+    ("isin", "source", "confidence"),
+    [
+        ("BRJUROCTF003", "b3", "high"),
+        ("BRJUROCTF002", "other", "high"),
+        ("BRJUROCTF002", "b3", "low"),
+    ],
+)
+def test_juro11_verified_cnpj_requires_exact_trusted_listing(
+    isin: str, source: str, confidence: str
+) -> None:
+    instrument = InstrumentMetadata(
+        ticker="JURO11",
+        instrument_type=InstrumentType.fi_infra,
+        isin=isin,
+        source=source,
+        confidence=confidence,
+    )
+
+    assert _verified_fund_cnpj(instrument) is None
 
 
 def test_fund_nav_consensus_drives_price_to_book_and_rejects_cvm_outlier() -> None:
@@ -1133,6 +1215,44 @@ async def test_b3_provider_distinguishes_absence_from_transport_failure() -> Non
     )
     assert await missing.get("TEST3") is None
     assert await missing.get("TEST3") is None
+
+
+async def test_verified_b3_listing_supplies_issuer_identity_when_bulletin_omits_it() -> None:
+    provider = B3InstrumentProvider(
+        Settings(),
+        httpx.MockTransport(lambda _request: pytest.fail("verified listing must not query BDI")),
+    )
+
+    instrument = await provider.get("B3SA3")
+
+    assert instrument is not None
+    assert instrument.isin == "BRB3SAACNOR6"
+    assert instrument.identifiers["cnpj"] == "09346601000125"
+    assert instrument.name == "B3 S.A. - BRASIL, BOLSA, BALCÃO"
+    assert instrument.source == "b3"
+    assert instrument.confidence == "verified"
+    assert provider.cached(["B3SA3"]) == [instrument]
+
+
+def test_verified_b3sa3_listing_selects_its_cvm_issuer() -> None:
+    from app.assessment.service import _trusted_b3_name
+    from app.services.company_matching import match_company
+    from app.services.opportunity import _VERIFIED_B3_LISTINGS
+
+    name = _trusted_b3_name("B3SA3", _VERIFIED_B3_LISTINGS["B3SA3"])
+    assert name is not None
+
+    match = match_company(
+        name,
+        {
+            "09346601000125": "B3 S.A. - BRASIL, BOLSA, BALCÃO",
+            "00000000000000": "BANCO DO BRASIL S.A.",
+        },
+    )
+
+    assert match is not None
+    assert match.cnpj == "09346601000125"
+    assert match.confidence == "high"
 
 
 @pytest.mark.asyncio

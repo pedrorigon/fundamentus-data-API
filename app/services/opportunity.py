@@ -57,6 +57,32 @@ SOURCE_STATUS_INVEST = "status_invest"
 SOURCE_B3 = "b3"
 SOURCE_CVM = "cvm"
 
+# The BDI equities bulletin intermittently omits the exchange's own share.
+# This exact listing is published by B3 with ticker, ISIN, issuer CNPJ and CVM
+# registration at the documented URL; no name-only or ticker-shape inference
+# is used to join its financial statements.
+# https://sistemaswebb3-listados.b3.com.br/listedCompaniesPage/main/21610/B3SA./overview?language=pt-br
+_VERIFIED_B3_LISTINGS = {
+    "B3SA3": InstrumentMetadata(
+        ticker="B3SA3",
+        name="B3 S.A. - BRASIL, BOLSA, BALCÃO",
+        instrument_type=InstrumentType.stock,
+        isin="BRB3SAACNOR6",
+        identifiers={"cnpj": "09346601000125", "cvm_code": "21610"},
+        currency="BRL",
+        exchange="BVMF",
+        country="BR",
+        source=SOURCE_B3,
+        confidence="verified",
+        reference_date=date(2026, 9, 24),
+    ),
+}
+
+# The manager identifies the traded JURO11 FIC by this CNPJ; it is distinct
+# from the master funds in its portfolio. B3's bulletin supplies the ISIN.
+# https://www.sparta.com.br/sparta-fi-infra/
+_VERIFIED_FUND_CNPJ = {("JURO11", "BRJUROCTF002"): "42730834000100"}
+
 # B3's public instrument files do not consistently carry an underlying symbol
 # for older BDR records.  These aliases are intentionally small and explicit;
 # an unknown BDR is left unresolved instead of guessing from its local code.
@@ -181,6 +207,14 @@ class B3InstrumentProvider:
         found, cached = self._cache.get(normalized, monotonic())
         if found:
             return cached
+        verified = _VERIFIED_B3_LISTINGS.get(normalized)
+        if verified is not None:
+            self._cache.set(
+                normalized,
+                monotonic() + self.settings.opportunity_cache_ttl_seconds,
+                verified,
+            )
+            return verified
         if not should_query_b3(normalized):
             # A foreign symbol can never appear in B3's bulletin, and the
             # session walk below would spend seven sequential requests proving
@@ -429,10 +463,14 @@ class OpportunityService:
             status_profile.values,
             self.settings.bazin_minimum_yield_percent,
         )
+        verified_cnpj = _verified_fund_cnpj(instrument)
+        status_cnpj = status_profile.cnpj
+        if verified_cnpj and status_cnpj and re.sub(r"\D", "", status_cnpj) != verified_cnpj:
+            source_failures[f"{SOURCE_STATUS_INVEST}:fund_cnpj"] = "IDENTITY_CONFLICT"
         try:
             report_series = await self.cvm.reports(
                 instrument,
-                cnpj=status_profile.cnpj,
+                cnpj=verified_cnpj or status_cnpj,
             )
         except APIError as error:
             report_series = CvmReportSeries()
@@ -473,6 +511,16 @@ def _normalized_ticker(ticker: str) -> str:
         return normalize_ticker(ticker)
     except ValueError as exc:
         raise InvalidTickerError(ticker=ticker) from exc
+
+
+def _verified_fund_cnpj(instrument: InstrumentMetadata | None) -> str | None:
+    if (
+        instrument is None
+        or instrument.source != SOURCE_B3
+        or instrument.confidence not in {"high", "verified", "authoritative"}
+    ):
+        return None
+    return _VERIFIED_FUND_CNPJ.get((instrument.ticker.upper(), (instrument.isin or "").upper()))
 
 
 def _is_valid_b3_payload(payload: object) -> bool:

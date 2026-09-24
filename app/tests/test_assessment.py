@@ -1594,7 +1594,7 @@ def test_assessment_private_state_helpers_cover_error_and_status_rules() -> None
         )
         is AssessmentRunStatus.completed
     )
-    assert assessment_key(request).startswith("assessment:v5:TEST3:stock")
+    assert assessment_key(request).startswith("assessment:v6:TEST3:stock")
 
     service = AssessmentSnapshotService(
         AssessmentStore(Path("/tmp/unused-assessment.sqlite3")),
