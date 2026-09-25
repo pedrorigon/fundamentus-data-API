@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 from time import monotonic
+from typing import TYPE_CHECKING
 
 import httpx
 from selectolax.parser import HTMLParser
@@ -30,6 +31,7 @@ from app.models import (
     AssetDetails,
     Dividend,
     FundDistribution,
+    FundMonthlyDistribution,
     FundMonthlyReport,
     FundReportSeries,
     InstrumentMetadata,
@@ -40,6 +42,7 @@ from app.models import (
     OpportunityResponse,
 )
 from app.models.assets import FundDistributionEvidence
+from app.models.income_events import CanonicalIncomeEvent, IncomeEventStatus
 from app.parsers.normalizers import clean_text, normalize_ticker, parse_br_decimal
 from app.parsers.status_invest import status_invest_cnpj
 from app.scrapers.cvm_fund_reports import (
@@ -48,14 +51,20 @@ from app.scrapers.cvm_fund_reports import (
 from app.scrapers.cvm_fund_reports import (
     FundReportSeries as CvmReportSeries,
 )
+from app.scrapers.sparta_fi_infra import SpartaDistributionProvider
 from app.services.assets import AssetService
 from app.services.bounded_cache import BoundedTTLCache
 from app.services.market_routing import should_query_b3
+
+if TYPE_CHECKING:
+    from app.income.store import IncomeEventStore
 
 SOURCE_FUNDAMENTUS = "fundamentus"
 SOURCE_STATUS_INVEST = "status_invest"
 SOURCE_B3 = "b3"
 SOURCE_CVM = "cvm"
+SOURCE_INCOME_STORE = "income_store"
+SOURCE_SPARTA_MANAGER = "sparta_manager"
 
 # The BDI equities bulletin intermittently omits the exchange's own share.
 # This exact listing is published by B3 with ticker, ISIN, issuer CNPJ and CVM
@@ -386,12 +395,16 @@ class OpportunityService:
         b3_provider: B3InstrumentProvider | None = None,
         status_provider: StatusInvestProvider | None = None,
         cvm_provider: CvmFundReportProvider | None = None,
+        income_store: IncomeEventStore | None = None,
+        sparta_provider: SpartaDistributionProvider | None = None,
     ) -> None:
         self.asset_service = asset_service
         self.settings = settings
         self.b3 = b3_provider or B3InstrumentProvider(settings)
         self.status = status_provider or StatusInvestProvider(settings)
         self.cvm = cvm_provider or CvmFundReportProvider(settings)
+        self.income_store = income_store
+        self.sparta = sparta_provider or SpartaDistributionProvider()
 
     async def instrument(self, ticker: str) -> InstrumentMetadata | None:
         return await self.b3.get(ticker)
@@ -400,8 +413,14 @@ class OpportunityService:
         """Resolve a batch from the bounded cache without delaying file imports."""
         return self.b3.cached(tickers)
 
-    async def opportunity(self, ticker: str) -> OpportunityResponse:
+    async def opportunity(
+        self, ticker: str, *, as_of: datetime | None = None
+    ) -> OpportunityResponse:
         normalized = _normalized_ticker(ticker)
+        reference_time = as_of or datetime.now(UTC)
+        if reference_time.tzinfo is None:
+            raise ValueError("Opportunity reference time must be timezone-aware")
+        today = reference_time.astimezone(UTC).date()
         source_failures: dict[str, str] = {}
         b3_task = asyncio.create_task(self.b3.get(normalized))
         asset_task = asyncio.create_task(self.asset_service.get_asset(normalized))
@@ -487,19 +506,53 @@ class OpportunityService:
                 }
             )
         metrics = _merge_official_fund_metrics(metrics, report_series)
+        income_events: list[CanonicalIncomeEvent] = []
+        if (
+            self.income_store is not None
+            and instrument is not None
+            and instrument.isin
+            and instrument.instrument_type
+            in {InstrumentType.fii, InstrumentType.fiagro, InstrumentType.fi_infra}
+        ):
+            try:
+                income_events = [
+                    event
+                    for event in await self.income_store.events([normalized], to_date=today)
+                    if event.updated_at <= reference_time
+                ]
+            except Exception:
+                # The income register enriches this endpoint. A storage outage
+                # remains explicit while the independent market sources work.
+                source_failures[SOURCE_INCOME_STORE] = "STORE_UNAVAILABLE"
+        authoritative = _verified_income_distributions(income_events, instrument)
+        monthly: tuple[FundMonthlyDistribution, ...] = ()
+        if verified_cnpj == _VERIFIED_FUND_CNPJ.get(("JURO11", "BRJUROCTF002")):
+            try:
+                monthly = await self.sparta.distributions(as_of=as_of)
+            except APIError as error:
+                source_failures[SOURCE_SPARTA_MANAGER] = error.code
+            if monthly and not _monthly_income_agrees_with_events(
+                monthly, income_events, instrument
+            ):
+                monthly = ()
+                source_failures[SOURCE_SPARTA_MANAGER] = "DATA_CONFLICT"
         reconciled_distributions = _reconcile_fund_distributions(
             dividends,
             status_profile.distributions,
+            authoritative,
         )
         distributions = _public_fund_distributions(reconciled_distributions)
         distribution_evidence = _public_fund_distribution_evidence(reconciled_distributions)
         metrics = _add_distribution_metrics(metrics, reconciled_distributions)
+        if monthly and all(item.payment_date <= today for item in monthly):
+            metrics = _add_monthly_distribution_metrics(metrics, monthly)
         return OpportunityResponse(
             ticker=normalized,
             instrument=instrument,
             metrics=metrics,
             fund_reports=_report_series(report_series),
             fund_distributions=list(distributions),
+            fund_monthly_distributions=list(monthly),
             fund_distribution_evidence=list(distribution_evidence),
             source_failures=source_failures,
             refreshed_at=datetime.now(UTC),
@@ -1254,14 +1307,16 @@ def _merge_fund_distributions(
 def _reconcile_fund_distributions(
     dividends: list[Dividend],
     status_distributions: tuple[FundDistribution, ...],
+    authoritative_distributions: tuple[FundDistribution, ...] = (),
 ) -> tuple[_ReconciledDistribution, ...]:
     """Return deterministic, date-keyed consensus results for fund events.
 
     A distribution date is one event.  Each independent source contributes at
     most its observed value for that event, and ``resolve_consensus`` decides
     whether those values can be projected.  We intentionally do not apply
-    source-order precedence: a conflicting newest event remains unresolved and
-    is never silently replaced by an older value.
+    source-order precedence for aggregators. Exact-ISIN, verified B3 events
+    are authoritative for the event amount; disagreeing aggregator values stay
+    in the rejected evidence instead of suppressing the exchange observation.
     """
 
     by_date: dict[date, list[SourceObservation]] = {}
@@ -1300,6 +1355,18 @@ def _reconcile_fund_distributions(
             )
         )
 
+    for distribution in authoritative_distributions:
+        by_date.setdefault(distribution.ex_date, []).append(
+            SourceObservation(
+                value=distribution.value,
+                source=SOURCE_B3,
+                as_of=distribution.ex_date,
+                unit="BRL",
+                source_lineage=(SOURCE_B3,),
+                independent_origin=SOURCE_B3,
+            )
+        )
+
     reconciled: list[_ReconciledDistribution] = []
     for event_date in sorted(by_date, reverse=True):
         observations = tuple(
@@ -1312,11 +1379,38 @@ def _reconcile_fund_distributions(
         # duplicate rows into one independent vote, excludes origins that
         # disagree with themselves, and still allows a majority of the other
         # independent origins to win.
-        consensus = resolve_consensus(
-            observations,
-            expected_unit="BRL",
-            valid_range=(Decimal("0"), Decimal("1E100")),
-        )
+        official = tuple(item for item in observations if item.source == SOURCE_B3)
+        if len(official) == 1:
+            chosen = official[0]
+            supporting = tuple(
+                item
+                for item in observations
+                if abs(item.value - chosen.value) <= Decimal("0.000001")
+            )
+            rejected = tuple(item for item in observations if item not in supporting)
+            origins = tuple(sorted({item.origin for item in supporting}))
+            consensus = ConsensusResult(
+                value=chosen.value,
+                as_of=event_date,
+                sources=tuple(sorted({item.source for item in supporting})),
+                independent_sources=origins,
+                source_lineage=tuple(
+                    sorted({line for item in supporting for line in item.lineage})
+                ),
+                status=(
+                    ConsensusStatus.consensus if len(origins) > 1 else ConsensusStatus.single_source
+                ),
+                reason="Verified B3 income event",
+                confidence=Decimal("1"),
+                observations=observations,
+                rejected_observations=rejected,
+            )
+        else:
+            consensus = resolve_consensus(
+                observations,
+                expected_unit="BRL",
+                valid_range=(Decimal("0"), Decimal("1E100")),
+            )
         reconciled.append(
             _ReconciledDistribution(
                 ex_date=event_date,
@@ -1324,6 +1418,108 @@ def _reconcile_fund_distributions(
             )
         )
     return tuple(reconciled)
+
+
+def _verified_income_distributions(
+    events: list[CanonicalIncomeEvent], instrument: InstrumentMetadata | None
+) -> tuple[FundDistribution, ...]:
+    if (
+        instrument is None
+        or instrument.source != SOURCE_B3
+        or instrument.confidence not in {"high", "verified", "authoritative"}
+        or not instrument.isin
+    ):
+        return ()
+    return tuple(
+        FundDistribution(ex_date=event.ex_date, value=event.unit_price, source=SOURCE_B3)
+        for event in events
+        if event.ticker == instrument.ticker
+        and event.isin == instrument.isin
+        and event.status is IncomeEventStatus.verified
+        and SOURCE_B3 in event.sources
+        and _fold(event.event_type) in {"RENDIMENTO", "DIVIDENDO"}
+        and event.unit_price.is_finite()
+        and event.unit_price >= 0
+    )
+
+
+def _monthly_income_agrees_with_events(
+    monthly: tuple[FundMonthlyDistribution, ...],
+    events: list[CanonicalIncomeEvent],
+    instrument: InstrumentMetadata | None,
+) -> bool:
+    # A manager's explicit zero does not create a B3 cash event. A positive
+    # event with the same payment date must nevertheless agree exactly.
+    by_payment: dict[date, Decimal] = {}
+    if instrument is None or not instrument.isin:
+        return True
+    for event in events:
+        if (
+            event.isin == instrument.isin
+            and event.status is IncomeEventStatus.verified
+            and SOURCE_B3 in event.sources
+            and _fold(event.event_type) in {"RENDIMENTO", "DIVIDENDO"}
+        ):
+            by_payment[event.payment_date] = (
+                by_payment.get(event.payment_date, Decimal("0")) + event.unit_price
+            )
+    for row in monthly:
+        observed = by_payment.get(row.payment_date)
+        if observed is not None and abs(observed - row.value) > Decimal("0.000001"):
+            return False
+    return True
+
+
+def _add_monthly_distribution_metrics(
+    metrics: OpportunityMetrics,
+    monthly: tuple[FundMonthlyDistribution, ...],
+) -> OpportunityMetrics:
+    """Use twelve explicit month values, so a zero month is not skipped."""
+    if len(monthly) != 12:
+        return metrics
+    annual = sum((item.value for item in monthly), Decimal("0"))
+    latest = monthly[-1]
+    source = [SOURCE_SPARTA_MANAGER]
+    updated: dict[str, OpportunityMetric] = {
+        "dividends_12m": _metric(
+            annual,
+            as_of=latest.report_as_of,
+            sources=source,
+            reason="Complete manager distribution history unavailable",
+            unit="BRL",
+        ),
+        "latest_distribution": _metric(
+            latest.value,
+            as_of=latest.report_as_of,
+            sources=source,
+            reason="Latest manager distribution unavailable",
+            unit="BRL",
+        ),
+        "median_distribution_3m": _metric(
+            _median(tuple(item.value for item in monthly[-3:])),
+            as_of=latest.report_as_of,
+            sources=source,
+            reason="Three manager distribution months unavailable",
+            unit="BRL",
+        ),
+        "median_distribution_6m": _metric(
+            _median(tuple(item.value for item in monthly[-6:])),
+            as_of=latest.report_as_of,
+            sources=source,
+            reason="Six manager distribution months unavailable",
+            unit="BRL",
+        ),
+    }
+    price = metrics.current_price
+    if price.value is not None and price.value.is_finite() and price.value > 0:
+        updated["dividend_yield_12m"] = _metric(
+            annual * Decimal("100") / price.value,
+            as_of=price.as_of or latest.report_as_of,
+            sources=sorted({SOURCE_SPARTA_MANAGER, *price.sources}),
+            reason="Manager income yield unavailable",
+            unit="percent",
+        )
+    return metrics.model_copy(update=updated)
 
 
 def _public_fund_distributions(

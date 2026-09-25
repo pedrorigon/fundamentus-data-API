@@ -17,6 +17,7 @@ from app.models import (
     FundamentalsSnapshot,
     FundDistribution,
     FundHolding,
+    FundMonthlyDistribution,
     FundMonthlyReport,
     FundProfile,
     FundReportSeries,
@@ -39,6 +40,7 @@ from app.models.quality import (
 from app.services.bcb_quality import BankQualitySnapshot, MacroQualitySnapshot
 from app.services.quality import (
     QualityFactsService,
+    _fund_facts,
     _has_domestic_stock_instrument,
     _market_scale_facts,
     _metric_fact,
@@ -137,6 +139,7 @@ def opportunity(
     *,
     reports: list[FundMonthlyReport] | None = None,
     distributions: list[FundDistribution] | None = None,
+    monthly_distributions: list[FundMonthlyDistribution] | None = None,
     distribution_evidence: list[FundDistributionEvidence] | None = None,
     cnpj: str = "123",
 ) -> OpportunityResponse:
@@ -146,6 +149,7 @@ def opportunity(
         metrics=opportunity_metrics(),
         fund_reports=FundReportSeries(cnpj=cnpj, reports=reports or []),
         fund_distributions=distributions or [],
+        fund_monthly_distributions=monthly_distributions or [],
         fund_distribution_evidence=distribution_evidence or [],
         refreshed_at=NOW,
     )
@@ -1298,6 +1302,71 @@ async def test_resolves_fund_reporting_and_distribution_stability() -> None:
     assert facts["reporting_history_months"] == Decimal("6")
     assert facts["distribution_stability"] == Decimal("0")
     assert facts["positive_distribution_frequency"] == Decimal("1")
+
+
+def test_manager_monthly_history_counts_zero_without_creating_cash_event() -> None:
+    months = [(2025 + (8 + index) // 12, (8 + index) % 12 + 1) for index in range(12)]
+    values = [
+        Decimal(value)
+        for value in ("1", "1", "1", "1", "1", "1", "1", ".75", ".5", "0", ".75", "1")
+    ]
+    monthly = [
+        FundMonthlyDistribution(
+            reference_month=date(year, month, 1),
+            payment_date=date(year + (month == 12), month % 12 + 1, 15),
+            value=value,
+            report_as_of=date(2026, 8, 31),
+            source="sparta_manager",
+        )
+        for (year, month), value in zip(months, values, strict=True)
+    ]
+    events = [
+        FundDistribution(ex_date=row.reference_month, value=row.value, source="b3")
+        for row in monthly
+        if row.value > 0
+    ]
+    instrument = InstrumentMetadata(
+        ticker="JURO11", instrument_type=InstrumentType.fi_infra, isin="BRJUROCTF002"
+    )
+    result = _fund_facts(
+        QualityAssetRequest(ticker="JURO11", kind=QualityAssetKind.real_estate_fund),
+        opportunity(
+            "JURO11",
+            instrument,
+            distributions=events,
+            monthly_distributions=monthly,
+            cnpj="42730834000100",
+        ),
+    )
+    facts = {fact.key: fact.value for fact in result.facts}
+
+    assert len(events) == 11
+    assert facts["distribution_history_months"] == Decimal("12")
+    assert facts["positive_distribution_frequency"] == Decimal(11) / Decimal(12)
+    assert facts["distribution_growth"] == Decimal("-1") / Decimal(3)
+    assert facts["distribution_cut_frequency"] == Decimal("0.3")
+
+    conflicting_aggregator = FundDistributionEvidence(
+        ex_date=date(2026, 7, 15),
+        status="conflict",
+        reason="Aggregators disagree",
+        sources=["fundamentus", "status_invest"],
+    )
+    with_conflict = _fund_facts(
+        QualityAssetRequest(ticker="JURO11", kind=QualityAssetKind.real_estate_fund),
+        opportunity(
+            "JURO11",
+            instrument,
+            distributions=events,
+            monthly_distributions=monthly,
+            distribution_evidence=[conflicting_aggregator],
+            cnpj="42730834000100",
+        ),
+    )
+    facts_with_conflict = {fact.key: fact.value for fact in with_conflict.facts}
+    assert facts_with_conflict["distribution_history_months"] == Decimal("12")
+    assert facts_with_conflict["positive_distribution_frequency"] == Decimal(11) / Decimal(12)
+    assert not any("withheld" in warning for warning in with_conflict.warnings)
 
 
 async def test_fund_quality_facts_use_confirmed_quota_basis() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import unicodedata
+from calendar import monthrange
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -16,6 +17,7 @@ from app.models import (
     FinancialPeriod,
     FundamentalsSnapshot,
     FundDistribution,
+    FundMonthlyDistribution,
     FundMonthlyReport,
     InstrumentDataResponse,
     InstrumentType,
@@ -79,6 +81,36 @@ class _DistributionProvenance:
     @property
     def independent_source_count(self) -> int:
         return len(self.independent_sources)
+
+
+@dataclass(frozen=True)
+class _DistributionPeriod:
+    as_of: date
+    value: Decimal
+    source: str
+
+
+def _distribution_periods(
+    distributions: list[FundDistribution],
+    monthly: list[FundMonthlyDistribution],
+) -> list[_DistributionPeriod]:
+    if monthly:
+        return [
+            _DistributionPeriod(
+                as_of=date(
+                    item.reference_month.year,
+                    item.reference_month.month,
+                    monthrange(item.reference_month.year, item.reference_month.month)[1],
+                ),
+                value=item.value,
+                source=item.source,
+            )
+            for item in sorted(monthly, key=lambda item: item.reference_month)
+        ]
+    return [
+        _DistributionPeriod(as_of=item.ex_date, value=item.value, source=item.source)
+        for item in distributions
+    ]
 
 
 class QualityFactsService:
@@ -845,18 +877,37 @@ def _fund_facts(
     )
     reports = units.reports
     distributions = units.distributions
+    monthly = opportunity.fund_monthly_distributions if opportunity is not None else []
+    periods = _distribution_periods(distributions, monthly)
     distribution_evidence = (
         opportunity.fund_distribution_evidence if opportunity is not None else []
     )
     unresolved_distribution_dates = _recent_unresolved_distribution_dates(distribution_evidence)
     report_source = _CVM_SOURCE
     distribution_provenance = _distribution_provenance(distributions, distribution_evidence)
+    if monthly:
+        monthly_sources = tuple(sorted({item.source for item in monthly}))
+        distribution_provenance = _DistributionProvenance(
+            sources=monthly_sources,
+            independent_sources=monthly_sources,
+            source_lineage=monthly_sources,
+            confidence=_CVM_CONFIDENCE,
+            observed_sources=tuple(
+                sorted({*distribution_provenance.observed_sources, *monthly_sources})
+            ),
+        )
+    # The manager series is complete and checked against exact-ISIN B3 cash
+    # events. An unrelated aggregator disagreement cannot invalidate it.
     missing_distribution_reason = (
-        _DISTRIBUTION_HISTORY_CONFLICT_REASON
-        if unresolved_distribution_dates
-        else "Distribution quota basis is unresolved"
-        if units.uncertain_distributions
-        else None
+        None
+        if monthly
+        else (
+            _DISTRIBUTION_HISTORY_CONFLICT_REASON
+            if unresolved_distribution_dates
+            else "Distribution quota basis is unresolved"
+            if units.uncertain_distributions
+            else None
+        )
     )
     if missing_distribution_reason is not None:
         (
@@ -870,33 +921,33 @@ def _fund_facts(
     else:
         distribution_history = _value_fact(
             "distribution_history_months",
-            Decimal(len(distributions)) if distributions else None,
+            Decimal(len(periods)) if periods else None,
             "count",
-            distributions[-1].ex_date if distributions else None,
+            periods[-1].as_of if periods else None,
             distribution_provenance.label,
             confidence=distribution_provenance.confidence,
             source_lineage=distribution_provenance.source_lineage,
             independent_source_count=distribution_provenance.independent_source_count,
         )
         distribution_stability = _distribution_stability(
-            distributions,
+            periods,
             provenance=distribution_provenance,
         )
         distribution_frequency = _positive_distribution_frequency(
-            distributions,
+            periods,
             provenance=distribution_provenance,
         )
         distribution_growth = _distribution_growth(
-            distributions,
+            periods,
             provenance=distribution_provenance,
         )
         distribution_cuts = _distribution_cut_frequency(
-            distributions,
+            periods,
             provenance=distribution_provenance,
         )
         distribution_consistency = _distribution_report_consistency(
             reports,
-            distributions,
+            periods,
             provenance=distribution_provenance,
         )
         if units.uncertain_reports:
@@ -1021,14 +1072,14 @@ def _fund_facts(
         and distribution_consistency.value > Decimal("0.25")
         else []
     )
-    if unresolved_distribution_dates:
+    if unresolved_distribution_dates and not monthly:
         warnings.insert(
             0,
             f"{_DISTRIBUTION_HISTORY_CONFLICT_REASON}; "
             "distribution-derived history facts were withheld",
         )
     warnings.extend(units.warnings)
-    has_distribution_history = bool(distributions or distribution_evidence)
+    has_distribution_history = bool(periods or distribution_evidence)
     market_metric = (
         opportunity.metrics.average_daily_traded_value if opportunity is not None else None
     )
@@ -1963,7 +2014,7 @@ def _validated_financial_facts(
 
 
 def _distribution_stability(
-    distributions: list[FundDistribution],
+    distributions: list[_DistributionPeriod],
     *,
     provenance: _DistributionProvenance | None = None,
 ) -> QualityFact:
@@ -1983,7 +2034,7 @@ def _distribution_stability(
         "distribution_stability",
         _safe_ratio(deviation, average),
         "ratio",
-        distributions[-1].ex_date,
+        distributions[-1].as_of,
         (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
         confidence=_distribution_fact_confidence(provenance, _CVM_CONFIDENCE),
         source_lineage=provenance.source_lineage if provenance is not None else (),
@@ -1992,7 +2043,7 @@ def _distribution_stability(
 
 
 def _positive_distribution_frequency(
-    distributions: list[FundDistribution],
+    distributions: list[_DistributionPeriod],
     *,
     provenance: _DistributionProvenance | None = None,
 ) -> QualityFact:
@@ -2008,7 +2059,7 @@ def _positive_distribution_frequency(
         "positive_distribution_frequency",
         Decimal(positive) / Decimal(len(recent)),
         "ratio",
-        recent[-1].ex_date,
+        recent[-1].as_of,
         (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
         confidence=_distribution_fact_confidence(provenance, _CVM_CONFIDENCE),
         source_lineage=provenance.source_lineage if provenance is not None else (),
@@ -2017,7 +2068,7 @@ def _positive_distribution_frequency(
 
 
 def _distribution_growth(
-    distributions: list[FundDistribution],
+    distributions: list[_DistributionPeriod],
     *,
     provenance: _DistributionProvenance | None = None,
 ) -> QualityFact:
@@ -2036,7 +2087,7 @@ def _distribution_growth(
         "distribution_growth",
         _safe_ratio(later - earlier, earlier),
         "ratio",
-        recent[-1].ex_date,
+        recent[-1].as_of,
         (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
         confidence=_distribution_fact_confidence(provenance, _DERIVED_CONFIDENCE),
         source_lineage=provenance.source_lineage if provenance is not None else (),
@@ -2045,7 +2096,7 @@ def _distribution_growth(
 
 
 def _distribution_cut_frequency(
-    distributions: list[FundDistribution],
+    distributions: list[_DistributionPeriod],
     *,
     provenance: _DistributionProvenance | None = None,
 ) -> QualityFact:
@@ -2072,7 +2123,7 @@ def _distribution_cut_frequency(
         "distribution_cut_frequency",
         Decimal(cuts) / Decimal(len(comparable)),
         "ratio",
-        recent[-1].ex_date,
+        recent[-1].as_of,
         (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
         confidence=_distribution_fact_confidence(provenance, _DERIVED_CONFIDENCE),
         source_lineage=provenance.source_lineage if provenance is not None else (),
@@ -2223,7 +2274,7 @@ def _nav_max_drawdown(reports: list[FundMonthlyReport]) -> QualityFact:
 
 def _distribution_report_consistency(
     reports: list[FundMonthlyReport],
-    distributions: list[FundDistribution],
+    distributions: list[_DistributionPeriod],
     *,
     provenance: _DistributionProvenance | None = None,
 ) -> QualityFact:
@@ -2236,7 +2287,7 @@ def _distribution_report_consistency(
     errors = [
         abs(item.value - expected) / max(abs(item.value), abs(expected), Decimal("0.000001"))
         for item in distributions[-36:]
-        if (expected := report_values.get((item.ex_date.year, item.ex_date.month))) is not None
+        if (expected := report_values.get((item.as_of.year, item.as_of.month))) is not None
     ]
     if len(errors) < 6:
         return _missing_fact(

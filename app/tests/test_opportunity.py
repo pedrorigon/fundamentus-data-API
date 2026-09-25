@@ -20,12 +20,14 @@ from app.models import (
     Dividend,
     FieldData,
     FundDistribution,
+    FundMonthlyDistribution,
     InstrumentBatchRequest,
     InstrumentMetadata,
     InstrumentType,
     OpportunityMetric,
     OpportunityObservation,
 )
+from app.models.income_events import CanonicalIncomeEvent, IncomeEventStatus
 from app.scrapers.cvm_fund_reports import (
     FundArchiveFailure,
     FundReportPoint,
@@ -37,6 +39,7 @@ from app.services.opportunity import (
     StatusInvestProfile,
     StatusInvestProvider,
     _add_distribution_metrics,
+    _add_monthly_distribution_metrics,
     _is_valid_b3_payload,
     _merge_fund_distributions,
     _merge_official_fund_metrics,
@@ -46,6 +49,7 @@ from app.services.opportunity import (
     _public_fund_distributions,
     _reconcile_fund_distributions,
     _verified_fund_cnpj,
+    _verified_income_distributions,
     parse_status_invest_profile,
     parse_status_invest_snapshot,
 )
@@ -564,6 +568,10 @@ async def test_juro11_uses_verified_traded_fund_cnpj(
             self.cnpj_requested = cnpj
             return await super().reports(instrument, cnpj=cnpj, today=today)
 
+    class EmptySpartaProvider:
+        async def distributions(self, *, as_of: date | None = None) -> tuple[()]:
+            return ()
+
     cvm = CapturedCvmProvider()
     service = OpportunityService(
         FakeAssetService(),  # type: ignore[arg-type]
@@ -571,6 +579,7 @@ async def test_juro11_uses_verified_traded_fund_cnpj(
         b3_provider=JuroB3Provider(),  # type: ignore[arg-type]
         status_provider=JuroStatusProvider(),  # type: ignore[arg-type]
         cvm_provider=cvm,  # type: ignore[arg-type]
+        sparta_provider=EmptySpartaProvider(),  # type: ignore[arg-type]
     )
 
     result = await service.opportunity("JURO11")
@@ -579,6 +588,84 @@ async def test_juro11_uses_verified_traded_fund_cnpj(
     assert result.fund_reports is not None
     assert result.fund_reports.cnpj == "42730834000100"
     assert result.source_failures[failure_key] == failure_code
+
+
+def test_verified_b3_fund_income_outweighs_conflicting_aggregators() -> None:
+    instrument = InstrumentMetadata(
+        ticker="JURO11",
+        instrument_type=InstrumentType.fi_infra,
+        isin="BRJUROCTF002",
+        source="b3",
+        confidence="high",
+    )
+    event = CanonicalIncomeEvent(
+        event_id="juro-aug-2026",
+        ticker="JURO11",
+        isin="BRJUROCTF002",
+        event_type="Rendimento",
+        ex_date=date(2026, 8, 31),
+        payment_date=date(2026, 9, 15),
+        unit_price=Decimal("1"),
+        status=IncomeEventStatus.verified,
+        sources=["b3"],
+    )
+    authoritative = _verified_income_distributions([event], instrument)
+    misleading = Dividend(
+        ex_date=event.ex_date,
+        payment_date=event.payment_date,
+        value=Decimal("9"),
+        type="Rendimento",
+        is_future_payment=False,
+        is_future_ex_date=False,
+        raw={},
+    )
+
+    reconciled = _reconcile_fund_distributions(
+        [misleading],
+        (FundDistribution(ex_date=event.ex_date, value=Decimal("8"), source="status_invest"),),
+        authoritative,
+    )
+
+    assert reconciled[0].consensus.value == Decimal("1")
+    assert reconciled[0].consensus.sources == ("b3",)
+    assert {item.source for item in reconciled[0].consensus.rejected_observations} == {
+        "fundamentus",
+        "status_invest",
+    }
+    assert (
+        _verified_income_distributions(
+            [event], instrument.model_copy(update={"isin": "BRJUROCTF003"})
+        )
+        == ()
+    )
+
+
+async def test_manager_months_define_exact_juro_income_metrics() -> None:
+    asset = await FakeAssetService().get_asset("JURO11")
+    assert asset.details is not None
+    metrics = _opportunity_metrics(asset.details, [], {}, Decimal("6"))
+    values = ("1", "1", "1", "1", "1", "1", "1", ".75", ".5", "0", ".75", "1")
+    monthly = tuple(
+        FundMonthlyDistribution(
+            reference_month=date(2025 + (8 + index) // 12, (8 + index) % 12 + 1, 1),
+            payment_date=date(2026, 9, 15),
+            value=Decimal(value),
+            report_as_of=date(2026, 8, 31),
+            source="sparta_manager",
+        )
+        for index, value in enumerate(values)
+    )
+
+    resolved = _add_monthly_distribution_metrics(metrics, monthly)
+
+    assert resolved.dividends_12m.value == Decimal("10")
+    assert resolved.latest_distribution is not None
+    assert resolved.latest_distribution.value == Decimal("1")
+    assert resolved.median_distribution_3m is not None
+    assert resolved.median_distribution_3m.value == Decimal("0.75")
+    assert resolved.median_distribution_6m is not None
+    assert resolved.median_distribution_6m.value == Decimal("0.75")
+    assert resolved.dividend_yield_12m.value == Decimal("100") / Decimal("3")
 
 
 @pytest.mark.parametrize(
@@ -601,6 +688,138 @@ def test_juro11_verified_cnpj_requires_exact_trusted_listing(
     )
 
     assert _verified_fund_cnpj(instrument) is None
+
+
+def _juro_monthly() -> tuple[FundMonthlyDistribution, ...]:
+    values = ("1", "1", "1", "1", "1", "1", "1", ".75", ".5", "0", ".75", "1")
+    return tuple(
+        FundMonthlyDistribution(
+            reference_month=date(2025 + (8 + index) // 12, (8 + index) % 12 + 1, 1),
+            payment_date=date(2025 + (9 + index) // 12, (9 + index) % 12 + 1, 15),
+            value=Decimal(value),
+            report_as_of=date(2026, 8, 31),
+            source="sparta_manager",
+            published_at=datetime(2026, 9, 3, tzinfo=UTC),
+        )
+        for index, value in enumerate(values)
+    )
+
+
+def _juro_income_event(amount: str = "1") -> CanonicalIncomeEvent:
+    return CanonicalIncomeEvent(
+        event_id="juro-aug-2026",
+        ticker="JURO11",
+        isin="BRJUROCTF002",
+        event_type="Rendimento",
+        ex_date=date(2026, 8, 31),
+        payment_date=date(2026, 9, 15),
+        unit_price=Decimal(amount),
+        status=IncomeEventStatus.verified,
+        sources=["b3"],
+        updated_at=datetime(2026, 9, 20, tzinfo=UTC),
+    )
+
+
+@pytest.mark.asyncio
+async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> None:
+    class JuroB3(FakeB3Provider):
+        async def get(self, ticker: str) -> InstrumentMetadata:
+            return InstrumentMetadata(
+                ticker=ticker,
+                instrument_type=InstrumentType.fi_infra,
+                isin="BRJUROCTF002",
+                source="b3",
+                confidence="high",
+            )
+
+    class IncomeStore:
+        requested: tuple[list[str], date] | None = None
+        amount = "1"
+        unavailable = False
+
+        async def events(self, tickers: list[str], *, to_date: date) -> list[CanonicalIncomeEvent]:
+            if self.unavailable:
+                raise RuntimeError("store unavailable")
+            self.requested = (tickers, to_date)
+            future = _juro_income_event("9").model_copy(
+                update={
+                    "event_id": "future-revision",
+                    "ex_date": date(2026, 7, 31),
+                    "payment_date": date(2026, 8, 14),
+                    "updated_at": datetime(2026, 9, 26, tzinfo=UTC),
+                }
+            )
+            return [_juro_income_event(self.amount), future]
+
+    class Manager:
+        requested: datetime | None = None
+        unavailable = False
+
+        async def distributions(
+            self, *, as_of: datetime | None = None
+        ) -> tuple[FundMonthlyDistribution, ...]:
+            if self.unavailable:
+                raise ProviderUnavailableError(ticker="JURO11")
+            self.requested = as_of
+            return _juro_monthly()
+
+    store = IncomeStore()
+    manager = Manager()
+    service = OpportunityService(
+        FakeAssetService(),  # type: ignore[arg-type]
+        Settings(),
+        b3_provider=JuroB3(),  # type: ignore[arg-type]
+        status_provider=FakeEmptyStatusProvider(),  # type: ignore[arg-type]
+        cvm_provider=FakeCvmProvider(),  # type: ignore[arg-type]
+        income_store=store,  # type: ignore[arg-type]
+        sparta_provider=manager,  # type: ignore[arg-type]
+    )
+    reference = datetime(2026, 9, 25, 12, tzinfo=UTC)
+
+    result = await service.opportunity("JURO11", as_of=reference)
+
+    assert store.requested == (["JURO11"], date(2026, 9, 25))
+    assert manager.requested == reference
+    assert result.metrics.dividends_12m.value == Decimal("10")
+    assert result.metrics.median_distribution_6m is not None
+    assert result.metrics.median_distribution_6m.value == Decimal("0.75")
+    assert result.fund_monthly_distributions[9].value == Decimal("0")
+    assert any(
+        item.ex_date == date(2026, 8, 31) and item.value == Decimal("1")
+        for item in result.fund_distributions
+    )
+    assert not any(item.ex_date == date(2026, 7, 31) for item in result.fund_distributions)
+    assert result.source_failures == {}
+
+    store.amount = "2"
+    conflicting = await service.opportunity("JURO11", as_of=reference)
+    assert conflicting.fund_monthly_distributions == []
+    assert conflicting.source_failures["sparta_manager"] == "DATA_CONFLICT"
+
+    store.unavailable = True
+    manager.unavailable = True
+    unavailable = await service.opportunity("JURO11", as_of=reference)
+    assert unavailable.source_failures == {
+        "income_store": "STORE_UNAVAILABLE",
+        "sparta_manager": "PROVIDER_UNAVAILABLE",
+    }
+
+
+def test_manager_history_is_withheld_when_verified_b3_disagrees() -> None:
+    from app.services.opportunity import _monthly_income_agrees_with_events
+
+    instrument = InstrumentMetadata(
+        ticker="JURO11",
+        instrument_type=InstrumentType.fi_infra,
+        isin="BRJUROCTF002",
+        source="b3",
+        confidence="high",
+    )
+
+    assert _monthly_income_agrees_with_events(_juro_monthly(), [_juro_income_event()], instrument)
+    assert not _monthly_income_agrees_with_events(
+        _juro_monthly(), [_juro_income_event("2")], instrument
+    )
 
 
 def test_fund_nav_consensus_drives_price_to_book_and_rejects_cvm_outlier() -> None:

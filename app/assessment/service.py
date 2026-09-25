@@ -229,7 +229,7 @@ class AssessmentSnapshotService:
                 _unsupported("Opportunity metrics are not applicable to ETF assets.").state,
             )
             if request.kind is QualityAssetKind.etf
-            else await self._opportunity(request.ticker)
+            else await self._opportunity(request.ticker, request.period_at)
         )
         fundamentals = await self._fundamentals(request, opportunity.value)
         quality = await self._quality(request, opportunity.value, fundamentals.value)
@@ -262,9 +262,11 @@ class AssessmentSnapshotService:
             },
         )
 
-    async def _opportunity(self, ticker: str) -> _Component[OpportunityResponse]:
+    async def _opportunity(
+        self, ticker: str, period_at: datetime
+    ) -> _Component[OpportunityResponse]:
         try:
-            result = await self.opportunity.opportunity(ticker)
+            result = await self.opportunity.opportunity(ticker, as_of=period_at)
             has_values = any(
                 metric.value is not None
                 for metric in result.metrics.__dict__.values()

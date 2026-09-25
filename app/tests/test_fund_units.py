@@ -10,6 +10,7 @@ from app.services.fund_units import normalize_fund_units
 from app.services.quality import (
     _distribution_cut_frequency,
     _distribution_growth,
+    _distribution_periods,
     _issuance_nav_preservation,
     _nav_growth,
     _nav_max_drawdown,
@@ -61,8 +62,9 @@ def test_confirmed_quota_split_preserves_economic_history(
     assert _nav_max_drawdown(normalized.reports).value == Decimal("0")
     assert _nav_return_observations(normalized.reports)[8].value == Decimal("0")
     assert _issuance_nav_preservation(normalized.reports).value == Decimal("1")
-    assert _distribution_growth(normalized.distributions).value == Decimal("0")
-    assert _distribution_cut_frequency(normalized.distributions).value == Decimal("0")
+    periods = _distribution_periods(normalized.distributions, [])
+    assert _distribution_growth(periods).value == Decimal("0")
+    assert _distribution_cut_frequency(periods).value == Decimal("0")
     assert normalized.sources
     assert not normalized.uncertain_reports
     assert not normalized.uncertain_distributions

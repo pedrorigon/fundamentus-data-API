@@ -111,7 +111,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         await getattr(income_event_service, "startup", _noop)()
         app.state.income_event_service = income_event_service
-        app.state.opportunity_service = OpportunityService(asset_service, settings)
+        app.state.opportunity_service = OpportunityService(
+            asset_service, settings, income_store=income_event_store
+        )
         instrument_data_service = InstrumentDataService(settings)
         app.state.instrument_data_service = instrument_data_service
         # Bulk directory warming is deliberately detached from readiness. Search

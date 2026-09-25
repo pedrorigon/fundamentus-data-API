@@ -1058,7 +1058,9 @@ async def test_snapshot_service_resolves_opportunity_once_and_shares_it_with_qua
                 }
             )
 
-        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, _ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             self.calls += 1
             return self.value
 
@@ -1156,7 +1158,9 @@ async def test_snapshot_service_keeps_fundamentals_independent_from_opportunity_
     class FailingOpportunity:
         calls = 0
 
-        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, _ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             self.calls += 1
             raise UpstreamUnavailableError()
 
@@ -1272,7 +1276,9 @@ class _AssessmentOpportunity:
         self.value = value
         self.calls = 0
 
-    async def opportunity(self, _ticker: str) -> OpportunityResponse | None:
+    async def opportunity(
+        self, _ticker: str, *, as_of: datetime | None = None
+    ) -> OpportunityResponse | None:
         self.calls += 1
         if self.value is None:
             raise ValueError("provider response contained a secret")
@@ -1478,7 +1484,9 @@ async def test_snapshot_service_retries_empty_opportunity_after_source_outage(
             self.failed = True
             self.calls = 0
 
-        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, _ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             self.calls += 1
             return unavailable if self.failed else _opportunity("OPP3")
 
@@ -1681,7 +1689,9 @@ async def test_snapshot_service_rejects_missing_closed_slot_before_claim_or_prov
     class UncalledOpportunity:
         calls = 0
 
-        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, _ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             self.calls += 1
             raise AssertionError("closed slots must not call providers")
 
@@ -1767,7 +1777,9 @@ async def test_snapshot_service_reads_existing_closed_slot_within_retention(
     )
 
     class UncalledOpportunity:
-        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, _ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             raise AssertionError("stored snapshots must not call providers")
 
     class UncalledFundamentals:
@@ -2160,7 +2172,9 @@ async def test_snapshot_service_retries_failed_component_before_publishing_compl
 @pytest.mark.asyncio
 async def test_fundamentals_route_falls_back_when_opportunity_enrichment_is_unavailable() -> None:
     class UnavailableOpportunity:
-        async def opportunity(self, ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             raise ProviderUnavailableError(ticker=ticker)
 
     class Fundamentals:
@@ -2188,7 +2202,9 @@ async def test_fundamentals_route_falls_back_when_opportunity_enrichment_is_unav
 @pytest.mark.asyncio
 async def test_fundamentals_route_rethrows_invalid_tickers() -> None:
     class InvalidOpportunity:
-        async def opportunity(self, ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             raise InvalidTickerError(ticker=ticker)
 
     class Fundamentals:
@@ -2206,7 +2222,9 @@ async def test_fundamentals_route_rethrows_invalid_tickers() -> None:
 @pytest.mark.asyncio
 async def test_fundamentals_batch_route_returns_typed_fallbacks_for_each_failure() -> None:
     class BatchOpportunity:
-        async def opportunity(self, ticker: str) -> OpportunityResponse | None:
+        async def opportunity(
+            self, ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse | None:
             return None
 
     class BatchFundamentals:
@@ -2241,7 +2259,9 @@ async def test_fundamentals_batch_route_returns_typed_fallbacks_for_each_failure
 @pytest.mark.asyncio
 async def test_fundamentals_batch_route_rethrows_invalid_tickers() -> None:
     class InvalidOpportunity:
-        async def opportunity(self, ticker: str) -> OpportunityResponse | None:
+        async def opportunity(
+            self, ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse | None:
             if ticker == "BAD3":
                 raise InvalidTickerError(ticker=ticker)
             return None
@@ -2272,7 +2292,9 @@ async def test_fixed_income_names_are_normalized_and_shared_without_market_resol
         def __init__(self) -> None:
             self.calls = 0
 
-        async def opportunity(self, _ticker: str) -> OpportunityResponse:
+        async def opportunity(
+            self, _ticker: str, *, as_of: datetime | None = None
+        ) -> OpportunityResponse:
             self.calls += 1
             raise AssertionError("fixed-income assessments must not call market opportunity")
 

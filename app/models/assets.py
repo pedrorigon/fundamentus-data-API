@@ -294,6 +294,17 @@ class FundDistribution(APIModel):
     source: str
 
 
+class FundMonthlyDistribution(APIModel):
+    """Manager-reported income for a reference month, including explicit zeroes."""
+
+    reference_month: date
+    payment_date: date
+    value: Decimal
+    report_as_of: date
+    source: str
+    published_at: datetime | None = None
+
+
 class FundDistributionEvidence(APIModel):
     """Auditable reconciliation result for one distribution date.
 
@@ -335,6 +346,7 @@ class OpportunityResponse(APIModel):
     metrics: OpportunityMetrics
     fund_reports: FundReportSeries | None = None
     fund_distributions: list[FundDistribution] = Field(default_factory=list)
+    fund_monthly_distributions: list[FundMonthlyDistribution] = Field(default_factory=list)
     fund_distribution_evidence: list[FundDistributionEvidence] = Field(default_factory=list)
     # Stable provider error codes are retained so callers can distinguish a
     # legitimate missing observation from a temporary source outage without
