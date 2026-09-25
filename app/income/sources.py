@@ -650,7 +650,6 @@ class FundosNetIncomeSource:
         as_of: date,
         client: httpx.AsyncClient,
     ) -> tuple[list[IncomeEventObservation], set[str]]:
-        rows = await self._rows(client)
         targeted_candidates: list[dict[str, Any]] = []
         complete_tickers: set[str] = set()
         if self.status_source is not None:
@@ -673,6 +672,15 @@ class FundosNetIncomeSource:
                 targeted_candidates.extend(targeted_rows)
                 if complete:
                     complete_tickers.add(ticker)
+        try:
+            rows = await self._rows(client)
+        except (httpx.HTTPError, ValueError):
+            # The broad index is an optional discovery path. Its malformed
+            # HTML/JSON response must not discard a complete CNPJ-targeted
+            # result already retrieved for the requested fund.
+            if not targeted_candidates and not complete_tickers:
+                raise
+            rows = []
         candidates = list(
             {
                 str(row["id"]): row
@@ -713,8 +721,8 @@ class FundosNetIncomeSource:
                 self._index[0], self.settings.income_source_index_ttl_seconds
             ):
                 return self._index[1]
-            response = await client.get(
-                "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            payload = await self._index_page(
+                client,
                 params={
                     "d": 1,
                     "s": 0,
@@ -725,10 +733,26 @@ class FundosNetIncomeSource:
                     "tipoFundo": 1,
                 },
             )
-            response.raise_for_status()
-            rows = _fundos_net_rows(response.json())
+            rows = _fundos_net_rows(payload)
             self._index = (time.monotonic(), rows)
             return rows
+
+    async def _index_page(
+        self, client: httpx.AsyncClient, *, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        async with client.stream(
+            "GET",
+            "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            params=params,
+        ) as response:
+            response.raise_for_status()
+            if "json" not in response.headers.get("content-type", "").lower():
+                raise ValueError("Fundos.NET index did not return JSON")
+            body = await read_bounded_body(response, 3_000_000)
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("Fundos.NET index returned an invalid schema")
+        return payload
 
     async def _rows_for_cnpj(
         self,
@@ -781,8 +805,8 @@ class FundosNetIncomeSource:
         page_size = max(self.settings.fundos_net_page_size, 1)
         scan_limit = max(self.settings.fundos_net_scan_limit, page_size)
         for offset in range(0, scan_limit, page_size):
-            response = await client.get(
-                "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            payload = await self._index_page(
+                client,
                 params={
                     "d": 1,
                     "s": offset,
@@ -796,8 +820,6 @@ class FundosNetIncomeSource:
                     "cnpjFundo": cnpj,
                 },
             )
-            response.raise_for_status()
-            payload = response.json()
             page = _fundos_net_rows(payload)
             rows.extend(page)
             total = _positive_int(payload.get("recordsFiltered"))

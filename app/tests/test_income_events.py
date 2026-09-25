@@ -1978,6 +1978,47 @@ async def test_fundos_net_source_filters_requested_ticker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fundos_net_targeted_income_survives_malformed_optional_index() -> None:
+    xml = b"""<DadosEconomicoFinanceiros><InformeRendimentos><Provento>
+    <CodISIN>BRJUROCTF002</CodISIN><CodNegociacao>JURO11</CodNegociacao><Rendimento>
+    <DataBase>2026-08-31</DataBase><ValorProvento>1.00</ValorProvento>
+    <DataPagamento>2026-09-15</DataPagamento></Rendimento></Provento></InformeRendimentos>
+    </DadosEconomicoFinanceiros>"""
+
+    class CnpjSource:
+        async def fund_cnpjs(self, _instruments: object) -> dict[str, str]:
+            return {"JURO11": "42730834000100"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "downloadDocumento" in request.url.path:
+            return httpx.Response(200, content=xml)
+        if "cnpj" in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": 1272107, "versao": 1, "status": "AC"}],
+                    "recordsFiltered": 1,
+                },
+            )
+        return httpx.Response(200, text="<html>invalid index</html>")
+
+    source = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(handler),
+        status_source=CnpjSource(),  # type: ignore[arg-type]
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="JURO11", isin="BRJUROCTF002")],
+        date(2026, 9, 25),
+    )
+
+    assert len(result.observations) == 1
+    assert result.observations[0].unit_price == Decimal("1")
+    assert result.coverage[0].status == "complete"
+
+
+@pytest.mark.asyncio
 async def test_fundos_net_rows_singleflight_survives_cancelled_waiter() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
