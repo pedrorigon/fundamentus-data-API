@@ -33,6 +33,7 @@ from app.scrapers.cvm_fund_reports import (
     FundReportPoint,
     FundReportSeries,
 )
+from app.scrapers.sparta_fi_infra import CreditHolding, CreditPortfolio
 from app.services.opportunity import (
     B3InstrumentProvider,
     OpportunityService,
@@ -757,6 +758,9 @@ async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> No
     class Manager:
         requested: datetime | None = None
         unavailable = False
+        credit_unavailable = False
+        missing_provenance = False
+        mismatched_report = False
 
         async def distributions(
             self, *, as_of: datetime | None = None
@@ -765,6 +769,29 @@ async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> No
                 raise ProviderUnavailableError(ticker="JURO11")
             self.requested = as_of
             return _juro_monthly()
+
+        async def credit_portfolio(self, *, as_of: datetime | None = None) -> CreditPortfolio:
+            if self.credit_unavailable:
+                raise ProviderInvalidResponseError(ticker="JURO11")
+            assert as_of == self.requested
+            return CreditPortfolio(
+                report_as_of=date(2026, 7, 31) if self.mismatched_report else date(2026, 8, 31),
+                published_at=datetime(2026, 9, 3, tzinfo=UTC),
+                holdings=(
+                    CreditHolding(
+                        row_number=1,
+                        security_code="CRTR12",
+                        issuer_and_sector="EPR Triângulo Mineiro Rodovias",
+                        disclosed_rating="A+",
+                        credit_spread=Decimal("0.009"),
+                        duration_years=Decimal("6.6"),
+                        portfolio_weight=Decimal("0.03"),
+                    ),
+                ),
+                cash_weight=Decimal("0.97"),
+                document_digest=None if self.missing_provenance else "a" * 64,
+                document_url="https://sparta.com.br/uploads/JURO11_RelatorioMensal_2026_08.pdf",
+            )
 
     store = IncomeStore()
     manager = Manager()
@@ -787,6 +814,9 @@ async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> No
     assert result.metrics.median_distribution_6m is not None
     assert result.metrics.median_distribution_6m.value == Decimal("0.75")
     assert result.fund_monthly_distributions[9].value == Decimal("0")
+    assert result.fund_credit_portfolio is not None
+    assert result.fund_credit_portfolio.holdings[0].security_code == "CRTR12"
+    assert result.fund_credit_portfolio.document_digest == "a" * 64
     assert any(
         item.ex_date == date(2026, 8, 31) and item.value == Decimal("1")
         for item in result.fund_distributions
@@ -797,7 +827,35 @@ async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> No
     store.amount = "2"
     conflicting = await service.opportunity("JURO11", as_of=reference)
     assert conflicting.fund_monthly_distributions == []
+    assert conflicting.fund_credit_portfolio is not None
     assert conflicting.source_failures["sparta_manager"] == "DATA_CONFLICT"
+
+    store.amount = "1"
+    manager.credit_unavailable = True
+    credit_unavailable = await service.opportunity("JURO11", as_of=reference)
+    assert credit_unavailable.fund_credit_portfolio is None
+    assert credit_unavailable.fund_monthly_distributions
+    assert credit_unavailable.source_failures["sparta_manager:credit_portfolio"] == (
+        "PROVIDER_INVALID_RESPONSE"
+    )
+
+    manager.credit_unavailable = False
+    manager.missing_provenance = True
+    untraceable = await service.opportunity("JURO11", as_of=reference)
+    assert untraceable.fund_credit_portfolio is None
+    assert untraceable.fund_monthly_distributions
+    assert untraceable.source_failures["sparta_manager:credit_portfolio"] == (
+        "PROVIDER_INVALID_RESPONSE"
+    )
+
+    manager.missing_provenance = False
+    manager.mismatched_report = True
+    mismatched = await service.opportunity("JURO11", as_of=reference)
+    assert mismatched.fund_credit_portfolio is None
+    assert mismatched.fund_monthly_distributions
+    assert mismatched.source_failures["sparta_manager:credit_portfolio"] == (
+        "PROVIDER_INVALID_RESPONSE"
+    )
 
     store.unavailable = True
     manager.unavailable = True

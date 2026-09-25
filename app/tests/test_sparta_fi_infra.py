@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 
 import httpx
 import pytest
@@ -13,6 +14,8 @@ from app.models import FundMonthlyDistribution
 from app.scrapers import sparta_fi_infra
 from app.scrapers.sparta_fi_infra import (
     SpartaDistributionProvider,
+    parse_credit_portfolio,
+    parse_credit_portfolio_pages,
     parse_monthly_distributions,
 )
 
@@ -31,6 +34,18 @@ Nov-25 12/12/2025 R$ 1,00 11,6%
 Out-25 14/11/2025 R$ 1,00 11,6%
 Set-25 14/10/2025 R$ 1,00 11,6%
 """
+
+
+def _credit_page(*, rows: int = 30) -> str:
+    return (
+        "COMPOSIÇÃO DA CARTEIRA\n# TIPO CÓDIGO\n"
+        + "".join(
+            f"{number} Debêntures CODE{number:03} Issuer {number} Rodovias "
+            f"{'S/R' if number == 2 else 'AAA'} 0,9% 6,6 1,0%\n"
+            for number in range(1, rows + 1)
+        )
+        + f"{rows + 1} Caixa AAA 0,0% 0,0 70,0%\nTotal 0,0% 0,0 100,0%\n"
+    )
 
 
 class _Page:
@@ -58,6 +73,88 @@ def test_official_report_keeps_explicit_zero_month(monkeypatch: pytest.MonkeyPat
     assert periods[9].reference_month == date(2026, 6, 1)
     assert periods[9].payment_date == date(2026, 7, 15)
     assert periods[9].value == Decimal("0")
+
+
+def test_manager_credit_inventory_is_reconciled_without_rating_to_default_mapping() -> None:
+    portfolio = parse_credit_portfolio_pages((_credit_page(),), report_as_of=date(2026, 8, 31))
+
+    assert len(portfolio.holdings) == 30
+    assert portfolio.reported_weight == Decimal("0.30")
+    assert portfolio.unrated_weight == Decimal("0.01")
+    assert portfolio.cash_weight == Decimal("0.7")
+    assert portfolio.holdings[0].security_code == "CODE001"
+    assert portfolio.holdings[0].credit_spread == Decimal("0.009")
+    assert portfolio.holdings[0].duration_years == Decimal("6.6")
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        _credit_page(rows=29),
+        _credit_page().replace("15 Debêntures", "16 Debêntures"),
+        _credit_page().replace("1,0%", "9,0%"),
+        _credit_page().replace("6,6 1,0%", "-6,6 1,0%"),
+        _credit_page().replace("31 Caixa", "30 Caixa"),
+        _credit_page().replace("Total 0,0% 0,0 100,0%", ""),
+        _credit_page().replace("Total 0,0% 0,0 100,0%", "Total 0,0% 0,0 99,0%"),
+        _credit_page().replace("Issuer 30 Rodovias AAA", "Issuer 30 Rodovias UNKNOWN"),
+    ],
+)
+def test_credit_inventory_rejects_gaps_or_bad_weights(page: str) -> None:
+    with pytest.raises(ValueError):
+        parse_credit_portfolio_pages((page,), report_as_of=date(2026, 8, 31))
+
+
+def test_credit_inventory_checks_document_identity_and_portfolio_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Reader:
+        pages = [_Page(_COVER)] + [_Page("")] * 5 + [_Page(_credit_page())] * 9 + [_Page("")]
+
+    monkeypatch.setattr(sparta_fi_infra, "PdfReader", lambda *_args, **_kwargs: Reader())
+    with pytest.raises(ValueError):
+        parse_credit_portfolio(b"%PDF-fixture", report_year=2026, report_month=7)
+
+
+def test_credit_inventory_reads_table_pages_until_reconciled_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Reader:
+        pages = (
+            [_Page(_COVER)]
+            + [_Page("")] * 5
+            + [_Page(_credit_page())]
+            + [_Page("COMPOSIÇÃO DA CARTEIRA\nALOCAÇÃO POR SETOR")]
+        )
+
+    monkeypatch.setattr(sparta_fi_infra, "PdfReader", lambda *_args, **_kwargs: Reader())
+    result = parse_credit_portfolio(b"%PDF-fixture", report_year=2026, report_month=8)
+
+    assert len(result.holdings) == 30
+    assert result.cash_weight == Decimal("0.7")
+    assert result.document_digest == sha256(b"%PDF-fixture").hexdigest()
+    assert result.document_url == "https://sparta.com.br/uploads/JURO11_RelatorioMensal_2026_08.pdf"
+
+
+def test_credit_inventory_rejects_invalid_or_unreadable_documents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="Invalid manager report document"):
+        parse_credit_portfolio(b"not a PDF", report_year=2026, report_month=8)
+
+    class ShortReader:
+        pages = [_Page(_COVER)]
+
+    monkeypatch.setattr(sparta_fi_infra, "PdfReader", lambda *_args, **_kwargs: ShortReader())
+    with pytest.raises(ValueError, match="lacks its portfolio section"):
+        parse_credit_portfolio(b"%PDF-fixture", report_year=2026, report_month=8)
+
+    def broken_reader(*_args: object, **_kwargs: object) -> object:
+        raise PdfReadError("invalid")
+
+    monkeypatch.setattr(sparta_fi_infra, "PdfReader", broken_reader)
+    with pytest.raises(ValueError, match="cannot be parsed"):
+        parse_credit_portfolio(b"%PDF-fixture", report_year=2026, report_month=8)
 
 
 @pytest.mark.parametrize(
@@ -136,6 +233,57 @@ async def test_provider_fetches_latest_closed_month_once(monkeypatch: pytest.Mon
 
     assert first == second
     assert urls == ["https://sparta.com.br/uploads/JURO11_RelatorioMensal_2026_08.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_provider_reuses_report_for_credit_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Reader:
+        pages = (
+            [_Page(_COVER), _Page(""), _Page(""), _Page(_ROWS)]
+            + [_Page("")] * 2
+            + [_Page(_credit_page())]
+            + [_Page("COMPOSIÇÃO DA CARTEIRA\nALOCAÇÃO POR SETOR")]
+        )
+
+    monkeypatch.setattr(sparta_fi_infra, "PdfReader", lambda *_args, **_kwargs: Reader())
+    requests = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            content=b"%PDF-fixture",
+            headers={"Last-Modified": "Thu, 03 Sep 2026 18:24:42 GMT"},
+        )
+
+    provider = SpartaDistributionProvider(transport=httpx.MockTransport(respond))
+    first = await provider.credit_portfolio(as_of=date(2026, 9, 25))
+    second = await provider.credit_portfolio(as_of=date(2026, 9, 25))
+
+    assert first is second
+    assert first.report_as_of == date(2026, 8, 31)
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_reports_invalid_credit_section_separately_from_valid_income(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reader(monkeypatch)
+    provider = SpartaDistributionProvider(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                content=b"%PDF-fixture",
+                headers={"Last-Modified": "Thu, 03 Sep 2026 18:24:42 GMT"},
+            )
+        )
+    )
+
+    assert len(await provider.distributions(as_of=date(2026, 9, 25))) == 12
+    with pytest.raises(ProviderInvalidResponseError):
+        await provider.credit_portfolio(as_of=date(2026, 9, 25))
 
 
 @pytest.mark.asyncio

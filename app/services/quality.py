@@ -16,6 +16,7 @@ from app.core.errors import APIError
 from app.models import (
     FinancialPeriod,
     FundamentalsSnapshot,
+    FundCreditPortfolio,
     FundDistribution,
     FundMonthlyDistribution,
     FundMonthlyReport,
@@ -878,6 +879,7 @@ def _fund_facts(
     reports = units.reports
     distributions = units.distributions
     monthly = opportunity.fund_monthly_distributions if opportunity is not None else []
+    credit_portfolio = opportunity.fund_credit_portfolio if opportunity is not None else None
     periods = _distribution_periods(distributions, monthly)
     distribution_evidence = (
         opportunity.fund_distribution_evidence if opportunity is not None else []
@@ -1065,6 +1067,8 @@ def _fund_facts(
         _shareholder_growth(reports),
         _nav_total_consistency(latest),
     ]
+    if credit_portfolio is not None:
+        facts.extend(_fund_credit_facts(credit_portfolio))
     instrument = opportunity.instrument if opportunity is not None else None
     warnings = (
         ["Distribution values diverge from the corresponding CVM monthly reports"]
@@ -1080,6 +1084,8 @@ def _fund_facts(
         )
     warnings.extend(units.warnings)
     has_distribution_history = bool(periods or distribution_evidence)
+    has_credit_portfolio = credit_portfolio is not None
+    has_fund_evidence = bool(reports or has_distribution_history or has_credit_portfolio)
     market_metric = (
         opportunity.metrics.average_daily_traded_value if opportunity is not None else None
     )
@@ -1087,6 +1093,8 @@ def _fund_facts(
     sources.update(units.sources)
     if reports:
         sources.add(report_source)
+    if credit_portfolio is not None:
+        sources.add(credit_portfolio.source)
     if market_metric is not None and market_metric.value is not None:
         sources.update(market_metric.sources)
     return QualityAssetFacts(
@@ -1095,12 +1103,51 @@ def _fund_facts(
         canonical_id=instrument.isin if instrument else None,
         profile=profile,
         facts=facts,
-        sources=sorted(sources) if reports or has_distribution_history else [],
+        sources=sorted(sources) if has_fund_evidence else [],
         warnings=warnings,
-        unavailable_reason=None
-        if reports or has_distribution_history
-        else "No public fund history was resolved",
+        unavailable_reason=None if has_fund_evidence else "No public fund history was resolved",
     )
+
+
+def _fund_credit_facts(portfolio: FundCreditPortfolio) -> list[QualityFact]:
+    """Expose disclosed composition as observations, without rating-to-loss assumptions."""
+
+    holdings = portfolio.holdings
+    values = (
+        ("credit_issue_count", Decimal(len(holdings)), "count"),
+        (
+            "credit_reported_weight",
+            sum((item.portfolio_weight for item in holdings), Decimal("0")),
+            "ratio",
+        ),
+        (
+            "credit_unrated_weight",
+            sum(
+                (item.portfolio_weight for item in holdings if item.disclosed_rating == "S/R"),
+                Decimal("0"),
+            ),
+            "ratio",
+        ),
+        (
+            "credit_largest_issue_weight",
+            max((item.portfolio_weight for item in holdings), default=Decimal("0")),
+            "ratio",
+        ),
+        ("credit_cash_weight", portfolio.cash_weight, "ratio"),
+    )
+    return [
+        _value_fact(
+            key,
+            value,
+            unit,
+            portfolio.report_as_of,
+            portfolio.source,
+            confidence=Decimal("0.55"),
+            source_lineage=(portfolio.source,),
+            independent_source_count=1,
+        )
+        for key, value, unit in values
+    ]
 
 
 def _missing_distribution_facts(reason: str) -> tuple[QualityFact, ...]:

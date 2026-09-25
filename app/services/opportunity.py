@@ -32,6 +32,8 @@ from app.domain.evidence import (
 from app.models import (
     AssetDetails,
     Dividend,
+    FundCreditHolding,
+    FundCreditPortfolio,
     FundDistribution,
     FundMonthlyDistribution,
     FundMonthlyReport,
@@ -528,11 +530,48 @@ class OpportunityService:
                 source_failures[SOURCE_INCOME_STORE] = "STORE_UNAVAILABLE"
         authoritative = _verified_income_distributions(income_events, instrument)
         monthly: tuple[FundMonthlyDistribution, ...] = ()
+        credit_portfolio: FundCreditPortfolio | None = None
         if verified_cnpj == _VERIFIED_FUND_CNPJ.get(("JURO11", "BRJUROCTF002")):
             try:
                 monthly = await self.sparta.distributions(as_of=as_of)
             except APIError as error:
                 source_failures[SOURCE_SPARTA_MANAGER] = error.code
+            if monthly:
+                try:
+                    manager_portfolio = await self.sparta.credit_portfolio(as_of=as_of)
+                except APIError as error:
+                    source_failures[f"{SOURCE_SPARTA_MANAGER}:credit_portfolio"] = error.code
+                else:
+                    if (
+                        manager_portfolio.report_as_of != monthly[-1].report_as_of
+                        or manager_portfolio.published_at != monthly[-1].published_at
+                        or not manager_portfolio.document_digest
+                        or not manager_portfolio.document_url
+                    ):
+                        source_failures[f"{SOURCE_SPARTA_MANAGER}:credit_portfolio"] = (
+                            "PROVIDER_INVALID_RESPONSE"
+                        )
+                    else:
+                        credit_portfolio = FundCreditPortfolio(
+                            report_as_of=manager_portfolio.report_as_of,
+                            published_at=manager_portfolio.published_at,
+                            source=SOURCE_SPARTA_MANAGER,
+                            document_digest=manager_portfolio.document_digest,
+                            document_url=manager_portfolio.document_url,
+                            holdings=[
+                                FundCreditHolding(
+                                    row_number=holding.row_number,
+                                    security_code=holding.security_code,
+                                    issuer_and_sector=holding.issuer_and_sector,
+                                    disclosed_rating=holding.disclosed_rating,
+                                    credit_spread=holding.credit_spread,
+                                    duration_years=holding.duration_years,
+                                    portfolio_weight=holding.portfolio_weight,
+                                )
+                                for holding in manager_portfolio.holdings
+                            ],
+                            cash_weight=manager_portfolio.cash_weight,
+                        )
             if monthly and not _monthly_income_agrees_with_events(
                 monthly, income_events, instrument
             ):
@@ -555,6 +594,7 @@ class OpportunityService:
             fund_reports=_report_series(report_series),
             fund_distributions=list(distributions),
             fund_monthly_distributions=list(monthly),
+            fund_credit_portfolio=credit_portfolio,
             fund_distribution_evidence=list(distribution_evidence),
             source_failures=source_failures,
             refreshed_at=datetime.now(UTC),

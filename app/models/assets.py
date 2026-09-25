@@ -305,6 +305,26 @@ class FundMonthlyDistribution(APIModel):
     published_at: datetime | None = None
 
 
+class FundCreditHolding(APIModel):
+    row_number: int
+    security_code: str
+    issuer_and_sector: str
+    disclosed_rating: str
+    credit_spread: Decimal
+    duration_years: Decimal = Field(ge=0)
+    portfolio_weight: Decimal = Field(ge=0, le=1)
+
+
+class FundCreditPortfolio(APIModel):
+    report_as_of: date
+    published_at: datetime | None = None
+    source: str
+    document_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    document_url: str = Field(min_length=1)
+    holdings: list[FundCreditHolding]
+    cash_weight: Decimal = Field(ge=0, le=1)
+
+
 class FundDistributionEvidence(APIModel):
     """Auditable reconciliation result for one distribution date.
 
@@ -347,6 +367,7 @@ class OpportunityResponse(APIModel):
     fund_reports: FundReportSeries | None = None
     fund_distributions: list[FundDistribution] = Field(default_factory=list)
     fund_monthly_distributions: list[FundMonthlyDistribution] = Field(default_factory=list)
+    fund_credit_portfolio: FundCreditPortfolio | None = None
     fund_distribution_evidence: list[FundDistributionEvidence] = Field(default_factory=list)
     # Stable provider error codes are retained so callers can distinguish a
     # legitimate missing observation from a temporary source outage without

@@ -15,6 +15,8 @@ from app.models import (
     FinancialPeriod,
     FundAllocation,
     FundamentalsSnapshot,
+    FundCreditHolding,
+    FundCreditPortfolio,
     FundDistribution,
     FundHolding,
     FundMonthlyDistribution,
@@ -141,6 +143,7 @@ def opportunity(
     distributions: list[FundDistribution] | None = None,
     monthly_distributions: list[FundMonthlyDistribution] | None = None,
     distribution_evidence: list[FundDistributionEvidence] | None = None,
+    credit_portfolio: FundCreditPortfolio | None = None,
     cnpj: str = "123",
 ) -> OpportunityResponse:
     return OpportunityResponse(
@@ -151,6 +154,7 @@ def opportunity(
         fund_distributions=distributions or [],
         fund_monthly_distributions=monthly_distributions or [],
         fund_distribution_evidence=distribution_evidence or [],
+        fund_credit_portfolio=credit_portfolio,
         refreshed_at=NOW,
     )
 
@@ -1367,6 +1371,54 @@ def test_manager_monthly_history_counts_zero_without_creating_cash_event() -> No
     assert facts_with_conflict["distribution_history_months"] == Decimal("12")
     assert facts_with_conflict["positive_distribution_frequency"] == Decimal(11) / Decimal(12)
     assert not any("withheld" in warning for warning in with_conflict.warnings)
+
+
+def test_juro_credit_inventory_exposes_issue_weights_without_implied_default_risk() -> None:
+    instrument = InstrumentMetadata(
+        ticker="JURO11", instrument_type=InstrumentType.fi_infra, isin="BRJUROCTF002"
+    )
+    portfolio = FundCreditPortfolio(
+        report_as_of=date(2026, 8, 31),
+        source="sparta_manager",
+        document_digest="a" * 64,
+        document_url="https://sparta.com.br/uploads/JURO11_RelatorioMensal_2026_08.pdf",
+        holdings=[
+            FundCreditHolding(
+                row_number=number,
+                security_code=f"ISSUE{number}",
+                issuer_and_sector="Issuer Rodovias",
+                disclosed_rating=rating,
+                credit_spread=Decimal("0.009"),
+                duration_years=Decimal("6.6"),
+                portfolio_weight=Decimal(weight),
+            )
+            for number, rating, weight in ((1, "AAA", "0.03"), (2, "S/R", "0.02"))
+        ],
+        cash_weight=Decimal("0.95"),
+    )
+    result = _fund_facts(
+        QualityAssetRequest(ticker="JURO11", kind=QualityAssetKind.real_estate_fund),
+        opportunity("JURO11", instrument, credit_portfolio=portfolio),
+    )
+    facts = {fact.key: fact for fact in result.facts}
+
+    assert facts["credit_issue_count"].value == Decimal("2")
+    assert facts["credit_reported_weight"].value == Decimal("0.05")
+    assert facts["credit_unrated_weight"].value == Decimal("0.02")
+    assert facts["credit_largest_issue_weight"].value == Decimal("0.03")
+    assert facts["credit_cash_weight"].value == Decimal("0.95")
+    assert all(
+        facts[key].source_lineage == ["sparta_manager"] and facts[key].independent_source_count == 1
+        for key in (
+            "credit_issue_count",
+            "credit_reported_weight",
+            "credit_unrated_weight",
+            "credit_largest_issue_weight",
+            "credit_cash_weight",
+        )
+    )
+    assert "sparta_manager" in result.sources
+    assert result.unavailable_reason is None
 
 
 async def test_fund_quality_facts_use_confirmed_quota_basis() -> None:
