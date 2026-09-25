@@ -21,6 +21,7 @@ from app.models import (
     FundMonthlyDistribution,
     FundMonthlyReport,
     InstrumentDataResponse,
+    InstrumentMetadata,
     InstrumentType,
     OpportunityResponse,
 )
@@ -63,6 +64,15 @@ _DISTRIBUTION_HISTORY_CONFLICT_REASON = (
     "Recent distribution history contains unresolved source observations"
 )
 _QUALITY_RESOLUTION_FAILED = "QUALITY_RESOLUTION_FAILED"
+# B3 identifies these exact listings as units, and their issuers document one
+# common plus two preferred shares per certificate. An ISIN mismatch must not
+# transfer the conversion to another security.
+# https://ri.btgpactual.com/governanca-corporativa/composicao-societaria/
+# https://ri.taesa.com.br/governanca-corporativa/estatuto/
+_VERIFIED_UNIT_SHARES = {
+    ("BPAC11", "BRBPACUNT006"): 3,
+    ("TAEE11", "BRTAEECDAM10"): 3,
+}
 
 
 @dataclass(frozen=True)
@@ -399,6 +409,7 @@ class QualityFactsService:
             peers,
             macro,
             bank,
+            unit_share_count=_verified_unit_share_count(instrument),
         )
 
     async def _international_facts(
@@ -554,6 +565,37 @@ def _opportunity_identity_unavailable(opportunity: OpportunityResponse | None) -
     )
 
 
+def _verified_unit_share_count(instrument: InstrumentMetadata) -> int | None:
+    if instrument.instrument_type is not InstrumentType.unit or instrument.source != "b3":
+        return None
+    return _VERIFIED_UNIT_SHARES.get((instrument.ticker.upper(), (instrument.isin or "").upper()))
+
+
+def _shares_for_per_instrument_checks(
+    shares: Decimal | None,
+    period: FinancialPeriod,
+    snapshot: FundamentalsSnapshot,
+    *,
+    unit_share_count: int | None,
+) -> Decimal | None:
+    """Use the unit basis only when both public ratios agree with filing totals."""
+    if shares is None or shares <= 0 or unit_share_count is None:
+        return shares
+    comparisons = (
+        (period.net_income, snapshot.earnings_per_share),
+        (period.equity, snapshot.book_value_per_share),
+    )
+    for total, reported in comparisons:
+        if total is None or reported is None or reported == 0:
+            return shares
+        per_share = total / shares
+        per_unit = per_share * unit_share_count
+        denominator = max(abs(per_unit), abs(reported), Decimal("0.000001"))
+        if abs(per_unit - reported) / denominator > Decimal("0.10"):
+            return shares
+    return shares / unit_share_count
+
+
 def _financial_facts(
     request: QualityAssetRequest,
     snapshot: FundamentalsSnapshot,
@@ -562,6 +604,8 @@ def _financial_facts(
     peers: list[SectorCompany],
     macro: MacroQualitySnapshot | None,
     bank: BankQualitySnapshot | None,
+    *,
+    unit_share_count: int | None = None,
 ) -> QualityAssetFacts:
     period = snapshot.trailing_twelve_months
     if period is None:
@@ -577,6 +621,12 @@ def _financial_facts(
         key=lambda item: item.period_end,
     )
     reference_shares = snapshot.shares_outstanding or period.shares_outstanding
+    reference_shares = _shares_for_per_instrument_checks(
+        reference_shares,
+        period,
+        snapshot,
+        unit_share_count=unit_share_count,
+    )
     profile = _stock_profile(snapshot.sector, snapshot.company_name)
     recent = annual[-5:]
     facts = [

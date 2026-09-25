@@ -522,6 +522,58 @@ async def test_resolves_complete_domestic_stock_quality_facts() -> None:
     assert fundamentals.calls == ["TEST3"]
 
 
+@pytest.mark.parametrize(
+    ("ticker", "isin", "instrument_type", "book_value_per_share", "source", "expected_error"),
+    [
+        ("BPAC11", "BRBPACUNT006", InstrumentType.unit, "18", "b3", Decimal("0")),
+        ("TAEE11", "BRTAEECDAM10", InstrumentType.unit, "18", "b3", Decimal("0")),
+        ("TAEE11", "BRTAEECDAM10", InstrumentType.stock, "18", "b3", Decimal("2") / 3),
+        ("TAEE11", "BRDIFFERENT00", InstrumentType.unit, "18", "b3", Decimal("2") / 3),
+        ("TAEE11", "BRTAEECDAM10", InstrumentType.unit, "6", "b3", Decimal("2") / 3),
+        ("TAEE11", "BRTAEECDAM10", InstrumentType.unit, None, "b3", Decimal("2") / 3),
+        ("TAEE11", "BRTAEECDAM10", InstrumentType.unit, "18", "other", Decimal("2") / 3),
+    ],
+)
+async def test_unit_consistency_requires_verified_identity_and_agreeing_ratios(
+    ticker: str,
+    isin: str,
+    instrument_type: InstrumentType,
+    book_value_per_share: str | None,
+    source: str,
+    expected_error: Decimal,
+) -> None:
+    instrument = InstrumentMetadata(
+        ticker=ticker,
+        name=ticker,
+        instrument_type=instrument_type,
+        isin=isin,
+        source=source,
+    )
+    snapshot = stock_snapshot().model_copy(
+        update={
+            "earnings_per_share": Decimal("3.6"),
+            "book_value_per_share": (
+                Decimal(book_value_per_share) if book_value_per_share is not None else None
+            ),
+        }
+    )
+    service = QualityFactsService(
+        FundamentalsStub(snapshot),  # type: ignore[arg-type]
+        InstrumentsStub({ticker: instrument_data(ticker, instrument)}),  # type: ignore[arg-type]
+        OpportunityStub({ticker: opportunity(ticker, instrument)}),  # type: ignore[arg-type]
+    )
+
+    request = QualityFactsRequest(
+        assets=[QualityAssetRequest(ticker=ticker, kind=QualityAssetKind.stock)]
+    )
+    response = await service.resolve(request)
+
+    facts = {fact.key: fact for fact in response.assets[0].facts}
+    assert facts["earnings_per_share_consistency_error"].value == expected_error
+    if expected_error == 0:
+        assert facts["book_value_per_share_consistency_error"].value == Decimal("0")
+
+
 async def test_quality_reuses_provided_domestic_stock_identity_without_lookup() -> None:
     instrument = InstrumentMetadata(
         ticker="TEST3",
