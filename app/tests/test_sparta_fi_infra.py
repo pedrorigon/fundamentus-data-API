@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -247,3 +248,29 @@ async def test_provider_rejects_missing_publication_time_for_historical_slot() -
 
     with pytest.raises(ProviderUnavailableError):
         await provider.distributions(as_of=date(2026, 9, 25))
+
+
+@pytest.mark.asyncio
+async def test_provider_shares_one_official_download_across_concurrent_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reader(monkeypatch)
+    requests = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            content=b"%PDF-fixture",
+            headers={"Last-Modified": "Thu, 03 Sep 2026 18:24:42 GMT"},
+        )
+
+    provider = SpartaDistributionProvider(transport=httpx.MockTransport(respond))
+    results = await asyncio.gather(
+        *(provider.distributions(as_of=date(2026, 9, 25)) for _ in range(10))
+    )
+
+    assert requests == 1
+    assert all(result == results[0] for result in results)
+    assert sum((row.value for row in results[0]), Decimal("0")) == Decimal("10.00")
