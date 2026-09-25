@@ -8,10 +8,12 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
+from sqlite3 import Error as SQLiteError
 from time import monotonic
 from typing import TYPE_CHECKING
 
 import httpx
+from psycopg import OperationalError
 from selectolax.parser import HTMLParser
 
 from app.config import Settings
@@ -520,7 +522,7 @@ class OpportunityService:
                     for event in await self.income_store.events([normalized], to_date=today)
                     if event.updated_at <= reference_time
                 ]
-            except Exception:
+            except (OSError, SQLiteError, OperationalError):
                 # The income register enriches this endpoint. A storage outage
                 # remains explicit while the independent market sources work.
                 source_failures[SOURCE_INCOME_STORE] = "STORE_UNAVAILABLE"

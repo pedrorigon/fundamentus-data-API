@@ -736,10 +736,13 @@ async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> No
         requested: tuple[list[str], date] | None = None
         amount = "1"
         unavailable = False
+        unexpected = False
 
         async def events(self, tickers: list[str], *, to_date: date) -> list[CanonicalIncomeEvent]:
             if self.unavailable:
-                raise RuntimeError("store unavailable")
+                raise OSError("store unavailable")
+            if self.unexpected:
+                raise RuntimeError("unexpected store failure")
             self.requested = (tickers, to_date)
             future = _juro_income_event("9").model_copy(
                 update={
@@ -803,6 +806,11 @@ async def test_juro11_service_reconciles_manager_months_with_verified_b3() -> No
         "income_store": "STORE_UNAVAILABLE",
         "sparta_manager": "PROVIDER_UNAVAILABLE",
     }
+
+    store.unavailable = False
+    store.unexpected = True
+    with pytest.raises(RuntimeError, match="unexpected store failure"):
+        await service.opportunity("JURO11", as_of=reference)
 
 
 def test_manager_history_is_withheld_when_verified_b3_disagrees() -> None:
