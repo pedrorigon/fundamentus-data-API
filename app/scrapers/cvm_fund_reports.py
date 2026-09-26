@@ -367,7 +367,7 @@ def parse_fiagro_reports(
             if not _same_isin(_text(row.get("Codigo_ISIN")), instrument.isin):
                 continue
             cnpj = _digits(row.get("CNPJ_Classe"))
-            point = _monthly_report(row, percentage_points=True)
+            point = _monthly_report(row, percentage_points=True, assets=_fiagro_assets(row))
             if cnpj and point is not None:
                 matches.append(
                     (
@@ -381,6 +381,37 @@ def parse_fiagro_reports(
     _score, cnpj, _point = max(matches, key=lambda item: item[0])
     reports = tuple(item[2] for item in matches if item[1] == cnpj)
     return FundReportSeries(cnpj=cnpj, reports=_latest_version_by_date(reports))
+
+
+# FIAGRO reports use their own chart of assets.  Rural land is the property
+# exposure, and only direct credit instruments count as credit: holdings of
+# other funds stay outside, as fund quotas do for real estate funds.
+_FIAGRO_CREDIT_FIELDS = (
+    "Titulos_Securitizacao",
+    "Valor_Titulos_Credito",
+    "Titulos_Divida_Corporativa",
+    "LCA",
+    "LCI",
+    "Direitos_Creditorios_Agronegocio",
+    "Direitos_Creditorios_Imoveis_Rurais",
+    "Demais_Direitos_Creditorios",
+)
+
+
+def _fiagro_assets(row: dict[str, str]) -> dict[str, str]:
+    """Express a FIAGRO asset breakdown in the real estate fund fields."""
+    credit = _sum_fields(row, _FIAGRO_CREDIT_FIELDS)
+    return {
+        key: value
+        for key, value in (
+            ("Valor_Ativo", row.get("Valor_Ativo")),
+            ("Total_Passivo", row.get("Total_Passivo")),
+            ("Direitos_Bens_Imoveis", row.get("Imoveis_Rurais")),
+            ("Total_Necessidades_Liquidez", row.get("Total_Necessidades_Liquidez")),
+            ("CRI_CRA", None if credit is None else str(credit)),
+        )
+        if value
+    }
 
 
 def parse_daily_fund_reports(payload: bytes, cnpj: str) -> tuple[FundReportPoint, ...]:

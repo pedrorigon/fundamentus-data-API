@@ -152,6 +152,43 @@ def test_fiagro_parser_accepts_legacy_isin_check_digits() -> None:
     assert result.reports[0].monthly_distribution_yield == Decimal("0.0112")
 
 
+def test_fiagro_parser_maps_asset_breakdown_to_fund_fields() -> None:
+    header = (
+        "CNPJ_Classe;Nome_Classe;Data_Referencia;Codigo_ISIN;Valor_Patrimonial_Cotas;"
+        "Dividend_Yield_Mes;Cotas_Emitidas;Valor_Ativo;Total_Passivo;Total_Necessidades_Liquidez;"
+        "Imoveis_Rurais;Titulos_Securitizacao;CRA;CRI;Valor_Titulos_Credito;CPR;"
+        "Cotas_Fundos_Investimento;FIAGRO\n"
+    )
+    # Values of the Kinea Credito Agro report for August 2026; subtotals and
+    # their components are both present and must not be added twice.
+    row = (
+        "41745701000137;KINEA CREDITO AGRO;2026-08-01;BRKNCACTF014;100.12;0.85;21599919;"
+        "2183328169.43;20743852.51;435397057.07;;1316018389.86;1251159155.09;64859234.77;"
+        "133188620.97;133188620.97;298594736.08;298594736.08\n"
+    )
+    payload = _zip(
+        {
+            "inf_mensal_fiagro_202608.csv": header + row,
+            "inf_mensal_fiagro_subclasse_202608.csv": "CNPJ_Classe;Nome_Subclasse\n",
+        }
+    )
+    instrument = InstrumentMetadata(
+        ticker="KNCA11",
+        name="KINEA CREDITO AGRO FIAGRO",
+        instrument_type=InstrumentType.fiagro,
+        isin="BRKNCACTF014",
+    )
+
+    report = parse_fiagro_reports(payload, instrument).reports[0]
+
+    assert report.total_assets == Decimal("2183328169.43")
+    assert report.total_liabilities == Decimal("20743852.51")
+    assert report.liquid_assets == Decimal("435397057.07")
+    assert report.credit_assets == Decimal("1449207010.83")
+    assert report.property_assets is None
+    assert report.issued_shares == Decimal("21599919")
+
+
 def test_daily_fund_parser_keeps_the_last_nav_of_each_month() -> None:
     payload = _zip(
         {
