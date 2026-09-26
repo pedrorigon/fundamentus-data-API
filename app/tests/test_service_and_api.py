@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import NoReturn
 
 import httpx
 import pytest
@@ -144,6 +145,143 @@ async def test_singleflight_coalesces_concurrent_scrapes() -> None:
     results = await asyncio.gather(*[service.get_details("ITUB4") for _ in range(8)])
     assert all(details.ticker == "ITUB4" for details, _cached in results)
     assert scraper.details_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_asset_cancels_sibling_when_details_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = await make_service(FakeScraper())
+    details_started = asyncio.Event()
+    dividends_started = asyncio.Event()
+    fail_details = asyncio.Event()
+    dividends_cancelled = asyncio.Event()
+
+    async def failing_details(ticker: str, *, force_refresh: bool = False) -> NoReturn:
+        details_started.set()
+        await fail_details.wait()
+        raise RuntimeError("details failed")
+
+    async def hanging_dividends(
+        ticker: str,
+        *,
+        period: object | None = None,
+        as_of: object | None = None,
+        force_refresh: bool = False,
+    ) -> NoReturn:
+        dividends_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            dividends_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, "get_details", failing_details)
+    monkeypatch.setattr(service, "get_dividends", hanging_dividends)
+    request = asyncio.create_task(service.get_asset("ITUB4"))
+
+    await asyncio.wait_for(details_started.wait(), timeout=1)
+    await asyncio.wait_for(dividends_started.wait(), timeout=1)
+    fail_details.set()
+
+    with pytest.raises(RuntimeError, match="details failed"):
+        await request
+
+    assert dividends_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_get_asset_cancels_sibling_when_dividends_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = await make_service(FakeScraper())
+    details_started = asyncio.Event()
+    dividends_started = asyncio.Event()
+    fail_dividends = asyncio.Event()
+    details_cancelled = asyncio.Event()
+
+    async def hanging_details(ticker: str, *, force_refresh: bool = False) -> NoReturn:
+        details_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            details_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    async def failing_dividends(
+        ticker: str,
+        *,
+        period: object | None = None,
+        as_of: object | None = None,
+        force_refresh: bool = False,
+    ) -> NoReturn:
+        dividends_started.set()
+        await fail_dividends.wait()
+        raise RuntimeError("dividends failed")
+
+    monkeypatch.setattr(service, "get_details", hanging_details)
+    monkeypatch.setattr(service, "get_dividends", failing_dividends)
+    request = asyncio.create_task(service.get_asset("ITUB4"))
+
+    await asyncio.wait_for(details_started.wait(), timeout=1)
+    await asyncio.wait_for(dividends_started.wait(), timeout=1)
+    fail_dividends.set()
+
+    with pytest.raises(RuntimeError, match="dividends failed"):
+        await request
+
+    assert details_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_get_asset_cancels_all_children_when_request_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = await make_service(FakeScraper())
+    details_started = asyncio.Event()
+    dividends_started = asyncio.Event()
+    details_cancelled = asyncio.Event()
+    dividends_cancelled = asyncio.Event()
+
+    async def hanging_details(ticker: str, *, force_refresh: bool = False) -> NoReturn:
+        details_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            details_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    async def hanging_dividends(
+        ticker: str,
+        *,
+        period: object | None = None,
+        as_of: object | None = None,
+        force_refresh: bool = False,
+    ) -> NoReturn:
+        dividends_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            dividends_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, "get_details", hanging_details)
+    monkeypatch.setattr(service, "get_dividends", hanging_dividends)
+    request = asyncio.create_task(service.get_asset("ITUB4"))
+
+    await asyncio.wait_for(details_started.wait(), timeout=1)
+    await asyncio.wait_for(dividends_started.wait(), timeout=1)
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert details_cancelled.is_set()
+    assert dividends_cancelled.is_set()
 
 
 @pytest.mark.asyncio

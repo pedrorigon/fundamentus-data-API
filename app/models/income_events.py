@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import Field, field_validator
 
@@ -93,6 +94,14 @@ class IncomeSourceCoverage(APIModel):
 class IncomeEventRefreshRequest(APIModel):
     instruments: list[IncomeInstrumentRequest] = Field(min_length=1, max_length=100)
     as_of: date | None = None
+    mode: Literal["sync", "async"] = "sync"
+
+
+class IncomeEventBackfillRequest(APIModel):
+    """A bounded bulk request for the official B3/CVM backfill job."""
+
+    instruments: list[IncomeInstrumentRequest] = Field(min_length=1, max_length=500)
+    as_of: date | None = None
 
 
 class IncomeEventRefreshResponse(APIModel):
@@ -101,6 +110,47 @@ class IncomeEventRefreshResponse(APIModel):
     published: int
     failed_sources: list[str] = Field(default_factory=list)
     cursor: int
+
+
+class IncomeEventAsyncRefreshResponse(APIModel):
+    job_id: str
+    status: str
+    requested: int
+    queued: int
+    deduplicated: int
+
+
+class IncomeEventRefreshJobItem(APIModel):
+    source: str
+    ticker: str
+    status: str
+    attempts: int
+    last_error: str | None = None
+
+
+class IncomeEventRefreshJobResponse(APIModel):
+    job_id: str
+    status: str
+    requested: int
+    completed: int
+    failed: int
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    items: list[IncomeEventRefreshJobItem] = Field(default_factory=list)
+
+
+class IncomeEventCoverageItem(APIModel):
+    source: str
+    ticker: str
+    status: str
+    complete: bool
+    observed_at: datetime
+    detail: str | None = None
+
+
+class IncomeEventCoverageResponse(APIModel):
+    items: list[IncomeEventCoverageItem] = Field(default_factory=list)
 
 
 class IncomeEventBatchRequest(APIModel):
@@ -129,10 +179,16 @@ class IncomeEventChangesResponse(APIModel):
 
 __all__ = [
     "CanonicalIncomeEvent",
+    "IncomeEventAsyncRefreshResponse",
+    "IncomeEventBackfillRequest",
     "IncomeEventBatchRequest",
     "IncomeEventBatchResponse",
     "IncomeEventChangesResponse",
+    "IncomeEventCoverageItem",
+    "IncomeEventCoverageResponse",
     "IncomeEventObservation",
+    "IncomeEventRefreshJobItem",
+    "IncomeEventRefreshJobResponse",
     "IncomeEventRefreshRequest",
     "IncomeEventRefreshResponse",
     "IncomeEventStatus",

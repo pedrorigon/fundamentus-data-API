@@ -285,3 +285,107 @@ async def test_bank_provider_retries_transient_capital_failures() -> None:
 
     assert capital_attempts == 2
     assert result.basel_ratio == Decimal("0.18")
+
+
+@pytest.mark.asyncio
+async def test_bank_provider_uses_bounded_lru_cache() -> None:
+    registrations = [
+        {
+            "NomeInstituicao": f"BANCO {name} S.A.",
+            "CodConglomeradoPrudencial": name,
+            "CodInst": name,
+            "Td": "I",
+        }
+        for name in ("ALFA", "BETA", "GAMA")
+    ]
+    capital_calls: list[str] = []
+    registration_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal registration_calls
+        path = request.url.path
+        if "IfDataCadastro" in path:
+            registration_calls += 1
+            return httpx.Response(200, json={"value": registrations})
+        if "Relatorio='5'" in path:
+            code = request.url.params["$filter"].split("'")[1]
+            capital_calls.append(code)
+            return httpx.Response(
+                200,
+                json={"value": [{"Conta": "79664", "Saldo": "0.15"}]},
+            )
+        if "AnoMes=202412" in path:
+            return httpx.Response(
+                200,
+                json={"value": [{"NomeColuna": "Total Geral", "Saldo": "100"}]},
+            )
+        return httpx.Response(200, json={"value": []})
+
+    provider = BcbBankProvider(
+        Settings(memory_cache_max_entries=2),
+        httpx.MockTransport(handler),
+    )
+    reference = date(2026, 7, 30)
+
+    assert (await provider.snapshot("Banco Alfa", reference)).basel_ratio == Decimal("0.15")
+    assert (await provider.snapshot("Banco Beta", reference)).basel_ratio == Decimal("0.15")
+    # A hit promotes ALFA, so GAMA evicts BETA as the least recently used item.
+    assert (await provider.snapshot("Banco Alfa", reference)).basel_ratio == Decimal("0.15")
+    assert (await provider.snapshot("Banco Gama", reference)).basel_ratio == Decimal("0.15")
+    assert (await provider.snapshot("Banco Alfa", reference)).basel_ratio == Decimal("0.15")
+    assert (await provider.snapshot("Banco Beta", reference)).basel_ratio == Decimal("0.15")
+
+    assert registration_calls == 1
+    assert capital_calls == ["ALFA", "BETA", "GAMA", "BETA"]
+
+
+@pytest.mark.asyncio
+async def test_bank_provider_separates_cache_entries_by_capital_period() -> None:
+    capital_calls: list[str] = []
+    registration_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal registration_calls
+        path = request.url.path
+        if "IfDataCadastro" in path:
+            registration_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "NomeInstituicao": "BANCO ALFA S.A.",
+                            "CodConglomeradoPrudencial": "ALFA",
+                            "CodInst": "ALFA",
+                            "Td": "I",
+                        }
+                    ]
+                },
+            )
+        if "Relatorio='5'" in path:
+            capital_calls.append(request.url.params["$filter"].split("'")[1])
+            return httpx.Response(
+                200,
+                json={"value": [{"Conta": "79664", "Saldo": "0.15"}]},
+            )
+        if "AnoMes=202412" in path:
+            return httpx.Response(
+                200,
+                json={"value": [{"NomeColuna": "Total Geral", "Saldo": "100"}]},
+            )
+        return httpx.Response(200, json={"value": []})
+
+    provider = BcbBankProvider(Settings(), httpx.MockTransport(handler))
+    before_q2_disclosure = date(2026, 7, 30)
+    after_q2_disclosure = date(2026, 8, 31)
+
+    first = await provider.snapshot("Banco Alfa", before_q2_disclosure)
+    assert first.capital_as_of == date(2026, 3, 1)
+    assert (await provider.snapshot("Banco Alfa", before_q2_disclosure)) is first
+
+    second = await provider.snapshot("Banco Alfa", after_q2_disclosure)
+    assert second.capital_as_of == date(2026, 6, 1)
+    assert (await provider.snapshot("Banco Alfa", after_q2_disclosure)) is second
+
+    assert registration_calls == 2
+    assert capital_calls == ["ALFA", "ALFA"]

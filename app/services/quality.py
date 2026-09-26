@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import unicodedata
-from collections.abc import Callable, Iterable
+from calendar import monthrange
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
+from typing import Any, cast
+
+import httpx
 
 from app.core.errors import APIError
 from app.models import (
     FinancialPeriod,
     FundamentalsSnapshot,
+    FundCreditPortfolio,
     FundDistribution,
+    FundMonthlyDistribution,
     FundMonthlyReport,
     InstrumentDataResponse,
+    InstrumentMetadata,
     InstrumentType,
     OpportunityResponse,
 )
+from app.models.assets import FundDistributionEvidence
 from app.models.fundamentals import SectorCompany
 from app.models.quality import (
     QualityAssetFacts,
@@ -33,6 +43,7 @@ from app.services.bcb_quality import (
     BcbMacroProvider,
     MacroQualitySnapshot,
 )
+from app.services.fund_units import normalize_fund_units
 from app.services.fundamentals import FundamentalsService
 from app.services.market import InstrumentDataService
 from app.services.opportunity import OpportunityService
@@ -45,6 +56,72 @@ _FCF_CONFIDENCE = Decimal("0.65")
 _PEER_CONFIDENCE = Decimal("0.80")
 _MARKET_CONFIDENCE = Decimal("0.85")
 _BCB_CONFIDENCE = Decimal("0.98")
+_LOGGER = logging.getLogger(__name__)
+_MISSING_OPPORTUNITY = object()
+_MISSING_FUNDAMENTALS = object()
+_RESOLVED_DISTRIBUTION_STATUSES = frozenset({"consensus", "single_source"})
+_DISTRIBUTION_HISTORY_CONFLICT_REASON = (
+    "Recent distribution history contains unresolved source observations"
+)
+_QUALITY_RESOLUTION_FAILED = "QUALITY_RESOLUTION_FAILED"
+# B3 identifies these exact listings as units, and their issuers document one
+# common plus two preferred shares per certificate. An ISIN mismatch must not
+# transfer the conversion to another security.
+# https://ri.btgpactual.com/governanca-corporativa/composicao-societaria/
+# https://ri.taesa.com.br/governanca-corporativa/estatuto/
+_VERIFIED_UNIT_SHARES = {
+    ("BPAC11", "BRBPACUNT006"): 3,
+    ("TAEE11", "BRTAEECDAM10"): 3,
+}
+
+
+@dataclass(frozen=True)
+class _DistributionProvenance:
+    """Selected and observed origins for fund distribution facts."""
+
+    sources: tuple[str, ...] = ()
+    independent_sources: tuple[str, ...] = ()
+    source_lineage: tuple[str, ...] = ()
+    confidence: Decimal = Decimal("0")
+    observed_sources: tuple[str, ...] = ()
+
+    @property
+    def label(self) -> str:
+        return ",".join(self.sources)
+
+    @property
+    def independent_source_count(self) -> int:
+        return len(self.independent_sources)
+
+
+@dataclass(frozen=True)
+class _DistributionPeriod:
+    as_of: date
+    value: Decimal
+    source: str
+
+
+def _distribution_periods(
+    distributions: list[FundDistribution],
+    monthly: list[FundMonthlyDistribution],
+) -> list[_DistributionPeriod]:
+    if monthly:
+        return [
+            _DistributionPeriod(
+                as_of=date(
+                    item.reference_month.year,
+                    item.reference_month.month,
+                    monthrange(item.reference_month.year, item.reference_month.month)[1],
+                ),
+                value=item.value,
+                source=item.source,
+            )
+            for item in sorted(monthly, key=lambda item: item.reference_month)
+        ]
+    return [
+        _DistributionPeriod(as_of=item.ex_date, value=item.value, source=item.source)
+        for item in distributions
+    ]
 
 
 class QualityFactsService:
@@ -66,7 +143,13 @@ class QualityFactsService:
         self.bank_provider = bank_provider
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 
-    async def resolve(self, request: QualityFactsRequest) -> QualityFactsResponse:
+    async def resolve(
+        self,
+        request: QualityFactsRequest,
+        *,
+        opportunity_by_ticker: Mapping[str, OpportunityResponse | None] | None = None,
+        fundamentals_by_ticker: Mapping[str, FundamentalsSnapshot | None] | None = None,
+    ) -> QualityFactsResponse:
         has_stocks = any(asset.kind is QualityAssetKind.stock for asset in request.assets)
         sector_task = (
             asyncio.create_task(self.fundamentals.sector_universe())
@@ -78,25 +161,72 @@ class QualityFactsService:
             if has_stocks and self.macro_provider is not None
             else None
         )
-        assets = await asyncio.gather(
-            *(self._bounded(asset, sector_task, macro_task) for asset in request.assets)
-        )
-        return QualityFactsResponse(assets=list(assets), refreshed_at=datetime.now(UTC))
+        shared_tasks = tuple(task for task in (sector_task, macro_task) if task is not None)
+        try:
+            assets = await asyncio.gather(
+                *(
+                    self._bounded(
+                        asset,
+                        sector_task,
+                        macro_task,
+                        opportunity_by_ticker=opportunity_by_ticker,
+                        fundamentals_by_ticker=fundamentals_by_ticker,
+                    )
+                    for asset in request.assets
+                )
+            )
+            return QualityFactsResponse(assets=list(assets), refreshed_at=datetime.now(UTC))
+        finally:
+            # These tasks are shared by every stock in the batch.  If the
+            # request is cancelled or one asset fails before consumers await
+            # them, stop their provider work and wait for cleanup to finish.
+            await _cancel_and_wait(shared_tasks)
 
     async def _bounded(
         self,
         asset: QualityAssetRequest,
         sector_task: asyncio.Task[dict[str, list[SectorCompany]]] | None,
         macro_task: asyncio.Task[MacroQualitySnapshot] | None,
+        *,
+        opportunity_by_ticker: Mapping[str, OpportunityResponse | None] | None,
+        fundamentals_by_ticker: Mapping[str, FundamentalsSnapshot | None] | None,
     ) -> QualityAssetFacts:
         async with self._semaphore:
             try:
-                return await self._resolve_asset(asset, sector_task, macro_task)
+                return await self._resolve_asset(
+                    asset,
+                    sector_task,
+                    macro_task,
+                    opportunity_by_ticker=opportunity_by_ticker,
+                    fundamentals_by_ticker=fundamentals_by_ticker,
+                )
             except APIError as error:
                 return QualityAssetFacts(
                     ticker=asset.ticker,
                     kind=asset.kind,
                     unavailable_reason=error.message,
+                    error_code=error.code,
+                    retryable=error.retryable,
+                )
+            except (
+                httpx.HTTPError,
+                ArithmeticError,
+                AttributeError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                # A known transport/schema/provider boundary failure must not
+                # cancel the rest of a portfolio batch. Keep the public reason
+                # stable; detailed diagnostics stay in the server log.
+                _LOGGER.exception("quality resolution failed for %s", asset.ticker)
+                return QualityAssetFacts(
+                    ticker=asset.ticker,
+                    kind=asset.kind,
+                    unavailable_reason="Quality evidence unavailable",
+                    error_code=_QUALITY_RESOLUTION_FAILED,
+                    retryable=True,
                 )
 
     async def _resolve_asset(
@@ -104,6 +234,9 @@ class QualityFactsService:
         asset: QualityAssetRequest,
         sector_task: asyncio.Task[dict[str, list[SectorCompany]]] | None,
         macro_task: asyncio.Task[MacroQualitySnapshot] | None,
+        *,
+        opportunity_by_ticker: Mapping[str, OpportunityResponse | None] | None,
+        fundamentals_by_ticker: Mapping[str, FundamentalsSnapshot | None] | None,
     ) -> QualityAssetFacts:
         if asset.kind is QualityAssetKind.crypto:
             return _unsupported(asset, "Use a network-data provider for cryptocurrency quality")
@@ -111,51 +244,149 @@ class QualityFactsService:
             return _unsupported(asset, "Use issuer and instrument identifiers for credit quality")
 
         instrument_type = _instrument_type(asset.kind)
-        instrument_data, opportunity = await asyncio.gather(
-            self.instruments.get(asset.ticker, instrument_type),
-            self.opportunity.opportunity(asset.ticker),
-        )
         if asset.kind is QualityAssetKind.etf:
+            # ETF quality is derived entirely from the public fund profile;
+            # Opportunity's equity valuation call is optional and expensive.
+            instrument_data = await self.instruments.get(asset.ticker, instrument_type)
             return _etf_facts(asset, instrument_data)
+        provided = (
+            opportunity_by_ticker.get(asset.ticker)
+            if opportunity_by_ticker is not None and asset.ticker in opportunity_by_ticker
+            else _MISSING_OPPORTUNITY
+        )
+        opportunity: OpportunityResponse | None
+        if (
+            asset.kind is QualityAssetKind.stock
+            and provided is not _MISSING_OPPORTUNITY
+            and _has_domestic_stock_instrument(cast(OpportunityResponse | None, provided))
+        ):
+            # The assessment snapshot already resolved and persisted B3's
+            # authoritative identity. Re-querying the instrument directory
+            # here would perform the same B3 bulletin request a second time
+            # for the same ticker and calculation period.
+            return await self._stock_facts(
+                asset,
+                None,
+                cast(OpportunityResponse, provided),
+                sector_task,
+                macro_task,
+                fundamentals_by_ticker=fundamentals_by_ticker,
+            )
         if asset.kind is QualityAssetKind.real_estate_fund:
+            # Fund quality derives solely from reports and distributions on
+            # the opportunity response.  An instrument-directory request
+            # would duplicate I/O without contributing any facts.
+            opportunity = (
+                await self.opportunity.opportunity(asset.ticker)
+                if provided is _MISSING_OPPORTUNITY
+                else cast(OpportunityResponse | None, provided)
+            )
             return _fund_facts(asset, opportunity)
+        if provided is not _MISSING_OPPORTUNITY and _opportunity_identity_unavailable(
+            cast(OpportunityResponse | None, provided)
+        ):
+            # OpportunityService already attempted the B3 identity lookup and
+            # recorded its typed failure. Repeating the directory request here
+            # would spend the same provider budget twice for one assessment.
+            return await self._stock_facts(
+                asset,
+                None,
+                cast(OpportunityResponse, provided),
+                sector_task,
+                macro_task,
+                fundamentals_by_ticker=fundamentals_by_ticker,
+            )
+        if provided is _MISSING_OPPORTUNITY:
+            instrument_task = asyncio.create_task(
+                self.instruments.get(asset.ticker, instrument_type)
+            )
+            opportunity_task = asyncio.create_task(self.opportunity.opportunity(asset.ticker))
+            try:
+                instrument_data, opportunity = await asyncio.gather(
+                    instrument_task,
+                    opportunity_task,
+                )
+            except BaseException:
+                # ``asyncio.gather`` propagates the first provider exception
+                # without cancelling its siblings.  Stop and await both
+                # provider tasks so a failed opportunity lookup cannot leave
+                # an instrument request running after this asset is complete.
+                await _cancel_and_wait((instrument_task, opportunity_task))
+                raise
+        else:
+            instrument_data = await self.instruments.get(asset.ticker, instrument_type)
+            opportunity = cast(OpportunityResponse | None, provided)
         return await self._stock_facts(
             asset,
             instrument_data,
             opportunity,
             sector_task,
             macro_task,
+            fundamentals_by_ticker=fundamentals_by_ticker,
         )
 
     async def _stock_facts(
         self,
         asset: QualityAssetRequest,
-        instrument_data: InstrumentDataResponse,
-        opportunity: OpportunityResponse,
+        instrument_data: InstrumentDataResponse | None,
+        opportunity: OpportunityResponse | None,
         sector_task: asyncio.Task[dict[str, list[SectorCompany]]] | None,
         macro_task: asyncio.Task[MacroQualitySnapshot] | None,
+        *,
+        fundamentals_by_ticker: Mapping[str, FundamentalsSnapshot | None] | None,
     ) -> QualityAssetFacts:
-        instrument = opportunity.instrument or instrument_data.instrument
+        instrument = opportunity.instrument if opportunity is not None else None
+        if instrument is None and instrument_data is not None:
+            instrument = instrument_data.instrument
         if (
             instrument is None
             or instrument.category == "INTERNATIONAL"
             or instrument.instrument_type is InstrumentType.bdr
         ):
-            return await self._international_facts(asset, instrument_data, opportunity)
-        metrics = opportunity.metrics
-        snapshot = await self.fundamentals.snapshot(
-            asset.ticker,
-            instrument.name,
-            reference_shares=metrics.shares_outstanding.value,
-            earnings_per_share=metrics.earnings_per_share.value,
-            book_value_per_share=metrics.book_value_per_share.value,
-            recurring_dividends_per_share=metrics.dividends_12m.value,
-            supplemental_sources={
-                "earnings_per_share": ",".join(metrics.earnings_per_share.sources),
-                "book_value_per_share": ",".join(metrics.book_value_per_share.sources),
-                "recurring_dividends_per_share": ",".join(metrics.dividends_12m.sources),
-            },
+            if instrument_data is None:
+                return QualityAssetFacts(
+                    ticker=asset.ticker,
+                    kind=asset.kind,
+                    canonical_id=instrument.isin if instrument else None,
+                    unavailable_reason="Instrument metadata unavailable",
+                )
+            return await self._international_facts(
+                asset,
+                instrument_data,
+                opportunity,
+                fundamentals_by_ticker=fundamentals_by_ticker,
+            )
+        metrics = opportunity.metrics if opportunity is not None else None
+        provided_snapshot = (
+            fundamentals_by_ticker.get(asset.ticker)
+            if fundamentals_by_ticker is not None and asset.ticker in fundamentals_by_ticker
+            else _MISSING_FUNDAMENTALS
         )
+        if provided_snapshot is _MISSING_FUNDAMENTALS:
+            snapshot = await self.fundamentals.snapshot(
+                asset.ticker,
+                instrument.name,
+                reference_shares=metrics.shares_outstanding.value if metrics else None,
+                earnings_per_share=metrics.earnings_per_share.value if metrics else None,
+                book_value_per_share=metrics.book_value_per_share.value if metrics else None,
+                recurring_dividends_per_share=metrics.dividends_12m.value if metrics else None,
+                supplemental_sources={
+                    "earnings_per_share": ",".join(metrics.earnings_per_share.sources),
+                    "book_value_per_share": ",".join(metrics.book_value_per_share.sources),
+                    "recurring_dividends_per_share": ",".join(metrics.dividends_12m.sources),
+                }
+                if metrics
+                else None,
+            )
+        elif provided_snapshot is None:
+            return QualityAssetFacts(
+                ticker=asset.ticker,
+                kind=asset.kind,
+                canonical_id=instrument.isin,
+                unavailable_reason="Fundamentals evidence unavailable",
+            )
+        else:
+            snapshot = cast(FundamentalsSnapshot, provided_snapshot)
         sector_universe = await sector_task if sector_task is not None else {}
         macro = await macro_task if macro_task is not None else None
         profile = _stock_profile(
@@ -178,13 +409,15 @@ class QualityFactsService:
             peers,
             macro,
             bank,
+            unit_share_count=_verified_unit_share_count(instrument),
         )
 
     async def _international_facts(
         self,
         asset: QualityAssetRequest,
         instrument_data: InstrumentDataResponse,
-        opportunity: OpportunityResponse,
+        opportunity: OpportunityResponse | None,
+        fundamentals_by_ticker: Mapping[str, FundamentalsSnapshot | None] | None = None,
     ) -> QualityAssetFacts:
         """Quality evidence for a listing outside the CVM filing universe.
 
@@ -195,9 +428,25 @@ class QualityFactsService:
         international equivalent, so those inputs stay absent and their weight
         is redistributed by the consumer.
         """
-        instrument = opportunity.instrument or instrument_data.instrument
+        instrument = (
+            opportunity.instrument if opportunity is not None else None
+        ) or instrument_data.instrument
         underlying_ticker = instrument.underlying_ticker if instrument else None
-        if instrument is not None and instrument.instrument_type is InstrumentType.bdr:
+        provided_snapshot = (
+            fundamentals_by_ticker.get(asset.ticker)
+            if fundamentals_by_ticker is not None and asset.ticker in fundamentals_by_ticker
+            else _MISSING_FUNDAMENTALS
+        )
+        if provided_snapshot is None:
+            return QualityAssetFacts(
+                ticker=asset.ticker,
+                kind=asset.kind,
+                canonical_id=instrument.isin if instrument else None,
+                unavailable_reason="Fundamentals evidence unavailable",
+            )
+        if provided_snapshot is not _MISSING_FUNDAMENTALS:
+            snapshot = cast(FundamentalsSnapshot, provided_snapshot)
+        elif instrument is not None and instrument.instrument_type is InstrumentType.bdr:
             if not underlying_ticker:
                 return QualityAssetFacts(
                     ticker=asset.ticker,
@@ -266,14 +515,97 @@ def _instrument_type(kind: QualityAssetKind) -> InstrumentType:
     }.get(kind, InstrumentType.unknown)
 
 
+async def _cancel_and_wait(tasks: tuple[asyncio.Task[Any], ...]) -> None:
+    """Cancel provider children and await their cleanup before returning."""
+
+    pending = tuple(task for task in tasks if not task.done())
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _has_domestic_stock_instrument(opportunity: OpportunityResponse | None) -> bool:
+    """Whether an opportunity carries a trustworthy local equity identity.
+
+    ``OpportunityService`` obtains this metadata from the B3 bulletin. Stock
+    and unit records are both handled by the issuer fundamentals path, while
+    BDRs and explicitly international records must retain the market lookup so
+    their foreign evidence can be loaded.
+    """
+    instrument = opportunity.instrument if opportunity is not None else None
+    if instrument is None or instrument.source != "b3":
+        return False
+    if instrument.instrument_type not in {InstrumentType.stock, InstrumentType.unit}:
+        return False
+    if (instrument.category or "").strip().upper() == "INTERNATIONAL":
+        return False
+    if instrument.country is not None and instrument.country.strip().upper() not in {
+        "BR",
+        "BRA",
+        "BRAZIL",
+    }:
+        return False
+    if instrument.exchange is not None and instrument.exchange.strip().upper() not in {
+        "B3",
+        "BOVESPA",
+        "BM&FBOVESPA",
+    }:
+        return False
+    return True
+
+
+def _opportunity_identity_unavailable(opportunity: OpportunityResponse | None) -> bool:
+    """Whether the shared opportunity lookup already failed to resolve B3 identity."""
+
+    return (
+        opportunity is not None
+        and opportunity.instrument is None
+        and "b3" in opportunity.source_failures
+    )
+
+
+def _verified_unit_share_count(instrument: InstrumentMetadata) -> int | None:
+    if instrument.instrument_type is not InstrumentType.unit or instrument.source != "b3":
+        return None
+    return _VERIFIED_UNIT_SHARES.get((instrument.ticker.upper(), (instrument.isin or "").upper()))
+
+
+def _shares_for_per_instrument_checks(
+    shares: Decimal | None,
+    period: FinancialPeriod,
+    snapshot: FundamentalsSnapshot,
+    *,
+    unit_share_count: int | None,
+) -> Decimal | None:
+    """Use the unit basis only when both public ratios agree with filing totals."""
+    if shares is None or shares <= 0 or unit_share_count is None:
+        return shares
+    comparisons = (
+        (period.net_income, snapshot.earnings_per_share),
+        (period.equity, snapshot.book_value_per_share),
+    )
+    for total, reported in comparisons:
+        if total is None or reported is None or reported == 0:
+            return shares
+        per_share = total / shares
+        per_unit = per_share * unit_share_count
+        denominator = max(abs(per_unit), abs(reported), Decimal("0.000001"))
+        if abs(per_unit - reported) / denominator > Decimal("0.10"):
+            return shares
+    return shares / unit_share_count
+
+
 def _financial_facts(
     request: QualityAssetRequest,
     snapshot: FundamentalsSnapshot,
     isin: str | None,
-    opportunity: OpportunityResponse,
+    opportunity: OpportunityResponse | None,
     peers: list[SectorCompany],
     macro: MacroQualitySnapshot | None,
     bank: BankQualitySnapshot | None,
+    *,
+    unit_share_count: int | None = None,
 ) -> QualityAssetFacts:
     period = snapshot.trailing_twelve_months
     if period is None:
@@ -289,6 +621,12 @@ def _financial_facts(
         key=lambda item: item.period_end,
     )
     reference_shares = snapshot.shares_outstanding or period.shares_outstanding
+    reference_shares = _shares_for_per_instrument_checks(
+        reference_shares,
+        period,
+        snapshot,
+        unit_share_count=unit_share_count,
+    )
     profile = _stock_profile(snapshot.sector, snapshot.company_name)
     recent = annual[-5:]
     facts = [
@@ -393,7 +731,10 @@ def _financial_facts(
         *_macro_facts(recent, macro),
         *_peer_facts(period, peers),
         *_market_scale_facts(opportunity),
-        *_dividend_facts(annual, opportunity.fund_distributions),
+        *_dividend_facts(
+            annual,
+            opportunity.fund_distributions if opportunity is not None else [],
+        ),
         *_bank_facts(bank),
     ]
     facts, warnings = _validated_financial_facts(facts)
@@ -503,8 +844,8 @@ def _etf_facts(
             "net_assets",
             profile.net_assets,
             "currency",
-            reference,
-            profile.source,
+            profile.net_assets_date or reference,
+            profile.net_assets_source or profile.source,
         ),
         _value_fact(
             "fund_age_years",
@@ -555,69 +896,176 @@ def _etf_facts(
         canonical_id=data.instrument.isin if data.instrument else None,
         profile=_etf_profile(profile.description, profile.asset_types, profile.sectors),
         facts=facts,
-        sources=[profile.source],
+        sources=sorted(
+            source for source in {profile.source, profile.net_assets_source} if source is not None
+        ),
     )
 
 
 def _fund_facts(
     request: QualityAssetRequest,
-    opportunity: OpportunityResponse,
+    opportunity: OpportunityResponse | None,
 ) -> QualityAssetFacts:
     reports = sorted(
-        opportunity.fund_reports.reports if opportunity.fund_reports else [],
+        opportunity.fund_reports.reports
+        if opportunity is not None and opportunity.fund_reports
+        else [],
         key=lambda item: item.as_of,
     )
     distributions = sorted(
-        opportunity.fund_distributions,
+        opportunity.fund_distributions if opportunity is not None else [],
         key=lambda item: item.ex_date,
     )
-    source = _CVM_SOURCE
-    distribution_consistency = _distribution_report_consistency(reports, distributions)
+    units = normalize_fund_units(
+        request.ticker,
+        (
+            opportunity.fund_reports.cnpj
+            if opportunity is not None and opportunity.fund_reports
+            else None
+        ),
+        reports,
+        distributions,
+    )
+    reports = units.reports
+    distributions = units.distributions
+    monthly = opportunity.fund_monthly_distributions if opportunity is not None else []
+    credit_portfolio = opportunity.fund_credit_portfolio if opportunity is not None else None
+    periods = _distribution_periods(distributions, monthly)
+    distribution_evidence = (
+        opportunity.fund_distribution_evidence if opportunity is not None else []
+    )
+    unresolved_distribution_dates = _recent_unresolved_distribution_dates(distribution_evidence)
+    report_source = _CVM_SOURCE
+    distribution_provenance = _distribution_provenance(distributions, distribution_evidence)
+    if monthly:
+        monthly_sources = tuple(sorted({item.source for item in monthly}))
+        distribution_provenance = _DistributionProvenance(
+            sources=monthly_sources,
+            independent_sources=monthly_sources,
+            source_lineage=monthly_sources,
+            confidence=_CVM_CONFIDENCE,
+            observed_sources=tuple(
+                sorted({*distribution_provenance.observed_sources, *monthly_sources})
+            ),
+        )
+    # The manager series is complete and checked against exact-ISIN B3 cash
+    # events. An unrelated aggregator disagreement cannot invalidate it.
+    missing_distribution_reason = (
+        None
+        if monthly
+        else (
+            _DISTRIBUTION_HISTORY_CONFLICT_REASON
+            if unresolved_distribution_dates
+            else "Distribution quota basis is unresolved"
+            if units.uncertain_distributions
+            else None
+        )
+    )
+    if missing_distribution_reason is not None:
+        (
+            distribution_history,
+            distribution_stability,
+            distribution_frequency,
+            distribution_growth,
+            distribution_cuts,
+            distribution_consistency,
+        ) = _missing_distribution_facts(missing_distribution_reason)
+    else:
+        distribution_history = _value_fact(
+            "distribution_history_months",
+            Decimal(len(periods)) if periods else None,
+            "count",
+            periods[-1].as_of if periods else None,
+            distribution_provenance.label,
+            confidence=distribution_provenance.confidence,
+            source_lineage=distribution_provenance.source_lineage,
+            independent_source_count=distribution_provenance.independent_source_count,
+        )
+        distribution_stability = _distribution_stability(
+            periods,
+            provenance=distribution_provenance,
+        )
+        distribution_frequency = _positive_distribution_frequency(
+            periods,
+            provenance=distribution_provenance,
+        )
+        distribution_growth = _distribution_growth(
+            periods,
+            provenance=distribution_provenance,
+        )
+        distribution_cuts = _distribution_cut_frequency(
+            periods,
+            provenance=distribution_provenance,
+        )
+        distribution_consistency = _distribution_report_consistency(
+            reports,
+            periods,
+            provenance=distribution_provenance,
+        )
+        if units.uncertain_reports:
+            distribution_consistency = _missing_fact(
+                "distribution_report_consistency_error",
+                "ratio",
+                "Report quota basis is unresolved",
+            )
     latest = reports[-1] if reports else None
     profile = (
         request.profile
         if request.profile and request.profile != "indeterminado"
-        else _fund_profile(latest, opportunity.instrument)
+        else _fund_profile(latest, opportunity.instrument if opportunity is not None else None)
     )
+    nav_growth = _nav_growth(reports)
+    nav_volatility = _nav_return_volatility(reports)
+    nav_frequency = _positive_nav_return_frequency(reports)
+    nav_drawdown = _nav_max_drawdown(reports)
+    issuance_preservation = _issuance_nav_preservation(reports)
+    if units.uncertain_reports:
+        nav_growth = _missing_fact("nav_growth", "ratio", "Report quota basis is unresolved")
+        nav_volatility = _missing_fact(
+            "nav_return_volatility", "ratio", "Report quota basis is unresolved"
+        )
+        nav_frequency = _missing_fact(
+            "positive_nav_return_frequency", "ratio", "Report quota basis is unresolved"
+        )
+        nav_drawdown = _missing_fact(
+            "nav_max_drawdown", "ratio", "Report quota basis is unresolved"
+        )
+        issuance_preservation = _missing_fact(
+            "issuance_nav_preservation", "ratio", "Report quota basis is unresolved"
+        )
     facts = [
         _value_fact(
             "reporting_history_months",
             Decimal(len(reports)) if reports else None,
             "count",
             reports[-1].as_of if reports else None,
-            source,
+            report_source,
         ),
-        _value_fact(
-            "distribution_history_months",
-            Decimal(len(distributions)) if distributions else None,
-            "count",
-            distributions[-1].ex_date if distributions else None,
-            source,
-        ),
-        _distribution_stability(distributions),
-        _positive_distribution_frequency(distributions),
-        _distribution_growth(distributions),
-        _distribution_cut_frequency(distributions),
+        distribution_history,
+        distribution_stability,
+        distribution_frequency,
+        distribution_growth,
+        distribution_cuts,
         _reporting_regularity(reports),
         _report_completeness(reports),
-        _nav_growth(reports),
-        _nav_return_volatility(reports),
-        _positive_nav_return_frequency(reports),
-        _nav_max_drawdown(reports),
+        nav_growth,
+        nav_volatility,
+        nav_frequency,
+        nav_drawdown,
         distribution_consistency,
         _value_fact(
             "net_assets",
             latest.net_assets if latest else None,
             "currency",
             latest.as_of if latest else None,
-            source,
+            report_source,
         ),
         _value_fact(
             "shareholder_count",
             latest.shareholder_count if latest else None,
             "count",
             latest.as_of if latest else None,
-            source,
+            report_source,
         ),
         _value_fact(
             "fund_age_years",
@@ -626,19 +1074,19 @@ def _fund_facts(
             else None,
             "years",
             latest.as_of if latest else None,
-            source,
+            report_source,
         ),
         _value_fact(
             "administration_fee_ratio",
             latest.administration_fee_ratio if latest else None,
             "ratio",
             latest.as_of if latest else None,
-            source,
+            report_source,
         ),
         _administrator_stability(reports),
         _metric_fact(
             "daily_traded_value",
-            opportunity.metrics.average_daily_traded_value,
+            opportunity.metrics.average_daily_traded_value if opportunity is not None else None,
             "currency",
         ),
         _ratio(
@@ -665,36 +1113,202 @@ def _fund_facts(
             latest.total_assets if latest else None,
             latest.as_of if latest else None,
         ),
-        _issuance_nav_preservation(reports),
+        issuance_preservation,
         _shareholder_growth(reports),
         _nav_total_consistency(latest),
     ]
-    instrument = opportunity.instrument
+    if credit_portfolio is not None:
+        facts.extend(_fund_credit_facts(credit_portfolio))
+    instrument = opportunity.instrument if opportunity is not None else None
     warnings = (
         ["Distribution values diverge from the corresponding CVM monthly reports"]
         if distribution_consistency.value is not None
         and distribution_consistency.value > Decimal("0.25")
         else []
     )
+    if unresolved_distribution_dates and not monthly:
+        warnings.insert(
+            0,
+            f"{_DISTRIBUTION_HISTORY_CONFLICT_REASON}; "
+            "distribution-derived history facts were withheld",
+        )
+    warnings.extend(units.warnings)
+    has_distribution_history = bool(periods or distribution_evidence)
+    has_credit_portfolio = credit_portfolio is not None
+    has_fund_evidence = bool(reports or has_distribution_history or has_credit_portfolio)
+    market_metric = (
+        opportunity.metrics.average_daily_traded_value if opportunity is not None else None
+    )
+    sources = set(distribution_provenance.observed_sources)
+    sources.update(units.sources)
+    if reports:
+        sources.add(report_source)
+    if credit_portfolio is not None:
+        sources.add(credit_portfolio.source)
+    if market_metric is not None and market_metric.value is not None:
+        sources.update(market_metric.sources)
     return QualityAssetFacts(
         ticker=request.ticker,
         kind=request.kind,
         canonical_id=instrument.isin if instrument else None,
         profile=profile,
         facts=facts,
-        sources=(
-            [source, "fundamentus"]
-            if opportunity.metrics.average_daily_traded_value
-            and opportunity.metrics.average_daily_traded_value.value is not None
-            else [source]
-        )
-        if reports or distributions
-        else [],
+        sources=sorted(sources) if has_fund_evidence else [],
         warnings=warnings,
-        unavailable_reason=None
-        if reports or distributions
-        else "No public fund history was resolved",
+        unavailable_reason=None if has_fund_evidence else "No public fund history was resolved",
     )
+
+
+def _fund_credit_facts(portfolio: FundCreditPortfolio) -> list[QualityFact]:
+    """Expose disclosed composition as observations, without rating-to-loss assumptions."""
+
+    holdings = portfolio.holdings
+    values = (
+        ("credit_issue_count", Decimal(len(holdings)), "count"),
+        (
+            "credit_reported_weight",
+            sum((item.portfolio_weight for item in holdings), Decimal("0")),
+            "ratio",
+        ),
+        (
+            "credit_unrated_weight",
+            sum(
+                (item.portfolio_weight for item in holdings if item.disclosed_rating == "S/R"),
+                Decimal("0"),
+            ),
+            "ratio",
+        ),
+        (
+            "credit_largest_issue_weight",
+            max((item.portfolio_weight for item in holdings), default=Decimal("0")),
+            "ratio",
+        ),
+        ("credit_cash_weight", portfolio.cash_weight, "ratio"),
+    )
+    return [
+        _value_fact(
+            key,
+            value,
+            unit,
+            portfolio.report_as_of,
+            portfolio.source,
+            confidence=Decimal("0.55"),
+            source_lineage=(portfolio.source,),
+            independent_source_count=1,
+        )
+        for key, value, unit in values
+    ]
+
+
+def _missing_distribution_facts(reason: str) -> tuple[QualityFact, ...]:
+    return tuple(
+        _missing_fact(key, unit, reason)
+        for key, unit in (
+            ("distribution_history_months", "count"),
+            ("distribution_stability", "ratio"),
+            ("positive_distribution_frequency", "ratio"),
+            ("distribution_growth", "ratio"),
+            ("distribution_cut_frequency", "ratio"),
+            ("distribution_report_consistency_error", "ratio"),
+        )
+    )
+
+
+def _recent_unresolved_distribution_dates(
+    evidence: list[FundDistributionEvidence],
+) -> tuple[date, ...]:
+    """Return unresolved dates in the latest 36 unique distribution events."""
+
+    unresolved_by_date: dict[date, bool] = {}
+    for item in evidence:
+        unresolved = item.value is None or item.status not in _RESOLVED_DISTRIBUTION_STATUSES
+        unresolved_by_date[item.ex_date] = unresolved_by_date.get(item.ex_date, False) or unresolved
+    recent_dates = sorted(unresolved_by_date)[-36:]
+    return tuple(event_date for event_date in recent_dates if unresolved_by_date[event_date])
+
+
+def _distribution_provenance(
+    distributions: list[FundDistribution],
+    evidence: list[FundDistributionEvidence],
+) -> _DistributionProvenance:
+    """Resolve source metadata for the distribution values used by quality facts."""
+
+    observed_sources = set(_source_tokens(item.source for item in distributions))
+    observed_sources.update(_source_tokens(source for item in evidence for source in item.sources))
+    resolved = [
+        item
+        for item in evidence
+        if item.value is not None and item.status in _RESOLVED_DISTRIBUTION_STATUSES
+    ]
+    if resolved:
+        sources = set(_source_tokens(source for item in resolved for source in item.sources))
+        independent_sources = set(
+            _source_tokens(source for item in resolved for source in item.independent_sources)
+        )
+        lineage = set(_source_tokens(source for item in resolved for source in item.source_lineage))
+        confidences = [
+            item.confidence
+            for item in resolved
+            if item.confidence.is_finite() and item.confidence > 0
+        ]
+    else:
+        sources = set(observed_sources)
+        independent_sources = set(sources)
+        lineage = set(sources)
+        confidences = []
+    if not independent_sources:
+        independent_sources = set(sources)
+    if not lineage:
+        lineage = set(sources)
+    confidence = min(confidences, default=_distribution_confidence(sources))
+    return _DistributionProvenance(
+        sources=tuple(sorted(sources)),
+        independent_sources=tuple(sorted(independent_sources)),
+        source_lineage=tuple(sorted(lineage)),
+        confidence=confidence,
+        observed_sources=tuple(sorted(observed_sources)),
+    )
+
+
+def _source_tokens(values: Iterable[str]) -> tuple[str, ...]:
+    """Split compact source labels while keeping the result deterministic."""
+
+    return tuple(
+        sorted(
+            {
+                token.strip()
+                for value in values
+                for token in value.replace("+", ",").split(",")
+                if token.strip()
+            }
+        )
+    )
+
+
+def _distribution_confidence(sources: set[str]) -> Decimal:
+    if not sources:
+        return Decimal("0")
+    if sources == {_CVM_SOURCE}:
+        return _CVM_CONFIDENCE
+    if len(sources) >= 2:
+        return min(Decimal("1"), Decimal(len(sources)) / Decimal("3"))
+    return Decimal("0.55")
+
+
+def _distribution_fact_confidence(
+    provenance: _DistributionProvenance | None,
+    default: Decimal,
+) -> Decimal:
+    if provenance is None or provenance.confidence <= 0:
+        return default
+    return min(default, provenance.confidence)
+
+
+def _consistency_source(provenance: _DistributionProvenance | None) -> str:
+    sources = {_CVM_SOURCE}
+    if provenance is not None:
+        sources.update(provenance.sources)
+    return ",".join(sorted(sources))
 
 
 def _etf_profile(
@@ -1212,7 +1826,12 @@ def _peer_ratio_fact(
     )
 
 
-def _market_scale_facts(opportunity: OpportunityResponse) -> list[QualityFact]:
+def _market_scale_facts(opportunity: OpportunityResponse | None) -> list[QualityFact]:
+    if opportunity is None:
+        return [
+            _missing_fact("daily_traded_value", "currency", "Opportunity evidence unavailable"),
+            _missing_fact("market_capitalization", "currency", "Opportunity evidence unavailable"),
+        ]
     metrics = opportunity.metrics
     return [
         _metric_fact("daily_traded_value", metrics.average_daily_traded_value, "currency"),
@@ -1221,8 +1840,12 @@ def _market_scale_facts(opportunity: OpportunityResponse) -> list[QualityFact]:
 
 
 def _metric_fact(key: str, metric: object, unit: str) -> QualityFact:
+    if metric is None:
+        return _missing_fact(key, unit, "Opportunity evidence unavailable")
     value = getattr(metric, "value", None)
     sources = getattr(metric, "sources", [])
+    lineage = getattr(metric, "source_lineage", [])
+    independent_sources = getattr(metric, "independent_sources", [])
     reference = getattr(metric, "as_of", None)
     return _value_fact(
         key,
@@ -1231,6 +1854,8 @@ def _metric_fact(key: str, metric: object, unit: str) -> QualityFact:
         reference if isinstance(reference, date) else None,
         ",".join(str(source) for source in sources) or "public_market_data",
         confidence=_MARKET_CONFIDENCE,
+        source_lineage=tuple(str(source) for source in lineage),
+        independent_source_count=len(independent_sources),
     )
 
 
@@ -1485,7 +2110,11 @@ def _validated_financial_facts(
     return validated, warnings
 
 
-def _distribution_stability(distributions: list[FundDistribution]) -> QualityFact:
+def _distribution_stability(
+    distributions: list[_DistributionPeriod],
+    *,
+    provenance: _DistributionProvenance | None = None,
+) -> QualityFact:
     values = [item.value for item in distributions[-36:] if item.value >= 0]
     if len(values) < 6:
         return _missing_fact(
@@ -1502,12 +2131,19 @@ def _distribution_stability(distributions: list[FundDistribution]) -> QualityFac
         "distribution_stability",
         _safe_ratio(deviation, average),
         "ratio",
-        distributions[-1].ex_date,
-        _CVM_SOURCE,
+        distributions[-1].as_of,
+        (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
+        confidence=_distribution_fact_confidence(provenance, _CVM_CONFIDENCE),
+        source_lineage=provenance.source_lineage if provenance is not None else (),
+        independent_source_count=(provenance.independent_source_count if provenance else 0),
     )
 
 
-def _positive_distribution_frequency(distributions: list[FundDistribution]) -> QualityFact:
+def _positive_distribution_frequency(
+    distributions: list[_DistributionPeriod],
+    *,
+    provenance: _DistributionProvenance | None = None,
+) -> QualityFact:
     recent = distributions[-36:]
     if len(recent) < 6:
         return _missing_fact(
@@ -1520,12 +2156,19 @@ def _positive_distribution_frequency(distributions: list[FundDistribution]) -> Q
         "positive_distribution_frequency",
         Decimal(positive) / Decimal(len(recent)),
         "ratio",
-        recent[-1].ex_date,
-        _CVM_SOURCE,
+        recent[-1].as_of,
+        (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
+        confidence=_distribution_fact_confidence(provenance, _CVM_CONFIDENCE),
+        source_lineage=provenance.source_lineage if provenance is not None else (),
+        independent_source_count=(provenance.independent_source_count if provenance else 0),
     )
 
 
-def _distribution_growth(distributions: list[FundDistribution]) -> QualityFact:
+def _distribution_growth(
+    distributions: list[_DistributionPeriod],
+    *,
+    provenance: _DistributionProvenance | None = None,
+) -> QualityFact:
     recent = distributions[-36:]
     if len(recent) < 12:
         return _missing_fact(
@@ -1541,13 +2184,19 @@ def _distribution_growth(distributions: list[FundDistribution]) -> QualityFact:
         "distribution_growth",
         _safe_ratio(later - earlier, earlier),
         "ratio",
-        recent[-1].ex_date,
-        _CVM_SOURCE,
-        confidence=_DERIVED_CONFIDENCE,
+        recent[-1].as_of,
+        (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
+        confidence=_distribution_fact_confidence(provenance, _DERIVED_CONFIDENCE),
+        source_lineage=provenance.source_lineage if provenance is not None else (),
+        independent_source_count=(provenance.independent_source_count if provenance else 0),
     )
 
 
-def _distribution_cut_frequency(distributions: list[FundDistribution]) -> QualityFact:
+def _distribution_cut_frequency(
+    distributions: list[_DistributionPeriod],
+    *,
+    provenance: _DistributionProvenance | None = None,
+) -> QualityFact:
     recent = distributions[-36:]
     if len(recent) < 6:
         return _missing_fact(
@@ -1571,9 +2220,11 @@ def _distribution_cut_frequency(distributions: list[FundDistribution]) -> Qualit
         "distribution_cut_frequency",
         Decimal(cuts) / Decimal(len(comparable)),
         "ratio",
-        recent[-1].ex_date,
-        _CVM_SOURCE,
-        confidence=_DERIVED_CONFIDENCE,
+        recent[-1].as_of,
+        (provenance.label if provenance is not None and provenance.label else _CVM_SOURCE),
+        confidence=_distribution_fact_confidence(provenance, _DERIVED_CONFIDENCE),
+        source_lineage=provenance.source_lineage if provenance is not None else (),
+        independent_source_count=(provenance.independent_source_count if provenance else 0),
     )
 
 
@@ -1720,7 +2371,9 @@ def _nav_max_drawdown(reports: list[FundMonthlyReport]) -> QualityFact:
 
 def _distribution_report_consistency(
     reports: list[FundMonthlyReport],
-    distributions: list[FundDistribution],
+    distributions: list[_DistributionPeriod],
+    *,
+    provenance: _DistributionProvenance | None = None,
 ) -> QualityFact:
     report_values = {
         (item.as_of.year, item.as_of.month): item.nav_per_share * distribution_yield
@@ -1731,7 +2384,7 @@ def _distribution_report_consistency(
     errors = [
         abs(item.value - expected) / max(abs(item.value), abs(expected), Decimal("0.000001"))
         for item in distributions[-36:]
-        if (expected := report_values.get((item.ex_date.year, item.ex_date.month))) is not None
+        if (expected := report_values.get((item.as_of.year, item.as_of.month))) is not None
     ]
     if len(errors) < 6:
         return _missing_fact(
@@ -1751,8 +2404,14 @@ def _distribution_report_consistency(
         median_error,
         "ratio",
         reports[-1].as_of,
-        "cvm,public_distributions",
-        confidence=Decimal("0.85"),
+        _consistency_source(provenance),
+        confidence=_distribution_fact_confidence(provenance, Decimal("0.85")),
+        source_lineage=(
+            tuple(sorted({_CVM_SOURCE, *(provenance.source_lineage if provenance else ())}))
+        ),
+        independent_source_count=(
+            len({_CVM_SOURCE, *(provenance.independent_sources if provenance else ())})
+        ),
     )
 
 
@@ -1764,6 +2423,8 @@ def _value_fact(
     source: str,
     *,
     confidence: Decimal = _CVM_CONFIDENCE,
+    source_lineage: Iterable[str] = (),
+    independent_source_count: int = 0,
 ) -> QualityFact:
     return QualityFact(
         key=key,
@@ -1771,6 +2432,8 @@ def _value_fact(
         unit=unit,
         as_of=reference if value is not None else None,
         source=source if value is not None else None,
+        source_lineage=sorted(set(source_lineage)) if value is not None else [],
+        independent_source_count=(max(0, independent_source_count) if value is not None else 0),
         confidence=confidence if value is not None else Decimal("0"),
         status="valid" if value is not None else "missing_data",
         unavailable_reason=None if value is not None else "Public source did not provide this fact",

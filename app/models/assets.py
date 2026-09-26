@@ -140,6 +140,8 @@ class FundHolding(APIModel):
 
 class FundProfile(APIModel):
     net_assets: Decimal | None = None
+    net_assets_date: date | None = None
+    net_assets_source: str | None = None
     net_expense_ratio: Decimal | None = None
     portfolio_turnover: Decimal | None = None
     dividend_yield: Decimal | None = None
@@ -175,6 +177,24 @@ class MarketQuote(APIModel):
     source: str
 
 
+class OpportunityObservation(APIModel):
+    """One normalized source value retained for later reconciliation."""
+
+    value: Decimal
+    source: str
+    as_of: date | None = None
+    unit: str | None = None
+    source_lineage: list[str] = Field(default_factory=list)
+    independent_origin: str | None = None
+
+    @field_validator("value")
+    @classmethod
+    def finite_value(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("observation value must be finite")
+        return value
+
+
 class InstrumentDataResponse(APIModel):
     ticker: str
     instrument: InstrumentMetadata | None = None
@@ -195,8 +215,31 @@ class InstrumentSearchResponse(APIModel):
 class OpportunityMetric(APIModel):
     value: Decimal | None = None
     as_of: date | None = None
+    unit: str | None = None
     sources: list[str] = Field(default_factory=list)
+    independent_sources: list[str] = Field(default_factory=list)
+    source_lineage: list[str] = Field(default_factory=list)
+    observations: list[OpportunityObservation] = Field(default_factory=list)
+    # Values excluded from the selected vote remain visible to explain
+    # outliers, unit mismatches, and implausible provider responses.
+    rejected_observations: list[OpportunityObservation] = Field(default_factory=list)
+    consensus_status: str = "missing_data"
+    confidence: Decimal = Decimal("0")
     unavailable_reason: str | None = None
+
+    @field_validator("value", "confidence")
+    @classmethod
+    def finite_numbers(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and not value.is_finite():
+            raise ValueError("metric values must be finite")
+        return value
+
+    @field_validator("confidence")
+    @classmethod
+    def confidence_range(cls, value: Decimal) -> Decimal:
+        if value < 0 or value > 1:
+            raise ValueError("metric confidence must be between zero and one")
+        return value
 
 
 class OpportunityMetrics(APIModel):
@@ -251,12 +294,85 @@ class FundDistribution(APIModel):
     source: str
 
 
+class FundMonthlyDistribution(APIModel):
+    """Manager-reported income for a reference month, including explicit zeroes."""
+
+    reference_month: date
+    payment_date: date
+    value: Decimal
+    report_as_of: date
+    source: str
+    published_at: datetime | None = None
+
+
+class FundCreditHolding(APIModel):
+    row_number: int
+    security_code: str
+    issuer_and_sector: str
+    disclosed_rating: str
+    credit_spread: Decimal
+    duration_years: Decimal = Field(ge=0)
+    portfolio_weight: Decimal = Field(ge=0, le=1)
+
+
+class FundCreditPortfolio(APIModel):
+    report_as_of: date
+    published_at: datetime | None = None
+    source: str
+    document_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    document_url: str = Field(min_length=1)
+    holdings: list[FundCreditHolding]
+    cash_weight: Decimal = Field(ge=0, le=1)
+
+
+class FundDistributionEvidence(APIModel):
+    """Auditable reconciliation result for one distribution date.
+
+    ``FundDistribution`` remains the compact, backwards-compatible projection
+    consumed by existing clients.  This companion record retains every source
+    observation, including unresolved conflicts that cannot safely be reduced
+    to one numeric value.
+    """
+
+    ex_date: date
+    value: Decimal | None = None
+    status: str = "missing_data"
+    reason: str
+    confidence: Decimal = Decimal("0")
+    sources: list[str] = Field(default_factory=list)
+    independent_sources: list[str] = Field(default_factory=list)
+    source_lineage: list[str] = Field(default_factory=list)
+    observations: list[OpportunityObservation] = Field(default_factory=list)
+    rejected_observations: list[OpportunityObservation] = Field(default_factory=list)
+
+    @field_validator("value", "confidence")
+    @classmethod
+    def finite_numbers(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and not value.is_finite():
+            raise ValueError("distribution evidence values must be finite")
+        return value
+
+    @field_validator("confidence")
+    @classmethod
+    def confidence_range(cls, value: Decimal) -> Decimal:
+        if value < 0 or value > 1:
+            raise ValueError("distribution evidence confidence must be between zero and one")
+        return value
+
+
 class OpportunityResponse(APIModel):
     ticker: str
     instrument: InstrumentMetadata | None = None
     metrics: OpportunityMetrics
     fund_reports: FundReportSeries | None = None
     fund_distributions: list[FundDistribution] = Field(default_factory=list)
+    fund_monthly_distributions: list[FundMonthlyDistribution] = Field(default_factory=list)
+    fund_credit_portfolio: FundCreditPortfolio | None = None
+    fund_distribution_evidence: list[FundDistributionEvidence] = Field(default_factory=list)
+    # Stable provider error codes are retained so callers can distinguish a
+    # legitimate missing observation from a temporary source outage without
+    # exposing upstream response bodies or exception text.
+    source_failures: dict[str, str] = Field(default_factory=dict)
     refreshed_at: datetime
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from decimal import Decimal
 
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 from app.config import Settings
+from app.core.errors import ProviderInvalidResponseError, ProviderUnavailableError
 from app.scrapers.international_statements import (
     InternationalStatementsProvider,
     parse_annual_income,
@@ -155,6 +157,59 @@ async def test_a_listing_without_an_income_statement_is_absent() -> None:
     )
 
     assert await provider.statements("NOPE") is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        lambda request: httpx.Response(500),
+        lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("timed out", request=request)),
+    ],
+)
+async def test_income_source_outages_are_retryable(
+    failure: Callable[[httpx.Request], httpx.Response],
+) -> None:
+    provider = InternationalStatementsProvider(
+        Settings(),
+        transport=httpx.MockTransport(failure),
+    )
+
+    with pytest.raises(ProviderUnavailableError):
+        await provider.statements("AAPL")
+
+
+async def test_income_source_rejects_a_structurally_invalid_success_response() -> None:
+    provider = InternationalStatementsProvider(
+        Settings(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, text="<html>blocked</html>")
+        ),
+    )
+
+    with pytest.raises(ProviderInvalidResponseError):
+        await provider.statements("AAPL")
+
+
+async def test_an_optional_balance_source_can_fail_before_reit_fallback() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "stockanalysis" in request.url.host:
+            return httpx.Response(200, text=_income_page())
+        if "statusinvest" in request.url.host:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            text=_reit_cell("Patrimônio Líquido", "$ 40,12 Bilhões R$ 40.123.970.000"),
+        )
+
+    provider = InternationalStatementsProvider(
+        Settings(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    statements = await provider.statements("O")
+
+    assert statements is not None
+    assert statements.equity == Decimal("40120000000.00")
 
 
 async def test_an_unlisted_balance_sheet_does_not_block_the_income_statement() -> None:

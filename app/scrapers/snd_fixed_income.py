@@ -75,12 +75,27 @@ class SndDebentureTradeProvider:
             if task is None:
                 task = asyncio.create_task(self._download_and_cache(identifier, year))
                 self._inflight[key] = task
-        try:
-            return await task
-        finally:
-            async with self._cache_lock:
-                if self._inflight.get(key) is task:
-                    self._inflight.pop(key, None)
+                task.add_done_callback(lambda completed: self._cleanup_inflight(key, completed))
+
+        # A cancelled caller must not propagate cancellation to the shared download.
+        # Cleanup is attached to the shared task itself so a cancelled caller cannot
+        # evict live ownership and cause duplicate provider work.
+        return await asyncio.shield(task)
+
+    def _cleanup_inflight(
+        self,
+        key: tuple[str, int],
+        task: asyncio.Future[dict[date, Decimal]],
+    ) -> None:
+        """Drop only the completed task that still owns its request key."""
+        if self._inflight.get(key) is task:
+            self._inflight.pop(key, None)
+
+        # If every waiter was cancelled, consume a failed task's exception so
+        # the event loop does not report an unhandled-task warning. Waiters
+        # still see the original exception when they await the shared task.
+        if not task.cancelled():
+            task.exception()
 
     async def _download_and_cache(self, identifier: str, year: int) -> dict[date, Decimal]:
         values = await self._download(identifier, year)
