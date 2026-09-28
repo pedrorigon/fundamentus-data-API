@@ -151,6 +151,9 @@ class FundProfile(APIModel):
     sectors: list[FundAllocation] = Field(default_factory=list)
     asset_types: list[FundAllocation] = Field(default_factory=list)
     holdings: list[FundHolding] = Field(default_factory=list)
+    holdings_date: date | None = None
+    holdings_source: str | None = None
+    holdings_grouped_by_label: bool = False
     source: str
 
 

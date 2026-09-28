@@ -9,18 +9,26 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile, ZipFile
 
 import httpx
+from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from app.config import Settings
 from app.core.archive_safety import ArchiveSafetyError, read_bounded_body
-from app.models import FundProfile, InstrumentMetadata, InstrumentType
+from app.models import FundHolding, FundProfile, InstrumentMetadata, InstrumentType
 
 _MANAGER_API = "https://www.btgpactual.com/etf/api"
 _MAX_PROFILE_BYTES = 512_000
+_MAX_HOLDINGS_BYTES = 128_000
+_MAX_HOLDINGS_EXPANDED_BYTES = 2_000_000
 _MAX_ASSET_AGE_DAYS = 7
 _FEE_PATTERN = re.compile(r"^([0-9]+(?:[.,][0-9]+)?)%\s*a\.a\.$", re.IGNORECASE)
 
@@ -103,13 +111,14 @@ class OfficialEtfProfileProvider:
                     },
                 )
                 net_assets, net_assets_date = _latest_assets(previous_daily, reference)
-        details = _result(characteristics)
-        if (
-            details is None
-            or str(details.get("Ticker") or "").upper() != verified.ticker
-            or str(details.get("CodISINFundo") or "").upper() != verified.isin
-        ):
-            return None
+            details = _result(characteristics)
+            if (
+                details is None
+                or str(details.get("Ticker") or "").upper() != verified.ticker
+                or str(details.get("CodISINFundo") or "").upper() != verified.isin
+            ):
+                return None
+            holdings, holdings_date = await self._holdings(client, verified, reference)
         fee = _annual_fee(details.get("TaxaAdministracao"))
         inception = _portal_date(details.get("DataInicio"))
         if fee is None and net_assets is None:
@@ -121,8 +130,34 @@ class OfficialEtfProfileProvider:
             net_expense_ratio=fee,
             inception_date=inception,
             description=str(details.get("IndiceReferencia") or ""),
+            holdings=holdings,
+            holdings_date=holdings_date,
+            holdings_source=(
+                f"{self.base_url}/Composicao/DownloadCarteira/?ID={verified.manager_id}"
+                if holdings
+                else None
+            ),
+            holdings_grouped_by_label=bool(holdings),
             source=verified.source_url,
         )
+
+    async def _holdings(
+        self,
+        client: httpx.AsyncClient,
+        verified: VerifiedEtf,
+        reference: date,
+    ) -> tuple[list[FundHolding], date | None]:
+        try:
+            async with client.stream(
+                "GET", "/Composicao/DownloadCarteira/", params={"ID": verified.manager_id}
+            ) as response:
+                response.raise_for_status()
+                if "spreadsheetml.sheet" not in response.headers.get("content-type", ""):
+                    return [], None
+                content = await read_bounded_body(response, _MAX_HOLDINGS_BYTES)
+        except (httpx.HTTPError, ArchiveSafetyError):
+            return [], None
+        return _parse_holdings(content, reference)
 
     async def _payload(
         self,
@@ -190,3 +225,91 @@ def _latest_assets(
         return None, None
     latest_date, latest_assets = max(observations, key=lambda item: item[0])
     return latest_assets, latest_date
+
+
+def _parse_holdings(content: bytes, reference: date) -> tuple[list[FundHolding], date | None]:
+    """Group manager portfolio lots by disclosed asset label, never by row count."""
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            members = archive.infolist()
+            if (
+                len(members) > 40
+                or sum(member.file_size for member in members) > _MAX_HOLDINGS_EXPANDED_BYTES
+                or any(member.file_size > max(1, member.compress_size) * 100 for member in members)
+            ):
+                return [], None
+        workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, KeyError, OSError, ParseError, ValueError):
+        return [], None
+    try:
+        if "Carteira" not in workbook.sheetnames:
+            return [], None
+        rows = workbook["Carteira"].iter_rows(values_only=True)
+        for index, header in enumerate(rows):
+            if index >= 20:
+                return [], None
+            normalized = tuple(str(value or "").strip().upper() for value in header)
+            if normalized[:7] == (
+                "DATA",
+                "CATEGORIA",
+                "ATIVO",
+                "QUANTIDADE",
+                "PREÇO (R$)",
+                "FINANCEIRO (R$)",
+                "PESO (%)",
+            ):
+                break
+        else:
+            return [], None
+        grouped: dict[str, Decimal] = defaultdict(Decimal)
+        total_financial = Decimal("0")
+        total_weight = Decimal("0")
+        as_of: date | None = None
+        for index, row in enumerate(rows):
+            if index >= 500:
+                return [], None
+            if not any(value is not None for value in row):
+                continue
+            if len(row) < 7 or not isinstance(row[0], (date, datetime)):
+                return [], None
+            observed_at = row[0].date() if isinstance(row[0], datetime) else row[0]
+            if not 0 <= (reference - observed_at).days <= _MAX_ASSET_AGE_DAYS:
+                return [], None
+            if as_of is not None and observed_at != as_of:
+                return [], None
+            as_of = observed_at
+            label = str(row[2] or "").strip().upper()
+            financial = _finite_decimal(row[5])
+            weight = _finite_decimal(row[6])
+            if not label or financial is None or weight is None:
+                return [], None
+            total_financial += financial
+            total_weight += weight
+            if financial > 0 and not label.startswith(("PROV.", "DESPESA", "TAXA")):
+                grouped[label] += financial
+        invested = sum(grouped.values(), Decimal("0"))
+        if (
+            as_of is None
+            or invested <= 0
+            or total_financial <= 0
+            or abs(total_weight - Decimal("100")) > Decimal("0.5")
+            or abs(invested - total_financial) / total_financial > Decimal("0.005")
+        ):
+            return [], None
+        holdings = [
+            FundHolding(symbol=label, weight=financial / invested)
+            for label, financial in sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        return holdings, as_of
+    finally:
+        workbook.close()
+
+
+def _finite_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None

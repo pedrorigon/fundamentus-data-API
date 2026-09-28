@@ -1151,6 +1151,53 @@ async def test_domestic_crypto_etf_preserves_official_cost_and_assets_dates() ->
     assert facts["holdings_count"].value is None
 
 
+async def test_grouped_official_etf_holdings_are_dated_without_inventing_security_count() -> None:
+    instrument = InstrumentMetadata(
+        ticker="ABTC11",
+        instrument_type=InstrumentType.etf,
+        isin="BRABTCCTF002",
+    )
+    source = "https://www.btgpactual.com/asset-management/etf/ABTC11"
+    holdings_source = "https://www.btgpactual.com/etf/api/Composicao/DownloadCarteira/?ID=126"
+    profile = FundProfile(
+        net_expense_ratio=Decimal("0.0039"),
+        net_assets=Decimal("23141900.56"),
+        holdings=[
+            FundHolding(symbol="XBT", weight=Decimal("0.9")),
+            FundHolding(symbol="LFT REF", weight=Decimal("0.1")),
+        ],
+        holdings_date=date(2026, 9, 23),
+        holdings_source=holdings_source,
+        holdings_grouped_by_label=True,
+        source=source,
+    )
+    data = instrument_data("ABTC11", instrument, fund_profile=profile).model_copy(
+        update={"refreshed_at": datetime(2026, 9, 24, tzinfo=UTC)}
+    )
+    service = QualityFactsService(
+        FundamentalsStub(stock_snapshot()),  # type: ignore[arg-type]
+        InstrumentsStub({"ABTC11": data}),  # type: ignore[arg-type]
+        OpportunityStub({}),  # type: ignore[arg-type]
+    )
+
+    asset = (
+        await service.resolve(
+            QualityFactsRequest(
+                assets=[QualityAssetRequest(ticker="ABTC11", kind=QualityAssetKind.etf)]
+            )
+        )
+    ).assets[0]
+    facts = {fact.key: fact for fact in asset.facts}
+
+    assert asset.sources == [source, holdings_source]
+    assert facts["holdings_count"].value is None
+    assert facts["top_ten_concentration"].value == Decimal("1")
+    assert facts["holdings_hhi"].value == Decimal("0.82")
+    assert facts["holdings_weight_coverage"].value == Decimal("1")
+    assert facts["holdings_hhi"].as_of == date(2026, 9, 23)
+    assert facts["holdings_hhi"].source == holdings_source
+
+
 async def test_assessment_can_reuse_opportunity_without_a_second_provider_call() -> None:
     instrument = InstrumentMetadata(ticker="TEST3", instrument_type=InstrumentType.stock)
     opportunity_provider = OpportunityStub({"TEST3": opportunity("TEST3", instrument)})

@@ -823,6 +823,8 @@ def _etf_facts(
         )
     reference = data.refreshed_at.date()
     holdings = profile.holdings
+    holdings_date = profile.holdings_date or reference
+    holdings_source = profile.holdings_source or profile.source
     total_weight = sum((holding.weight for holding in holdings), Decimal("0"))
     weight_scale = Decimal("100") if total_weight > Decimal("1.5") else Decimal("1")
     facts = [
@@ -856,24 +858,24 @@ def _etf_facts(
         ),
         _value_fact(
             "holdings_count",
-            Decimal(len(holdings)) if holdings else None,
+            Decimal(len(holdings)) if holdings and not profile.holdings_grouped_by_label else None,
             "count",
-            reference,
-            profile.source,
+            holdings_date,
+            holdings_source,
         ),
         _value_fact(
             "top_ten_concentration",
             sum((holding.weight for holding in holdings[:10]), Decimal("0")) if holdings else None,
             "ratio",
-            reference,
-            profile.source,
+            holdings_date,
+            holdings_source,
         ),
         _value_fact(
             "holdings_hhi",
             _hhi(holding.weight for holding in holdings),
             "ratio",
-            reference,
-            profile.source,
+            holdings_date,
+            holdings_source,
         ),
         _value_fact(
             "sector_hhi",
@@ -886,8 +888,8 @@ def _etf_facts(
             "holdings_weight_coverage",
             _safe_ratio(total_weight, weight_scale) if holdings else None,
             "ratio",
-            reference,
-            profile.source,
+            holdings_date,
+            holdings_source,
         ),
     ]
     return QualityAssetFacts(
@@ -897,7 +899,9 @@ def _etf_facts(
         profile=_etf_profile(profile.description, profile.asset_types, profile.sectors),
         facts=facts,
         sources=sorted(
-            source for source in {profile.source, profile.net_assets_source} if source is not None
+            source
+            for source in {profile.source, profile.net_assets_source, profile.holdings_source}
+            if source is not None
         ),
     )
 
