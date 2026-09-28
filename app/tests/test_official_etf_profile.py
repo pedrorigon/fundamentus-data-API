@@ -11,7 +11,11 @@ from openpyxl import Workbook
 
 from app.config import Settings
 from app.models import InstrumentMetadata, InstrumentType
-from app.scrapers.official_etf_profile import OfficialEtfProfileProvider, _parse_holdings
+from app.scrapers.official_etf_profile import (
+    OfficialEtfProfileProvider,
+    _finite_decimal,
+    _parse_holdings,
+)
 
 _XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -243,6 +247,37 @@ def test_manager_workbook_rejects_malformed_rows_and_large_archive() -> None:
         for index in range(41):
             output.writestr(f"file-{index}.xml", "x")
     assert _parse_holdings(archive.getvalue(), date(2026, 9, 24)) == ([], None)
+
+
+def test_manager_workbook_skips_empty_rows_without_changing_total_weights() -> None:
+    as_of = datetime(2026, 9, 23)
+    content = _workbook_content(
+        [
+            [as_of, "Outros", "XBT", 1, 60, 60, 60],
+            [None] * 7,
+            [as_of, "Renda fixa", "LFT", 1, 40, 40, 40],
+        ]
+    )
+
+    holdings, holdings_date = _parse_holdings(content, date(2026, 9, 24))
+
+    assert holdings_date == date(2026, 9, 23)
+    assert [(item.symbol, item.weight) for item in holdings] == [
+        ("XBT", Decimal("0.6")),
+        ("LFT", Decimal("0.4")),
+    ]
+
+
+def test_manager_workbook_rejects_more_than_500_portfolio_rows() -> None:
+    as_of = datetime(2026, 9, 23)
+    rows = [[as_of, "Outros", "XBT", 1, 1, 1, 1] for _ in range(501)]
+
+    assert _parse_holdings(_workbook_content(rows), date(2026, 9, 24)) == ([], None)
+
+
+@pytest.mark.parametrize("value", [True, "not-a-number", Decimal("NaN")])
+def test_manager_workbook_rejects_invalid_numeric_values(value: object) -> None:
+    assert _finite_decimal(value) is None
 
 
 @pytest.mark.parametrize(
