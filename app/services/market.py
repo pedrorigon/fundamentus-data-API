@@ -35,6 +35,9 @@ SOURCE_ALPHA_VANTAGE = "alpha_vantage"
 SOURCE_BRAPI = "brapi"
 INSTRUMENT_TICKER_PATTERN = re.compile(r"^[A-Z0-9]{1,8}(?:[.-][A-Z0-9]{1,3})?$")
 B3_TICKER_PATTERN = re.compile(r"^[A-Z]{4}\d{1,2}$")
+_EQUITY_CASH_SEGMENT = "EQUITY-CASH"
+_BRAZIL_COUNTRIES = frozenset({"BR", "BRA", "BRAZIL", "BRASIL"})
+_B3_DIRECTORY_SOURCES = frozenset({"B3", "B3_BDI", "B3_BDI_CONSOLIDATED"})
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -183,7 +186,7 @@ class InstrumentDataService:
         self._cache: BoundedTTLCache[tuple[str, InstrumentType | None], InstrumentDataResponse] = (
             BoundedTTLCache(settings.ticker_cache_max_entries)
         )
-        self._directory: BoundedMap[tuple[str, str], InstrumentMetadata] = BoundedMap(
+        self._directory: BoundedMap[tuple[str, str, str], InstrumentMetadata] = BoundedMap(
             settings.instrument_directory_max_entries
         )
         self._directory_lock = asyncio.Lock()
@@ -341,7 +344,15 @@ class InstrumentDataService:
                 self._directory.set(key, item.model_copy(update={"underlying_name": name}))
 
     def _remember(self, instrument: InstrumentMetadata) -> None:
-        key = (_fold_search(instrument.ticker), _fold_search(instrument.exchange) or "")
+        instrument = _normalize_directory_instrument(instrument)
+        ticker = _fold_search(instrument.ticker)
+        exchange = _fold_search(instrument.exchange) or ""
+        key = (ticker, exchange, "")
+        existing = self._directory.get(key)
+        if existing and existing.isin and instrument.isin and existing.isin != instrument.isin:
+            # Conflicting securities must not overwrite each other. Ordinary
+            # bulk observations keep the same key, so enrichment remains O(1).
+            key = (ticker, exchange, instrument.isin)
         existing = self._directory.get(key)
         self._directory.set(key, _merge_instruments(existing, instrument))
 
@@ -621,6 +632,17 @@ async def _cancel_and_wait(tasks: tuple[asyncio.Task[Any], ...]) -> None:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+def _normalize_directory_instrument(instrument: InstrumentMetadata) -> InstrumentMetadata:
+    exchange = _fold_search(instrument.exchange)
+    country = _fold_search(instrument.country)
+    source = _fold_search(instrument.source)
+    if exchange != _EQUITY_CASH_SEGMENT or (country and country not in _BRAZIL_COUNTRIES):
+        return instrument
+    if country in _BRAZIL_COUNTRIES or source in _B3_DIRECTORY_SOURCES:
+        return instrument.model_copy(update={"exchange": "B3"})
+    return instrument
+
+
 def _merge_instruments(
     existing: InstrumentMetadata | None,
     incoming: InstrumentMetadata,
@@ -635,6 +657,12 @@ def _merge_instruments(
         if value not in (None, "", {}, []):
             if values.get(field) in (None, "", {}, []):
                 values[field] = value
+    generic_types = {InstrumentType.fund, InstrumentType.unknown}
+    if incoming.instrument_type in generic_types and existing.instrument_type not in generic_types:
+        for field in ("instrument_type", "source", "confidence"):
+            values[field] = previous[field]
+        if not incoming.name or incoming.name == incoming.ticker:
+            values["name"] = existing.name
     if _confidence_rank(existing.confidence) > _confidence_rank(incoming.confidence):
         for field in (
             "instrument_type",
