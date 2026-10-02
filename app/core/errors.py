@@ -72,6 +72,20 @@ class UpstreamUnavailableError(APIError):
     retryable = True
 
 
+class ProviderInvalidResponseError(UpstreamInvalidResponseError):
+    """A configured secondary provider returned an unusable response."""
+
+    code = "PROVIDER_INVALID_RESPONSE"
+    message = "A data provider returned an invalid response."
+
+
+class ProviderUnavailableError(UpstreamUnavailableError):
+    """A configured secondary provider could not be reached."""
+
+    code = "PROVIDER_UNAVAILABLE"
+    message = "A data provider is unavailable."
+
+
 class CircuitBreakerOpenError(APIError):
     status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     code = "UPSTREAM_CIRCUIT_OPEN"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from typing import Any
 
 import httpx
@@ -42,12 +43,19 @@ class BrapiInstrumentDirectoryProvider:
             if task is None:
                 task = asyncio.create_task(self._load())
                 self._inflight = task
-        try:
-            return await task
-        finally:
-            async with self._lock:
-                if self._inflight is task:
-                    self._inflight = None
+                task.add_done_callback(self._complete)
+        # This task is shared by all callers.  A request cancellation must not
+        # cancel the bulk refresh for every other waiter.
+        return await asyncio.shield(task)
+
+    def _complete(self, task: asyncio.Task[list[InstrumentMetadata]]) -> None:
+        """Release ownership only when this provider task has completed."""
+        if self._inflight is task:
+            self._inflight = None
+        # A cancelled waiter may be the only consumer of a failed task.  Mark
+        # the exception as retrieved while preserving it for any other waiter.
+        if not task.cancelled():
+            task.exception()
 
     async def instruments(self) -> list[InstrumentMetadata]:
         return await self.directory()
@@ -163,9 +171,13 @@ def _text(row: dict[str, Any], *keys: str) -> str | None:
 def _directory_instrument_type(
     raw_type: str | None,
     name: str | None,
-    ticker: str,
+    _ticker: str,
 ) -> InstrumentType:
-    text = " ".join(value for value in (raw_type, name) if value).upper()
+    # B3/BrAPI names are not consistent about accents (for example, ``Índice``)
+    # and the ticker suffix is deliberately excluded from this decision.  B3
+    # suffixes are shared by ETFs, units and listed funds, so a suffix cannot
+    # establish a fund class.
+    text = _fold_directory_text(raw_type, name)
     if "BDR" in text or "DEPOSITARY" in text:
         return InstrumentType.bdr
     if "ETF" in text or "FUNDO DE IND" in text:
@@ -176,20 +188,26 @@ def _directory_instrument_type(
         return InstrumentType.fi_infra
     if "FII" in text or "IMOBILI" in text or "REAL ESTATE" in text:
         return InstrumentType.fii
-    if (
-        raw_type
-        and raw_type.strip().upper() in {"FUND", "FUNDS", "FUNDOS"}
-        and ticker.endswith("11")
-    ):
-        return InstrumentType.fii
     if "UNIT" in text or " UNT" in f" {text}":
         return InstrumentType.unit
     if "STOCK" in text or "EQUITY" in text or "COMMON" in text:
         return InstrumentType.stock
+    if raw_type and _fold_directory_text(raw_type) in {"FUND", "FUNDS", "FUNDOS"}:
+        return InstrumentType.fund
     # A suffix alone is not authoritative: several B3 classes share suffixes
     # and upstream list rows occasionally omit their type. Preserve that
     # uncertainty instead of inventing a security class.
     return InstrumentType.unknown
+
+
+def _fold_directory_text(*values: str | None) -> str:
+    """Fold provider text for classification without changing displayed names."""
+
+    text = " ".join(value for value in values if value)
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    ).upper()
 
 
 __all__ = [

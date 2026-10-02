@@ -19,6 +19,7 @@ from pypdf import PdfReader
 
 from app.config import Settings
 from app.core.archive_safety import open_validated_zip, read_bounded_body
+from app.core.errors import APIError
 from app.income.parsers import (
     parse_b3_income_events,
     parse_cvm_income_adjustment_text,
@@ -26,7 +27,7 @@ from app.income.parsers import (
     parse_fundos_net_xml,
     parse_status_invest_income_events,
 )
-from app.models import Dividend
+from app.models import Dividend, InstrumentMetadata
 from app.models.income_events import (
     IncomeEventObservation,
     IncomeInstrumentRequest,
@@ -34,6 +35,7 @@ from app.models.income_events import (
 )
 from app.parsers.status_invest import parse_status_invest_cnpj
 from app.services.assets import AssetService
+from app.services.opportunity import B3InstrumentProvider
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class IncomeSourceResult:
 class IncomeSource(Protocol):
     name: str
     snapshot_sources: tuple[str, ...]
+    #: Official publications are the only sources a bulk backfill collects.
+    official: bool
 
     async def collect(
         self,
@@ -53,8 +57,44 @@ class IncomeSource(Protocol):
     ) -> IncomeSourceResult: ...
 
 
+class InstrumentIdentityProvider(Protocol):
+    """Authoritative ticker-to-instrument identity lookup."""
+
+    async def get(self, ticker: str) -> InstrumentMetadata | None: ...
+
+
+def _cleanup_shared_task[Key, Value](
+    tasks: dict[Key, asyncio.Task[Value]],
+    key: Key,
+    task: asyncio.Future[Value],
+) -> None:
+    """Remove a completed owner and mark an unobserved failure as retrieved."""
+    if tasks.get(key) is task:
+        tasks.pop(key, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _drain_shared_tasks[Key, Value](
+    tasks: dict[Key, asyncio.Task[Value]],
+    lock: asyncio.Lock,
+) -> None:
+    """Keep a request client alive until its shared producers have finished."""
+    async with lock:
+        pending = tuple(tasks.values())
+    if pending:
+        await asyncio.gather(
+            *(asyncio.shield(task) for task in pending),
+            return_exceptions=True,
+        )
+        # Done callbacks remove the task from the ownership map on the next loop
+        # turn. Let them run before the request-scoped client is closed.
+        await asyncio.sleep(0)
+
+
 class FundamentusIncomeSource:
     name = "fundamentus"
+    official = False
     snapshot_sources: tuple[str, ...] = ("fundamentus",)
 
     def __init__(self, assets: AssetService) -> None:
@@ -88,6 +128,7 @@ class FundamentusIncomeSource:
 
 class StatusInvestIncomeSource:
     name = "status_invest"
+    official = False
     snapshot_sources: tuple[str, ...] = ("status_invest",)
 
     def __init__(
@@ -108,10 +149,13 @@ class StatusInvestIncomeSource:
     ) -> IncomeSourceResult:
         del as_of
         async with self._client() as client:
-            results = await asyncio.gather(
-                *(self._instrument(client, item) for item in instruments),
-                return_exceptions=True,
-            )
+            try:
+                results = await asyncio.gather(
+                    *(self._instrument(client, item) for item in instruments),
+                    return_exceptions=True,
+                )
+            finally:
+                await _drain_shared_tasks(self._profile_tasks, self._profile_lock)
         return _instrument_results(self.name, instruments, results)
 
     async def fund_cnpjs(
@@ -122,10 +166,13 @@ class StatusInvestIncomeSource:
         if not funds:
             return {}
         async with self._client() as client:
-            pages = await asyncio.gather(
-                *(self._profile_html(client, item) for item in funds),
-                return_exceptions=True,
-            )
+            try:
+                pages = await asyncio.gather(
+                    *(self._profile_html(client, item) for item in funds),
+                    return_exceptions=True,
+                )
+            finally:
+                await _drain_shared_tasks(self._profile_tasks, self._profile_lock)
         return {
             instrument.ticker: cnpj
             for instrument, page in zip(funds, pages, strict=True)
@@ -154,18 +201,30 @@ class StatusInvestIncomeSource:
                 return cached[1]
             task = self._profile_tasks.get(ticker)
             if task is None:
-                task = asyncio.create_task(self._fetch_profile_html(client, instrument))
+                task = asyncio.create_task(
+                    self._fetch_and_cache_profile(client, ticker, instrument)
+                )
                 self._profile_tasks[ticker] = task
-        try:
-            html = await task
-            async with self._profile_lock:
-                self._profiles[ticker] = (time.monotonic(), html)
-                _trim_ttl_cache(self._profiles, self.settings.ticker_cache_max_entries)
-            return html
-        finally:
-            async with self._profile_lock:
-                if self._profile_tasks.get(ticker) is task:
-                    self._profile_tasks.pop(ticker, None)
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._profile_tasks,
+                        ticker,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_profile(
+        self,
+        client: httpx.AsyncClient,
+        ticker: str,
+        instrument: IncomeInstrumentRequest,
+    ) -> str:
+        html = await self._fetch_profile_html(client, instrument)
+        async with self._profile_lock:
+            self._profiles[ticker] = (time.monotonic(), html)
+            _trim_ttl_cache(self._profiles, self.settings.ticker_cache_max_entries)
+        return html
 
     async def _fetch_profile_html(
         self,
@@ -197,15 +256,19 @@ class StatusInvestIncomeSource:
 
 class OfficialCompanyIncomeSource:
     name = "official_companies"
+    official = True
     snapshot_sources: tuple[str, ...] = ("b3", "cvm")
 
     def __init__(
         self,
         settings: Settings,
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        identity_provider: InstrumentIdentityProvider | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport
+        self._identity_provider = identity_provider or B3InstrumentProvider(settings, transport)
         self._cvm_index: dict[int, tuple[float, list[dict[str, str]]]] = {}
         self._cvm_lock = asyncio.Lock()
         self._cvm_documents: dict[str, tuple[float, str]] = {}
@@ -214,13 +277,34 @@ class OfficialCompanyIncomeSource:
         self._cvm_download_semaphore = asyncio.Semaphore(
             min(max(settings.upstream_concurrency, 1), 2)
         )
+        # One B3 listed-company payload covers every share class of an issuer,
+        # so a bulk backfill reads each issuer once per index window.
+        self._b3_payloads: dict[str, tuple[float, Any]] = {}
+        self._b3_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._b3_lock = asyncio.Lock()
+        self._identity_tasks: dict[str, asyncio.Task[InstrumentMetadata | None]] = {}
+        self._identity_lock = asyncio.Lock()
+        self._identity_semaphore = asyncio.Semaphore(max(settings.upstream_concurrency, 1))
 
     async def collect(
         self,
         instruments: Sequence[IncomeInstrumentRequest],
         as_of: date,
     ) -> IncomeSourceResult:
-        async with httpx.AsyncClient(
+        async with self._client() as client:
+            try:
+                results = await asyncio.gather(
+                    *(self._instrument(client, item, as_of) for item in instruments),
+                    return_exceptions=True,
+                )
+            finally:
+                await _drain_shared_tasks(self._cvm_document_tasks, self._cvm_document_lock)
+                await _drain_shared_tasks(self._b3_tasks, self._b3_lock)
+                await _drain_shared_tasks(self._identity_tasks, self._identity_lock)
+        return _instrument_results(self.name, instruments, results)
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.cvm_request_timeout_seconds),
             limits=_limits(self.settings),
             follow_redirects=True,
@@ -229,12 +313,7 @@ class OfficialCompanyIncomeSource:
                 "User-Agent": self.settings.user_agent,
             },
             transport=self.transport,
-        ) as client:
-            results = await asyncio.gather(
-                *(self._instrument(client, item, as_of) for item in instruments),
-                return_exceptions=True,
-            )
-        return _instrument_results(self.name, instruments, results)
+        )
 
     async def _instrument(
         self,
@@ -250,7 +329,12 @@ class OfficialCompanyIncomeSource:
         )
         requested_isin = instrument.isin or inferred_isin
         if requested_isin is None and _distinct_b3_isins(b3_payload) > 1:
-            raise ValueError(f"B3 returned multiple ISINs for {instrument.ticker}")
+            requested_isin = await self._resolve_ambiguous_isin(instrument.ticker, b3_payload)
+        effective_instrument = (
+            instrument
+            if requested_isin == instrument.isin
+            else instrument.model_copy(update={"isin": requested_isin})
+        )
         b3_events, cvm_code = parse_b3_income_events(
             b3_payload,
             ticker=instrument.ticker,
@@ -258,11 +342,77 @@ class OfficialCompanyIncomeSource:
         )
         if cvm_code is None:
             return b3_events
-        cvm_events = await self._cvm_events(client, instrument, cvm_code, as_of)
+        cvm_events = await self._cvm_events(client, effective_instrument, cvm_code, as_of)
         return [*b3_events, *cvm_events]
+
+    async def _resolve_ambiguous_isin(self, ticker: str, payload: Any) -> str:
+        try:
+            metadata = await self._instrument_identity(ticker)
+        except APIError as exc:
+            raise ValueError(
+                f"B3 returned multiple ISINs for {ticker}; "
+                f"authoritative identity lookup failed ({exc.code})"
+            ) from exc
+        if metadata is not None and metadata.ticker.upper() != ticker.upper():
+            raise ValueError(f"B3 identity for {ticker} returned metadata for {metadata.ticker}")
+        resolved_isin = (metadata.isin if metadata is not None else None) or ""
+        resolved_isin = resolved_isin.strip().upper()
+        if not resolved_isin:
+            raise ValueError(
+                f"B3 returned multiple ISINs for {ticker}; "
+                "authoritative identity did not return an ISIN"
+            )
+        if _debt_isin(resolved_isin):
+            raise ValueError(f"B3 identity for {ticker} resolved to debenture ISIN {resolved_isin}")
+        if resolved_isin not in _b3_isins(payload):
+            raise ValueError(
+                f"B3 identity for {ticker} resolved to ISIN {resolved_isin}, "
+                "which is absent from the issuer income payload"
+            )
+        return resolved_isin
+
+    async def _instrument_identity(self, ticker: str) -> InstrumentMetadata | None:
+        key = ticker.upper()
+        async with self._identity_lock:
+            task = self._identity_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(self._fetch_instrument_identity(key))
+                self._identity_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._identity_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_instrument_identity(self, ticker: str) -> InstrumentMetadata | None:
+        async with self._identity_semaphore:
+            return await self._identity_provider.get(ticker)
 
     async def _b3_payload(self, client: httpx.AsyncClient, ticker: str) -> Any:
         issuer = _issuer_code(ticker)
+        async with self._b3_lock:
+            cached = self._b3_payloads.get(issuer)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._b3_tasks.get(issuer)
+            if task is None:
+                task = asyncio.create_task(self._fetch_b3_payload(client, issuer))
+                self._b3_tasks[issuer] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._b3_tasks,
+                        issuer,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_b3_payload(self, client: httpx.AsyncClient, issuer: str) -> Any:
         encoded = base64.b64encode(
             json.dumps(
                 {"language": "pt-br", "issuingCompany": issuer}, separators=(",", ":")
@@ -272,10 +422,15 @@ class OfficialCompanyIncomeSource:
         url = f"{self.settings.b3_listed_companies_base_url.rstrip('/')}{endpoint}"
         response = await client.get(url)
         if response.status_code == 404:
-            return []
-        response.raise_for_status()
-        payload = response.json()
-        return json.loads(payload) if isinstance(payload, str) else payload
+            payload: Any = []
+        else:
+            response.raise_for_status()
+            raw = response.json()
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        async with self._b3_lock:
+            self._b3_payloads[issuer] = (time.monotonic(), payload)
+            _trim_ttl_cache(self._b3_payloads, self.settings.ticker_cache_max_entries)
+        return payload
 
     async def _cvm_events(
         self,
@@ -322,11 +477,13 @@ class OfficialCompanyIncomeSource:
             response = await client.get(url)
             if response.status_code == 404:
                 self._cvm_index[year] = (time.monotonic(), [])
+                _trim_ttl_cache(self._cvm_index, self.settings.ticker_cache_max_entries)
                 return []
             response.raise_for_status()
             payload = await read_bounded_body(response, self.settings.archive_download_max_bytes)
             rows = _read_cvm_zip(payload)
             self._cvm_index[year] = (time.monotonic(), rows)
+            _trim_ttl_cache(self._cvm_index, self.settings.ticker_cache_max_entries)
             return rows
 
     async def _cvm_document(
@@ -352,7 +509,7 @@ class OfficialCompanyIncomeSource:
         )
         if instrument.isin:
             return [item for item in events if item.isin in {None, instrument.isin}]
-        return events
+        return [item for item in events if not _debt_isin(item.isin)]
 
     async def _cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
         async with self._cvm_document_lock:
@@ -363,21 +520,30 @@ class OfficialCompanyIncomeSource:
                 return cached[1]
             task = self._cvm_document_tasks.get(link)
             if task is None:
-                task = asyncio.create_task(self._fetch_cvm_document_text(client, link))
+                task = asyncio.create_task(self._fetch_and_cache_cvm_document(client, link))
                 self._cvm_document_tasks[link] = task
-        try:
-            text = await task
-            async with self._cvm_document_lock:
-                self._cvm_documents[link] = (time.monotonic(), text)
-                _trim_ttl_cache(
-                    self._cvm_documents,
-                    self.settings.ticker_cache_max_entries,
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._cvm_document_tasks,
+                        link,
+                        completed,
+                    )
                 )
-            return text
-        finally:
-            async with self._cvm_document_lock:
-                if self._cvm_document_tasks.get(link) is task:
-                    self._cvm_document_tasks.pop(link, None)
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_cvm_document(
+        self,
+        client: httpx.AsyncClient,
+        link: str,
+    ) -> str:
+        text = await self._fetch_cvm_document_text(client, link)
+        async with self._cvm_document_lock:
+            self._cvm_documents[link] = (time.monotonic(), text)
+            _trim_ttl_cache(
+                self._cvm_documents,
+                self.settings.ticker_cache_max_entries,
+            )
+        return text
 
     async def _fetch_cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
         async with self._cvm_download_semaphore:
@@ -395,6 +561,7 @@ class OfficialCompanyIncomeSource:
 
 class FundosNetIncomeSource:
     name = "fundos_net"
+    official = False
     snapshot_sources: tuple[str, ...] = ("fundos_net",)
 
     def __init__(
@@ -452,71 +619,93 @@ class FundosNetIncomeSource:
             )
         return IncomeSourceResult(observations, coverage)
 
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.settings.fundos_net_base_url,
+            timeout=httpx.Timeout(self.settings.cvm_request_timeout_seconds),
+            limits=_limits(self.settings),
+            follow_redirects=True,
+            headers={
+                "Accept": "application/json,application/xml,text/xml",
+                "User-Agent": self.settings.user_agent,
+            },
+            transport=self.transport,
+        )
+
     async def _load(
         self,
         requested: dict[str, IncomeInstrumentRequest],
         as_of: date,
     ) -> tuple[list[IncomeEventObservation], set[str]]:
-        headers = {
-            "Accept": "application/json,application/xml,text/xml",
-            "User-Agent": self.settings.user_agent,
-        }
-        async with httpx.AsyncClient(
-            base_url=self.settings.fundos_net_base_url,
-            timeout=httpx.Timeout(self.settings.cvm_request_timeout_seconds),
-            limits=_limits(self.settings),
-            follow_redirects=True,
-            headers=headers,
-            transport=self.transport,
-        ) as client:
+        async with self._client() as client:
+            try:
+                return await self._load_with_client(requested, as_of, client)
+            finally:
+                await _drain_shared_tasks(self._fund_row_tasks, self._fund_row_lock)
+                await _drain_shared_tasks(self._document_tasks, self._document_lock)
+
+    async def _load_with_client(
+        self,
+        requested: dict[str, IncomeInstrumentRequest],
+        as_of: date,
+        client: httpx.AsyncClient,
+    ) -> tuple[list[IncomeEventObservation], set[str]]:
+        targeted_candidates: list[dict[str, Any]] = []
+        complete_tickers: set[str] = set()
+        if self.status_source is not None:
+            cnpjs = await self.status_source.fund_cnpjs(list(requested.values()))
+            targeted = await asyncio.gather(
+                *(
+                    self._rows_for_cnpj(
+                        client,
+                        cnpj,
+                        as_of - timedelta(days=self.settings.income_snapshot_overlap_days),
+                    )
+                    for ticker, cnpj in cnpjs.items()
+                ),
+                return_exceptions=True,
+            )
+            for (ticker, _cnpj), result in zip(cnpjs.items(), targeted, strict=True):
+                if isinstance(result, BaseException):
+                    continue
+                targeted_rows, complete = result
+                targeted_candidates.extend(targeted_rows)
+                if complete:
+                    complete_tickers.add(ticker)
+        try:
             rows = await self._rows(client)
-            targeted_candidates: list[dict[str, Any]] = []
-            complete_tickers: set[str] = set()
-            if self.status_source is not None:
-                cnpjs = await self.status_source.fund_cnpjs(list(requested.values()))
-                targeted = await asyncio.gather(
-                    *(
-                        self._rows_for_cnpj(
-                            client,
-                            cnpj,
-                            as_of - timedelta(days=self.settings.income_snapshot_overlap_days),
-                        )
-                        for ticker, cnpj in cnpjs.items()
+        except (httpx.HTTPError, ValueError):
+            # The broad index is an optional discovery path. Its malformed
+            # HTML/JSON response must not discard a complete CNPJ-targeted
+            # result already retrieved for the requested fund.
+            if not targeted_candidates and not complete_tickers:
+                raise
+            rows = []
+        candidates = list(
+            {
+                str(row["id"]): row
+                for row in [
+                    *targeted_candidates,
+                    *_fundos_net_candidates(
+                        rows,
+                        requested,
+                        self.settings.fundos_net_fallback_documents,
                     ),
-                    return_exceptions=True,
-                )
-                for (ticker, _cnpj), result in zip(cnpjs.items(), targeted, strict=True):
-                    if isinstance(result, BaseException):
-                        continue
-                    targeted_rows, complete = result
-                    targeted_candidates.extend(targeted_rows)
-                    if complete:
-                        complete_tickers.add(ticker)
-            candidates = list(
-                {
-                    str(row["id"]): row
-                    for row in [
-                        *targeted_candidates,
-                        *_fundos_net_candidates(
-                            rows,
-                            requested,
-                            self.settings.fundos_net_fallback_documents,
-                        ),
-                    ]
-                }.values()
-            )
-            semaphore = asyncio.Semaphore(self.settings.upstream_concurrency)
+                ]
+            }.values()
+        )
+        semaphore = asyncio.Semaphore(self.settings.upstream_concurrency)
 
-            async def download(row: dict[str, Any]) -> list[IncomeEventObservation]:
-                async with semaphore:
-                    return await self._document(client, row)
+        async def download(row: dict[str, Any]) -> list[IncomeEventObservation]:
+            async with semaphore:
+                return await self._document(client, row)
 
-            parsed = await asyncio.gather(
-                *(download(row) for row in candidates), return_exceptions=True
-            )
-            failure = next((result for result in parsed if isinstance(result, BaseException)), None)
-            if failure is not None:
-                raise RuntimeError("Fundos.NET document refresh was incomplete") from failure
+        parsed = await asyncio.gather(
+            *(download(row) for row in candidates), return_exceptions=True
+        )
+        failure = next((result for result in parsed if isinstance(result, BaseException)), None)
+        if failure is not None:
+            raise RuntimeError("Fundos.NET document refresh was incomplete") from failure
         observations = [
             event
             for result in parsed
@@ -532,8 +721,8 @@ class FundosNetIncomeSource:
                 self._index[0], self.settings.income_source_index_ttl_seconds
             ):
                 return self._index[1]
-            response = await client.get(
-                "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            payload = await self._index_page(
+                client,
                 params={
                     "d": 1,
                     "s": 0,
@@ -544,10 +733,26 @@ class FundosNetIncomeSource:
                     "tipoFundo": 1,
                 },
             )
-            response.raise_for_status()
-            rows = _fundos_net_rows(response.json())
+            rows = _fundos_net_rows(payload)
             self._index = (time.monotonic(), rows)
             return rows
+
+    async def _index_page(
+        self, client: httpx.AsyncClient, *, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        async with client.stream(
+            "GET",
+            "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            params=params,
+        ) as response:
+            response.raise_for_status()
+            if "json" not in response.headers.get("content-type", "").lower():
+                raise ValueError("Fundos.NET index did not return JSON")
+            body = await read_bounded_body(response, 3_000_000)
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("Fundos.NET index returned an invalid schema")
+        return payload
 
     async def _rows_for_cnpj(
         self,
@@ -564,18 +769,31 @@ class FundosNetIncomeSource:
                 return cached[1]
             task = self._fund_row_tasks.get(key)
             if task is None:
-                task = asyncio.create_task(self._fetch_rows_for_cnpj(client, cnpj, snapshot_from))
+                task = asyncio.create_task(
+                    self._fetch_and_cache_rows(client, cnpj, snapshot_from, key)
+                )
                 self._fund_row_tasks[key] = task
-        try:
-            result = await task
-            async with self._fund_row_lock:
-                self._fund_rows[key] = (time.monotonic(), result)
-                _trim_ttl_cache(self._fund_rows, self.settings.ticker_cache_max_entries)
-            return result
-        finally:
-            async with self._fund_row_lock:
-                if self._fund_row_tasks.get(key) is task:
-                    self._fund_row_tasks.pop(key, None)
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._fund_row_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_rows(
+        self,
+        client: httpx.AsyncClient,
+        cnpj: str,
+        snapshot_from: date,
+        key: tuple[str, date],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        result = await self._fetch_rows_for_cnpj(client, cnpj, snapshot_from)
+        async with self._fund_row_lock:
+            self._fund_rows[key] = (time.monotonic(), result)
+            _trim_ttl_cache(self._fund_rows, self.settings.ticker_cache_max_entries)
+        return result
 
     async def _fetch_rows_for_cnpj(
         self,
@@ -587,8 +805,8 @@ class FundosNetIncomeSource:
         page_size = max(self.settings.fundos_net_page_size, 1)
         scan_limit = max(self.settings.fundos_net_scan_limit, page_size)
         for offset in range(0, scan_limit, page_size):
-            response = await client.get(
-                "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            payload = await self._index_page(
+                client,
                 params={
                     "d": 1,
                     "s": offset,
@@ -602,8 +820,6 @@ class FundosNetIncomeSource:
                     "cnpjFundo": cnpj,
                 },
             )
-            response.raise_for_status()
-            payload = response.json()
             page = _fundos_net_rows(payload)
             rows.extend(page)
             total = _positive_int(payload.get("recordsFiltered"))
@@ -630,18 +846,28 @@ class FundosNetIncomeSource:
                 return cached[1]
             task = self._document_tasks.get(key)
             if task is None:
-                task = asyncio.create_task(self._fetch_document(client, row, key))
+                task = asyncio.create_task(self._fetch_and_cache_document(client, row, key))
                 self._document_tasks[key] = task
-        try:
-            events = await task
-            async with self._document_lock:
-                self._documents[key] = (time.monotonic(), events)
-                _trim_ttl_cache(self._documents, self.settings.fundos_net_scan_limit)
-            return events
-        finally:
-            async with self._document_lock:
-                if self._document_tasks.get(key) is task:
-                    self._document_tasks.pop(key, None)
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._document_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_document(
+        self,
+        client: httpx.AsyncClient,
+        row: dict[str, Any],
+        key: tuple[str, int],
+    ) -> list[IncomeEventObservation]:
+        events = await self._fetch_document(client, row, key)
+        async with self._document_lock:
+            self._documents[key] = (time.monotonic(), events)
+            _trim_ttl_cache(self._documents, self.settings.fundos_net_scan_limit)
+        return events
 
     async def _fetch_document(
         self,
@@ -807,6 +1033,22 @@ def _latest_cvm_documents(
     return sorted(latest.values(), key=lambda row: row.get("Data_Entrega", ""), reverse=True)[
         : max(limit, 0)
     ]
+
+
+_DEBT_ISIN = re.compile(r"^BR[A-Z0-9]{4}DB")
+
+
+def _debt_isin(isin: str | None) -> bool:
+    """Whether an ISIN identifies a debenture rather than a listed share.
+
+    One CVM notice often covers every security an issuer pays on, so a single
+    document lists the shares and the debentures side by side. Their amounts are
+    not comparable: a debenture pays on a face value in the hundreds while a
+    share pays cents. Rows are attributed by the instrument's own ISIN, but when
+    that is unknown the debenture rows would otherwise be read as the share's
+    income and overstate it by orders of magnitude.
+    """
+    return bool(isin and _DEBT_ISIN.match(isin.upper()))
 
 
 def _cvm_income_adjustment(row: dict[str, str]) -> bool:

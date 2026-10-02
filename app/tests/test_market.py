@@ -241,6 +241,16 @@ class _Alpha:
         return None, None
 
 
+class _EtfProfiles:
+    def __init__(self, profile: FundProfile) -> None:
+        self.profile = profile
+        self.calls: list[InstrumentMetadata] = []
+
+    async def get(self, instrument: InstrumentMetadata) -> FundProfile:
+        self.calls.append(instrument)
+        return self.profile
+
+
 @pytest.mark.asyncio
 async def test_instrument_data_service_uses_brapi_for_b3_and_caches_result() -> None:
     instrument = InstrumentMetadata(ticker="BOVA11", instrument_type=InstrumentType.etf)
@@ -258,6 +268,63 @@ async def test_instrument_data_service_uses_brapi_for_b3_and_caches_result() -> 
     assert first is second
     assert first.instrument is instrument
     assert b3.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_instrument_data_service_joins_verified_domestic_etf_profile() -> None:
+    instrument = InstrumentMetadata(
+        ticker="ABTC11",
+        instrument_type=InstrumentType.etf,
+        isin="BRABTCCTF002",
+        source="b3",
+        confidence="high",
+    )
+    profile = FundProfile(
+        net_assets=Decimal("23141900.56"),
+        net_assets_date=date(2026, 9, 23),
+        net_expense_ratio=Decimal("0.0039"),
+        source="https://www.btgpactual.com/asset-management/etf/ABTC11",
+    )
+    etf_profiles = _EtfProfiles(profile)
+    service = InstrumentDataService(
+        Settings(instrument_data_ttl_seconds=60),
+        b3=_B3(instrument),  # type: ignore[arg-type]
+        brapi=_Brapi(),  # type: ignore[arg-type]
+        etf_profiles=etf_profiles,  # type: ignore[arg-type]
+    )
+
+    first = await service.get("ABTC11")
+    second = await service.get("ABTC11")
+
+    assert first is second
+    assert first.fund_profile is profile
+    assert etf_profiles.calls == [instrument]
+
+
+@pytest.mark.asyncio
+async def test_domestic_etf_profile_survives_independent_quote_failure() -> None:
+    instrument = InstrumentMetadata(
+        ticker="ABTC11",
+        instrument_type=InstrumentType.etf,
+        isin="BRABTCCTF002",
+    )
+    profile = FundProfile(
+        net_expense_ratio=Decimal("0.0039"),
+        source="https://www.btgpactual.com/asset-management/etf/ABTC11",
+    )
+    service = InstrumentDataService(
+        Settings(),
+        b3=_B3(instrument),  # type: ignore[arg-type]
+        brapi=BrapiInstrumentDataProvider(
+            Settings(), httpx.MockTransport(lambda _request: httpx.Response(503))
+        ),
+        etf_profiles=_EtfProfiles(profile),  # type: ignore[arg-type]
+    )
+
+    result = await service.get("ABTC11")
+
+    assert result.quote is None
+    assert result.fund_profile is profile
 
 
 @pytest.mark.asyncio
