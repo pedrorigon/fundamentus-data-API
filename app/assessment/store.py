@@ -39,12 +39,17 @@ def _postgres_row_factory(cursor: Any) -> Any:
 
 
 ASSESSMENT_TABLE = "fundamentus_assessment_snapshots"
+ASSESSMENT_BOOTSTRAP_TABLE = "fundamentus_assessment_bootstrap_work"
 MAX_LEASE_SECONDS = 3600
 ASSESSMENT_MAINTENANCE_BATCH_SIZE = 100
 
 
 class AssessmentStoreError(RuntimeError):
     """Raised when durable assessment ownership cannot be established."""
+
+
+class BootstrapIdentityConflictError(AssessmentStoreError):
+    """Raised when a bootstrap key is reused with a different period."""
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,43 @@ class ClaimResult:
     generation: int | None = None
 
 
+@dataclass(frozen=True)
+class BootstrapWork:
+    """Durable admission record for one asynchronous bootstrap calculation.
+
+    ``corporate_name`` is retained from the first admission for worker/wire
+    consistency, but it is intentionally outside the immutable run key.
+    """
+
+    key: str
+    bootstrap_key: str
+    ticker: str
+    kind: str
+    venue: str | None
+    corporate_name: str | None
+    period_at: datetime
+    phase: str
+    lease_token: str | None
+    lease_expires_at: datetime | None
+    retry_at: datetime | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class BootstrapEnqueueResult:
+    state: str
+    work: BootstrapWork
+    record: AssessmentRecord | None = None
+
+
+@dataclass(frozen=True)
+class BootstrapWorkClaim:
+    work: BootstrapWork
+    token: str
+
+
 class AssessmentStore:
     """Durable idempotency and snapshot storage.
 
@@ -129,6 +171,7 @@ class AssessmentStore:
                     await db.execute("PRAGMA journal_mode = WAL")
                     await db.execute("PRAGMA synchronous = NORMAL")
                     await db.executescript(_SCHEMA)
+                    await db.executescript(_BOOTSTRAP_SCHEMA)
                     for statement in _SQLITE_MIGRATIONS:
                         try:
                             await db.execute(statement)
@@ -136,6 +179,7 @@ class AssessmentStore:
                             if "duplicate column name" not in str(exc).lower():
                                 raise
                     await db.execute(_SQLITE_INDEX)
+                    await db.execute(_SQLITE_BOOTSTRAP_INDEX)
                     await db.commit()
                 except BaseException:
                     await db.close()
@@ -200,6 +244,10 @@ class AssessmentStore:
                     WHERE rowid IN (
                         SELECT rowid FROM {ASSESSMENT_TABLE}
                         WHERE period_at < ? AND status != 'processing'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM {ASSESSMENT_BOOTSTRAP_TABLE} bootstrap
+                              WHERE bootstrap.run_key = {ASSESSMENT_TABLE}.run_key
+                          )
                         ORDER BY period_at
                         LIMIT ?
                     )
@@ -207,6 +255,35 @@ class AssessmentStore:
                     (cutoff.isoformat(), limit),
                 )
                 removed = max(0, cursor.rowcount)
+                remaining = max(0, limit - removed)
+                if remaining:
+                    await db.execute(
+                        f"""
+                        DELETE FROM {ASSESSMENT_TABLE}
+                        WHERE run_key IN (
+                            SELECT run_key FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                            WHERE updated_at < ?
+                              AND (phase = 'done' OR (phase = 'failed' AND retry_at IS NULL))
+                            ORDER BY updated_at
+                            LIMIT ?
+                        )
+                        """,
+                        (cutoff.isoformat(), remaining),
+                    )
+                    queue_cursor = await db.execute(
+                        f"""
+                        DELETE FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                        WHERE rowid IN (
+                            SELECT rowid FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                            WHERE updated_at < ?
+                              AND (phase = 'done' OR (phase = 'failed' AND retry_at IS NULL))
+                            ORDER BY updated_at
+                            LIMIT ?
+                        )
+                        """,
+                        (cutoff.isoformat(), remaining),
+                    )
+                    removed += max(0, queue_cursor.rowcount)
                 await db.commit()
             except BaseException:
                 await db.rollback()
@@ -243,6 +320,10 @@ class AssessmentStore:
                     f"""
                     SELECT * FROM {ASSESSMENT_TABLE}
                     WHERE status = 'processing'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {ASSESSMENT_BOOTSTRAP_TABLE} bootstrap
+                          WHERE bootstrap.run_key = {ASSESSMENT_TABLE}.run_key
+                      )
                       AND lease_expires_at IS NOT NULL
                       AND lease_expires_at <= ?
                     ORDER BY period_at, run_key
@@ -294,6 +375,334 @@ class AssessmentStore:
         terminalized = await self.terminalize_expired(now=current, batch_size=limit)
         removed = await self.cleanup_before(before, batch_size=limit)
         return terminalized, removed
+
+    async def enqueue_bootstrap(
+        self,
+        *,
+        key: str,
+        bootstrap_key: str,
+        ticker: str,
+        kind: str,
+        venue: str | None,
+        period_at: datetime,
+        corporate_name: str | None = None,
+        now: datetime | None = None,
+    ) -> BootstrapEnqueueResult:
+        """Durably admit one bootstrap request before returning to HTTP.
+
+        The queue owns the first-input timestamp.  A retry with the same
+        immutable key but a different period is rejected without returning the
+        stored identity to the caller.  The assessment snapshot table remains
+        the source of truth for the eventual payload and provider lease.
+        """
+
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        period = _utc(period_at)
+        if self.database_url:
+            return await self._postgres_enqueue_bootstrap(
+                key,
+                bootstrap_key,
+                ticker,
+                kind,
+                venue,
+                corporate_name,
+                period,
+                current,
+            )
+
+        async with self._lock:
+            db = self._require_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    f"SELECT * FROM {ASSESSMENT_BOOTSTRAP_TABLE} WHERE run_key = ?",
+                    (key,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    work = _new_bootstrap_work(
+                        key=key,
+                        bootstrap_key=bootstrap_key,
+                        ticker=ticker,
+                        kind=kind,
+                        venue=venue,
+                        corporate_name=corporate_name,
+                        period_at=period,
+                        now=current,
+                    )
+                    await db.execute(_INSERT_BOOTSTRAP_SQLITE, _bootstrap_work_params(work))
+                    result = BootstrapEnqueueResult("queued", work)
+                else:
+                    work = _bootstrap_work(row)
+                    if not _bootstrap_identity_matches(
+                        work,
+                        bootstrap_key=bootstrap_key,
+                        ticker=ticker,
+                        kind=kind,
+                        venue=venue,
+                        period_at=period,
+                    ):
+                        raise BootstrapIdentityConflictError(
+                            "Bootstrap identity was already admitted with a different period."
+                        )
+                    work, state = _prepare_bootstrap_work(work, now=current)
+                    if work != _bootstrap_work(row):
+                        await db.execute(
+                            _UPDATE_BOOTSTRAP_SQLITE,
+                            _bootstrap_work_params(work)[1:] + (work.key,),
+                        )
+                    async with db.execute(
+                        f"SELECT * FROM {ASSESSMENT_TABLE} WHERE run_key = ?",
+                        (key,),
+                    ) as snapshot_cur:
+                        snapshot_row = await snapshot_cur.fetchone()
+                    record = _record(snapshot_row) if snapshot_row is not None else None
+                    if record is not None and record.status is AssessmentRunStatus.completed:
+                        state = "completed"
+                    elif record is not None and record.status is AssessmentRunStatus.failed:
+                        if record.retry_at is not None and record.retry_at > current:
+                            state = "retry_wait"
+                        elif state not in {"queued", "processing"}:
+                            state = "failed"
+                    result = BootstrapEnqueueResult(state, work, record)
+                await db.commit()
+                return result
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def claim_bootstrap_due(
+        self,
+        *,
+        limit: int,
+        now: datetime | None = None,
+        lease_seconds: int | None = None,
+    ) -> list[BootstrapWorkClaim]:
+        """Claim queued/due bootstrap work with a short durable queue lease."""
+
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        duration = min(MAX_LEASE_SECONDS, max(1, lease_seconds or self.default_lease_seconds))
+        expires = current + timedelta(seconds=duration)
+        count = max(1, limit)
+        if self.database_url:
+            return await self._postgres_claim_bootstrap_due(count, current, expires)
+
+        claims: list[BootstrapWorkClaim] = []
+        async with self._lock:
+            db = self._require_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    f"""
+                    SELECT * FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                    WHERE phase = 'queued'
+                       OR (phase = 'running' AND lease_expires_at IS NOT NULL
+                           AND lease_expires_at <= ?)
+                       OR (phase = 'failed' AND retry_at IS NOT NULL AND retry_at <= ?)
+                    ORDER BY created_at, run_key
+                    LIMIT ?
+                    """,
+                    (current.isoformat(), current.isoformat(), count),
+                ) as cur:
+                    rows = await cur.fetchall()
+                for row in rows:
+                    work = _bootstrap_work(row)
+                    token = secrets.token_urlsafe(24)
+                    updated = replace(
+                        work,
+                        phase="running",
+                        lease_token=token,
+                        lease_expires_at=expires,
+                        retry_at=None,
+                        updated_at=current,
+                    )
+                    cursor = await db.execute(
+                        _UPDATE_BOOTSTRAP_SQLITE,
+                        _bootstrap_work_params(updated)[1:] + (updated.key,),
+                    )
+                    if cursor.rowcount == 1:
+                        claims.append(BootstrapWorkClaim(updated, token))
+                await db.commit()
+                return claims
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def renew_bootstrap_lease(
+        self,
+        *,
+        key: str,
+        token: str,
+        now: datetime | None = None,
+        lease_seconds: int | None = None,
+    ) -> bool:
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        duration = min(MAX_LEASE_SECONDS, max(1, lease_seconds or self.default_lease_seconds))
+        expires = current + timedelta(seconds=duration)
+        if self.database_url:
+            return await self._postgres_renew_bootstrap_lease(key, token, current, expires)
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                f"""
+                UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE run_key = ? AND phase = 'running'
+                  AND lease_token = ? AND lease_expires_at > ?
+                """,
+                (expires.isoformat(), current.isoformat(), key, token, current.isoformat()),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def complete_bootstrap(
+        self,
+        *,
+        key: str,
+        token: str,
+        success: bool,
+        retry_after_seconds: int = 0,
+        error: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Mark a queue item done or schedule a bounded retry."""
+
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        retry_at = (
+            current + timedelta(seconds=max(0, retry_after_seconds))
+            if not success and retry_after_seconds > 0
+            else None
+        )
+        phase = "done" if success else "failed"
+        if self.database_url:
+            return await self._postgres_complete_bootstrap(
+                key, token, phase, retry_at, error, current
+            )
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                f"""
+                UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+                SET phase = ?, lease_token = NULL, lease_expires_at = NULL,
+                    retry_at = ?, error = ?, updated_at = ?
+                WHERE run_key = ? AND phase = 'running' AND lease_token = ?
+                """,
+                (
+                    phase,
+                    retry_at.isoformat() if retry_at else None,
+                    error,
+                    current.isoformat(),
+                    key,
+                    token,
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def release_bootstrap(
+        self,
+        *,
+        key: str,
+        token: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return an owned queue item to the front of the queue."""
+
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        if self.database_url:
+            return await self._postgres_release_bootstrap(key, token, current)
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                f"""
+                UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+                SET phase = 'queued', lease_token = NULL, lease_expires_at = NULL,
+                    retry_at = NULL, updated_at = ?
+                WHERE run_key = ? AND phase = 'running' AND lease_token = ?
+                """,
+                (current.isoformat(), key, token),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def renew_claim(
+        self,
+        *,
+        key: str,
+        token: str,
+        generation: int,
+        now: datetime | None = None,
+        lease_seconds: int | None = None,
+    ) -> bool:
+        """Extend a provider lease without changing its attempt budget."""
+
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        duration = min(MAX_LEASE_SECONDS, max(1, lease_seconds or self.default_lease_seconds))
+        expires = current + timedelta(seconds=duration)
+        if self.database_url:
+            return await self._postgres_renew_claim(key, token, generation, current, expires)
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                f"""
+                UPDATE {ASSESSMENT_TABLE}
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE run_key = ? AND status = 'processing'
+                  AND lease_token = ? AND generation = ? AND lease_expires_at > ?
+                """,
+                (
+                    expires.isoformat(),
+                    current.isoformat(),
+                    key,
+                    token,
+                    generation,
+                    current.isoformat(),
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def release_claim(
+        self,
+        *,
+        key: str,
+        token: str,
+        generation: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Fence and requeue a cancelled provider build immediately."""
+
+        self._ensure_started()
+        current = _utc(now or datetime.now(UTC))
+        if self.database_url:
+            return await self._postgres_release_claim(key, token, generation, current)
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                f"""
+                UPDATE {ASSESSMENT_TABLE}
+                SET status = 'failed', error = 'cancelled',
+                    lease_token = NULL, lease_expires_at = NULL,
+                    retry_at = ?, updated_at = ?
+                WHERE run_key = ? AND status = 'processing'
+                  AND lease_token = ? AND generation = ?
+                """,
+                (
+                    current.isoformat(),
+                    current.isoformat(),
+                    key,
+                    token,
+                    generation,
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
 
     async def claim(
         self,
@@ -502,12 +911,14 @@ class AssessmentStore:
         async with await _postgres_connect(self.database_url) as conn:
             await postgres_lock_schema(conn, "fundamentus_assessment_schema")
             await conn.execute(_POSTGRES_SCHEMA)
+            await conn.execute(_POSTGRES_BOOTSTRAP_SCHEMA)
             for statement in _POSTGRES_MIGRATIONS:
                 await conn.execute(statement)
             # Legacy installations may not have ``venue`` yet.  Keep index
             # creation after additive migrations so PostgreSQL can initialize
             # both fresh and upgraded databases in one startup transaction.
             await conn.execute(_POSTGRES_INDEX)
+            await conn.execute(_POSTGRES_BOOTSTRAP_INDEX)
             await conn.commit()
 
     async def _postgres_fetchone(self, query: str, params: tuple[Any, ...]) -> Any:
@@ -526,13 +937,62 @@ class AssessmentStore:
                         WHERE ctid IN (
                             SELECT ctid FROM {ASSESSMENT_TABLE}
                             WHERE period_at < %s AND status != 'processing'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM {ASSESSMENT_BOOTSTRAP_TABLE} bootstrap
+                                  WHERE bootstrap.run_key = {ASSESSMENT_TABLE}.run_key
+                              )
                             ORDER BY period_at
                             LIMIT %s
                         )
                         """,
                         (cutoff, limit),
                     )
-                    return max(0, int(cur.rowcount))
+                    removed = max(0, int(cur.rowcount))
+                    # Keep this probe separate from the assessment DELETE so
+                    # lightweight PostgreSQL test doubles that model only the
+                    # historical table still report the original row count.
+                    remaining = max(0, limit - removed)
+                    if not remaining:
+                        return removed
+                    await cur.execute(
+                        f"""
+                        SELECT 1 FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                        WHERE updated_at < %s
+                          AND (phase = 'done' OR (phase = 'failed' AND retry_at IS NULL))
+                        LIMIT 1
+                        """,
+                        (cutoff,),
+                    )
+                    queue_exists = await cur.fetchone()
+                    if queue_exists is None:
+                        return removed
+                    await cur.execute(
+                        f"""
+                        DELETE FROM {ASSESSMENT_TABLE}
+                        WHERE run_key IN (
+                            SELECT run_key FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                            WHERE updated_at < %s
+                              AND (phase = 'done' OR (phase = 'failed' AND retry_at IS NULL))
+                            ORDER BY updated_at
+                            LIMIT %s
+                        )
+                        """,
+                        (cutoff, remaining),
+                    )
+                    await cur.execute(
+                        f"""
+                        DELETE FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                        WHERE ctid IN (
+                            SELECT ctid FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                            WHERE updated_at < %s
+                              AND (phase = 'done' OR (phase = 'failed' AND retry_at IS NULL))
+                            ORDER BY updated_at
+                            LIMIT %s
+                        )
+                        """,
+                        (cutoff, remaining),
+                    )
+                    return removed + max(0, int(cur.rowcount))
 
     async def _postgres_terminalize_expired(self, now: datetime, limit: int) -> int:
         async with await _postgres_connect(self.database_url) as conn:
@@ -542,6 +1002,10 @@ class AssessmentStore:
                         f"""
                         SELECT * FROM {ASSESSMENT_TABLE}
                         WHERE status = 'processing'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM {ASSESSMENT_BOOTSTRAP_TABLE} bootstrap
+                              WHERE bootstrap.run_key = {ASSESSMENT_TABLE}.run_key
+                          )
                           AND lease_expires_at IS NOT NULL
                           AND lease_expires_at <= %s
                         ORDER BY period_at, run_key
@@ -576,6 +1040,211 @@ class AssessmentStore:
                         )
                         terminalized += max(0, int(cur.rowcount))
                     return terminalized
+
+    async def _postgres_enqueue_bootstrap(
+        self,
+        key: str,
+        bootstrap_key: str,
+        ticker: str,
+        kind: str,
+        venue: str | None,
+        corporate_name: str | None,
+        period_at: datetime,
+        now: datetime,
+    ) -> BootstrapEnqueueResult:
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor(row_factory=_postgres_row_factory) as cur:
+                    work = _new_bootstrap_work(
+                        key=key,
+                        bootstrap_key=bootstrap_key,
+                        ticker=ticker,
+                        kind=kind,
+                        venue=venue,
+                        corporate_name=corporate_name,
+                        period_at=period_at,
+                        now=now,
+                    )
+                    await cur.execute(
+                        _INSERT_BOOTSTRAP_POSTGRES,
+                        _bootstrap_work_params(work, postgres=True),
+                    )
+                    await cur.execute(
+                        f"SELECT * FROM {ASSESSMENT_BOOTSTRAP_TABLE} WHERE run_key = %s FOR UPDATE",
+                        (key,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise AssessmentStoreError(
+                            f"PostgreSQL bootstrap row disappeared for key {key!r}"
+                        )
+                    persisted = _bootstrap_work(row)
+                    if not _bootstrap_identity_matches(
+                        persisted,
+                        bootstrap_key=bootstrap_key,
+                        ticker=ticker,
+                        kind=kind,
+                        venue=venue,
+                        period_at=period_at,
+                    ):
+                        raise BootstrapIdentityConflictError(
+                            "Bootstrap identity was already admitted with a different period."
+                        )
+                    persisted, state = _prepare_bootstrap_work(persisted, now=now)
+                    if persisted != _bootstrap_work(row):
+                        await cur.execute(
+                            _UPDATE_BOOTSTRAP_POSTGRES,
+                            _bootstrap_work_params(persisted, postgres=True)[1:] + (persisted.key,),
+                        )
+                    await cur.execute(
+                        f"SELECT * FROM {ASSESSMENT_TABLE} WHERE run_key = %s",
+                        (key,),
+                    )
+                    snapshot_row = await cur.fetchone()
+                    record = _record(snapshot_row) if snapshot_row is not None else None
+                    if record is not None and record.status is AssessmentRunStatus.completed:
+                        state = "completed"
+                    elif record is not None and record.status is AssessmentRunStatus.failed:
+                        state = (
+                            "retry_wait"
+                            if record.retry_at is not None and record.retry_at > now
+                            else state
+                        )
+                    return BootstrapEnqueueResult(state, persisted, record)
+
+    async def _postgres_claim_bootstrap_due(
+        self,
+        limit: int,
+        now: datetime,
+        expires: datetime,
+    ) -> list[BootstrapWorkClaim]:
+        claims: list[BootstrapWorkClaim] = []
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor(row_factory=_postgres_row_factory) as cur:
+                    await cur.execute(
+                        f"""
+                        SELECT * FROM {ASSESSMENT_BOOTSTRAP_TABLE}
+                        WHERE phase = 'queued'
+                           OR (phase = 'running' AND lease_expires_at IS NOT NULL
+                               AND lease_expires_at <= %s)
+                           OR (phase = 'failed' AND retry_at IS NOT NULL AND retry_at <= %s)
+                        ORDER BY created_at, run_key
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (now, now, limit),
+                    )
+                    rows = await cur.fetchall()
+                    for row in rows:
+                        work = _bootstrap_work(row)
+                        token = secrets.token_urlsafe(24)
+                        updated = replace(
+                            work,
+                            phase="running",
+                            lease_token=token,
+                            lease_expires_at=expires,
+                            retry_at=None,
+                            updated_at=now,
+                        )
+                        await cur.execute(
+                            _UPDATE_BOOTSTRAP_POSTGRES,
+                            _bootstrap_work_params(updated, postgres=True)[1:] + (updated.key,),
+                        )
+                        claims.append(BootstrapWorkClaim(updated, token))
+        return claims
+
+    async def _postgres_renew_bootstrap_lease(
+        self, key: str, token: str, now: datetime, expires: datetime
+    ) -> bool:
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+                        SET lease_expires_at = %s, updated_at = %s
+                        WHERE run_key = %s AND phase = 'running'
+                          AND lease_token = %s AND lease_expires_at > %s
+                        """,
+                        (expires, now, key, token, now),
+                    )
+                    return int(cur.rowcount) == 1
+
+    async def _postgres_complete_bootstrap(
+        self,
+        key: str,
+        token: str,
+        phase: str,
+        retry_at: datetime | None,
+        error: str | None,
+        now: datetime,
+    ) -> bool:
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+                        SET phase = %s, lease_token = NULL, lease_expires_at = NULL,
+                            retry_at = %s, error = %s, updated_at = %s
+                        WHERE run_key = %s AND phase = 'running' AND lease_token = %s
+                        """,
+                        (phase, retry_at, error, now, key, token),
+                    )
+                    return int(cur.rowcount) == 1
+
+    async def _postgres_release_bootstrap(self, key: str, token: str, now: datetime) -> bool:
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+                        SET phase = 'queued', lease_token = NULL,
+                            lease_expires_at = NULL, retry_at = NULL, updated_at = %s
+                        WHERE run_key = %s AND phase = 'running' AND lease_token = %s
+                        """,
+                        (now, key, token),
+                    )
+                    return int(cur.rowcount) == 1
+
+    async def _postgres_renew_claim(
+        self, key: str, token: str, generation: int, now: datetime, expires: datetime
+    ) -> bool:
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE {ASSESSMENT_TABLE}
+                        SET lease_expires_at = %s, updated_at = %s
+                        WHERE run_key = %s AND status = 'processing'
+                          AND lease_token = %s AND generation = %s
+                          AND lease_expires_at > %s
+                        """,
+                        (expires, now, key, token, generation, now),
+                    )
+                    return int(cur.rowcount) == 1
+
+    async def _postgres_release_claim(
+        self, key: str, token: str, generation: int, now: datetime
+    ) -> bool:
+        async with await _postgres_connect(self.database_url) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE {ASSESSMENT_TABLE}
+                        SET status = 'failed', error = 'cancelled',
+                            lease_token = NULL, lease_expires_at = NULL,
+                            retry_at = %s, updated_at = %s
+                        WHERE run_key = %s AND status = 'processing'
+                          AND lease_token = %s AND generation = %s
+                        """,
+                        (now, now, key, token, generation),
+                    )
+                    return int(cur.rowcount) == 1
 
     async def _postgres_claim(
         self,
@@ -769,6 +1438,129 @@ class AssessmentStore:
                         ),
                     )
                     return int(cur.rowcount) == 1
+
+
+def _new_bootstrap_work(
+    *,
+    key: str,
+    bootstrap_key: str,
+    ticker: str,
+    kind: str,
+    venue: str | None,
+    corporate_name: str | None,
+    period_at: datetime,
+    now: datetime,
+) -> BootstrapWork:
+    return BootstrapWork(
+        key=key,
+        bootstrap_key=bootstrap_key,
+        ticker=ticker,
+        kind=kind,
+        venue=venue,
+        corporate_name=corporate_name,
+        period_at=_utc(period_at),
+        phase="queued",
+        lease_token=None,
+        lease_expires_at=None,
+        retry_at=None,
+        error=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _bootstrap_identity_matches(
+    work: BootstrapWork,
+    *,
+    bootstrap_key: str,
+    ticker: str,
+    kind: str,
+    venue: str | None,
+    period_at: datetime,
+) -> bool:
+    return (
+        work.bootstrap_key == bootstrap_key
+        and work.ticker == ticker
+        and work.kind == kind
+        and work.venue == venue
+        and work.period_at == _utc(period_at)
+    )
+
+
+def _prepare_bootstrap_work(work: BootstrapWork, *, now: datetime) -> tuple[BootstrapWork, str]:
+    """Normalize queue state after an enqueue or retry admission."""
+
+    if work.phase == "running":
+        if work.lease_expires_at is not None and work.lease_expires_at > now:
+            return work, "processing"
+        return (
+            replace(
+                work,
+                phase="queued",
+                lease_token=None,
+                lease_expires_at=None,
+                retry_at=None,
+                updated_at=now,
+            ),
+            "queued",
+        )
+    if work.phase == "queued":
+        return work, "processing"
+    if work.phase == "failed":
+        if work.retry_at is not None and work.retry_at > now:
+            return work, "retry_wait"
+        if work.retry_at is not None:
+            return (
+                replace(work, phase="queued", retry_at=None, error=None, updated_at=now),
+                "queued",
+            )
+        return work, "failed"
+    if work.phase == "done":
+        return work, "completed"
+    raise AssessmentStoreError(f"Unknown bootstrap queue phase {work.phase!r}")
+
+
+def _bootstrap_work(row: Any) -> BootstrapWork:
+    return BootstrapWork(
+        key=str(row["run_key"]),
+        bootstrap_key=str(row["bootstrap_key"]),
+        ticker=str(row["ticker"]),
+        kind=str(row["kind"]),
+        venue=row["venue"],
+        corporate_name=row["corporate_name"],
+        period_at=_parse_datetime(row["period_at"]),
+        phase=str(row["phase"]),
+        lease_token=row["lease_token"],
+        lease_expires_at=_parse_optional_datetime(row["lease_expires_at"]),
+        retry_at=_parse_optional_datetime(row["retry_at"]),
+        error=row["error"],
+        created_at=_parse_datetime(row["created_at"]),
+        updated_at=_parse_datetime(row["updated_at"]),
+    )
+
+
+def _bootstrap_work_params(
+    work: BootstrapWork,
+    *,
+    postgres: bool = False,
+) -> tuple[Any, ...]:
+    del postgres
+    return (
+        work.key,
+        work.bootstrap_key,
+        work.ticker,
+        work.kind,
+        work.venue,
+        work.corporate_name,
+        work.period_at.isoformat(),
+        work.phase,
+        work.lease_token,
+        work.lease_expires_at.isoformat() if work.lease_expires_at else None,
+        work.retry_at.isoformat() if work.retry_at else None,
+        work.error,
+        work.created_at.isoformat(),
+        work.updated_at.isoformat(),
+    )
 
 
 def _claim_decision(
@@ -1023,6 +1815,25 @@ CREATE TABLE IF NOT EXISTS {ASSESSMENT_TABLE} (
 );
 """
 
+_BOOTSTRAP_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {ASSESSMENT_BOOTSTRAP_TABLE} (
+    run_key TEXT PRIMARY KEY,
+    bootstrap_key TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    venue TEXT,
+    corporate_name TEXT,
+    period_at TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    retry_at TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 _POSTGRES_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {ASSESSMENT_TABLE} (
     run_key TEXT PRIMARY KEY,
@@ -1048,15 +1859,39 @@ CREATE TABLE IF NOT EXISTS {ASSESSMENT_TABLE} (
 );
 """
 
+_POSTGRES_BOOTSTRAP_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {ASSESSMENT_BOOTSTRAP_TABLE} (
+    run_key TEXT PRIMARY KEY,
+    bootstrap_key TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    venue TEXT,
+    corporate_name TEXT,
+    period_at TIMESTAMPTZ NOT NULL,
+    phase TEXT NOT NULL,
+    lease_token TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    retry_at TIMESTAMPTZ,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+"""
+
 _POSTGRES_MIGRATIONS = (
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN IF NOT EXISTS venue TEXT",
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN IF NOT EXISTS last_good_payload TEXT",
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN IF NOT EXISTS last_good_evidence_digest TEXT",
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN IF NOT EXISTS last_good_fetched_at TIMESTAMPTZ",
+    f"ALTER TABLE {ASSESSMENT_BOOTSTRAP_TABLE} ADD COLUMN IF NOT EXISTS corporate_name TEXT",
 )
 _POSTGRES_INDEX = f"""
 CREATE INDEX IF NOT EXISTS ix_fundamentus_assessment_snapshots_period
     ON {ASSESSMENT_TABLE} (ticker, kind, profile, venue, period_at)
+"""
+_POSTGRES_BOOTSTRAP_INDEX = f"""
+CREATE INDEX IF NOT EXISTS ix_fundamentus_assessment_bootstrap_due
+    ON {ASSESSMENT_BOOTSTRAP_TABLE} (phase, retry_at, lease_expires_at, created_at)
 """
 
 # ``CREATE TABLE IF NOT EXISTS`` does not add columns to an installation that
@@ -1068,11 +1903,35 @@ _SQLITE_MIGRATIONS = (
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN last_good_payload TEXT",
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN last_good_evidence_digest TEXT",
     f"ALTER TABLE {ASSESSMENT_TABLE} ADD COLUMN last_good_fetched_at TEXT",
+    f"ALTER TABLE {ASSESSMENT_BOOTSTRAP_TABLE} ADD COLUMN corporate_name TEXT",
 )
 _SQLITE_INDEX = f"""
 CREATE INDEX IF NOT EXISTS ix_fundamentus_assessment_snapshots_period
     ON {ASSESSMENT_TABLE} (ticker, kind, profile, venue, period_at)
 """
+_SQLITE_BOOTSTRAP_INDEX = f"""
+CREATE INDEX IF NOT EXISTS ix_fundamentus_assessment_bootstrap_due
+    ON {ASSESSMENT_BOOTSTRAP_TABLE} (phase, retry_at, lease_expires_at, created_at)
+"""
+
+_INSERT_BOOTSTRAP_SQLITE = f"""
+INSERT INTO {ASSESSMENT_BOOTSTRAP_TABLE} (
+    run_key, bootstrap_key, ticker, kind, venue, corporate_name, period_at, phase,
+    lease_token, lease_expires_at, retry_at, error, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(run_key) DO NOTHING
+"""
+_INSERT_BOOTSTRAP_POSTGRES = _INSERT_BOOTSTRAP_SQLITE.replace("?", "%s")
+
+_UPDATE_BOOTSTRAP_SQLITE = f"""
+UPDATE {ASSESSMENT_BOOTSTRAP_TABLE}
+SET bootstrap_key = ?, ticker = ?, kind = ?, venue = ?, corporate_name = ?,
+    period_at = ?, phase = ?,
+    lease_token = ?, lease_expires_at = ?, retry_at = ?, error = ?,
+    created_at = ?, updated_at = ?
+WHERE run_key = ?
+"""
+_UPDATE_BOOTSTRAP_POSTGRES = _UPDATE_BOOTSTRAP_SQLITE.replace("?", "%s")
 
 _UPSERT_SQLITE = f"""
 INSERT INTO {ASSESSMENT_TABLE} (
@@ -1134,9 +1993,14 @@ WHERE run_key = %s
 
 __all__ = [
     "ASSESSMENT_TABLE",
+    "ASSESSMENT_BOOTSTRAP_TABLE",
     "ASSESSMENT_MAINTENANCE_BATCH_SIZE",
     "MAX_LEASE_SECONDS",
     "AssessmentClaim",
+    "BootstrapEnqueueResult",
+    "BootstrapIdentityConflictError",
+    "BootstrapWork",
+    "BootstrapWorkClaim",
     "AssessmentRecord",
     "AssessmentStoreError",
     "AssessmentStore",

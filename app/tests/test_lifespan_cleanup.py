@@ -142,6 +142,30 @@ def lifespan_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             super().__init__("assessment", events, fail_stage=fail_stage, close_error=close_error)
             resources["assessment"] = self
 
+        async def claim_bootstrap_due(self, **_kwargs: Any) -> list[Any]:
+            return []
+
+        async def complete_bootstrap(self, **_kwargs: Any) -> bool:
+            return True
+
+        async def renew_bootstrap_lease(self, **_kwargs: Any) -> bool:
+            return True
+
+        async def claim(self, **_kwargs: Any) -> object:
+            raise AssertionError("test assessment queue should not claim work")
+
+        async def release_bootstrap(self, **_kwargs: Any) -> bool:
+            return True
+
+        async def release_claim(self, **_kwargs: Any) -> bool:
+            return True
+
+        async def renew_claim(self, **_kwargs: Any) -> bool:
+            return True
+
+        async def enqueue_bootstrap(self, **_kwargs: Any) -> object:
+            raise AssertionError("test assessment queue should not be admitted")
+
     class ClientWithFailure(Client):
         async def startup(self) -> None:
             self.events.append("client.startup")
@@ -179,6 +203,10 @@ def lifespan_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             return AssessmentWithCleanupFailure(*args, **kwargs)
         return Assessment(*args, **kwargs)
 
+    class AssessmentService(_Dependency):
+        def set_bootstrap_wakeup(self, _callback: object) -> None:
+            events.append("assessment.set_bootstrap_wakeup")
+
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "CacheStore", CacheWithFailure)
     monkeypatch.setattr(main, "FundamentusClient", ClientWithFailure)
@@ -202,7 +230,11 @@ def lifespan_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "BcbBankProvider",
         "AssessmentSnapshotService",
     ):
-        monkeypatch.setattr(main, name, _Dependency)
+        monkeypatch.setattr(
+            main,
+            name,
+            AssessmentService if name == "AssessmentSnapshotService" else _Dependency,
+        )
 
     return {"config": config, "events": events, "resources": resources, "settings": settings}
 

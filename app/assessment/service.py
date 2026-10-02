@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
@@ -12,11 +13,18 @@ from app.assessment.models import (
     ASSESSMENT_TIMEZONE,
     AssessmentComponentState,
     AssessmentComponentStatus,
+    AssessmentMode,
     AssessmentRunStatus,
     AssessmentSnapshotRequest,
     AssessmentSnapshotResponse,
 )
-from app.assessment.store import AssessmentStore, ClaimResult
+from app.assessment.store import (
+    AssessmentStore,
+    ClaimResult,
+)
+from app.assessment.store import (
+    BootstrapIdentityConflictError as BootstrapStoreIdentityConflictError,
+)
 from app.core.errors import APIError, InvalidTickerError
 from app.models import (
     FundamentalsSnapshot,
@@ -37,6 +45,12 @@ class InvalidAssessmentPeriodError(APIError):
     status_code = 400
     code = "INVALID_ASSESSMENT_PERIOD"
     message = "Assessment period is outside the supported scheduler window."
+
+
+class BootstrapIdentityConflictError(APIError):
+    status_code = 409
+    code = "BOOTSTRAP_IDENTITY_CONFLICT"
+    message = "Bootstrap identity was already admitted with a different period."
 
 
 T = TypeVar("T")
@@ -79,6 +93,7 @@ class AssessmentSnapshotService:
         *,
         period_history_days: int = 370,
         retry_backoff_seconds: int = 15,
+        bootstrap_retry_after_seconds: int = 2,
     ) -> None:
         self.store = store
         self.opportunity = opportunity
@@ -86,9 +101,18 @@ class AssessmentSnapshotService:
         self.quality = quality
         self.period_history_days = max(1, period_history_days)
         self.retry_backoff_seconds = max(0, retry_backoff_seconds)
+        self.bootstrap_retry_after_seconds = min(60, max(1, bootstrap_retry_after_seconds))
+        self._bootstrap_wakeup: Callable[[], None] | None = None
+
+    def set_bootstrap_wakeup(self, callback: Callable[[], None] | None) -> None:
+        """Attach the lifecycle-managed worker's wake callback."""
+
+        self._bootstrap_wakeup = callback
 
     async def resolve(self, request: AssessmentSnapshotRequest) -> AssessmentSnapshotResponse:
         normalized = self._normalize_request(request)
+        if normalized.mode is AssessmentMode.bootstrap:
+            return await self._resolve_bootstrap(normalized)
         key = assessment_key(normalized)
         now = _now_local()
         self._validate_period(normalized.period_at, now=now, enforce_capture_window=False)
@@ -114,51 +138,125 @@ class AssessmentSnapshotService:
             return self._claim_response(normalized, claim)
         assert claim.token is not None
         assert claim.generation is not None
+        response, _committed = await self._execute_claim(normalized, key, claim)
+        return response
+
+    async def execute_claim(
+        self,
+        request: AssessmentSnapshotRequest,
+        key: str,
+        claim: ClaimResult,
+    ) -> tuple[AssessmentSnapshotResponse, bool]:
+        """Build/publish one worker-owned claim off the HTTP request path."""
+
+        return await self._execute_claim(request, key, claim)
+
+    async def _resolve_bootstrap(
+        self, request: AssessmentSnapshotRequest
+    ) -> AssessmentSnapshotResponse:
+        assert request.bootstrap_key is not None
+        key = bootstrap_assessment_key(request)
+        self._validate_bootstrap_period(request.period_at)
         try:
-            response = await self._build(normalized)
-        # Provider adapters normalize their expected failures below, but an
-        # ordinary programming or integration exception must still leave a
-        # durable, sanitized failure for this claim. ``Exception`` excludes
-        # ``CancelledError``/other control-flow ``BaseException`` values, so
-        # shutdown and task cancellation continue to propagate normally.
-        except Exception as exc:
-            response = self._unexpected_failure(normalized, exc)
-            await self.store.fail(
+            admitted = await self.store.enqueue_bootstrap(
                 key=key,
-                token=claim.token,
-                generation=claim.generation,
-                response=response,
-                retry_after_seconds=self._retry_delay(claim.record.attempts),
+                bootstrap_key=request.bootstrap_key,
+                ticker=request.ticker,
+                kind=request.kind.value,
+                venue=request.venue,
+                corporate_name=request.corporate_name,
+                period_at=request.period_at,
             )
-            return response
+        except BootstrapStoreIdentityConflictError as exc:
+            # Do not expose the already-admitted timestamp or instrument
+            # identity.  The caller can safely retry with the original
+            # immutable input, but cannot use this response to probe another
+            # client's snapshot.
+            raise BootstrapIdentityConflictError() from exc
 
-        # A build with no usable component is a provider failure.  Route it
-        # through ``fail`` so a transient outage cannot replace the durable
-        # last-good snapshot with an empty completed result.
-        if response.status is AssessmentRunStatus.failed:
-            await self.store.fail(
-                key=key,
-                token=claim.token,
-                generation=claim.generation,
-                response=response,
-                retry_after_seconds=self._retry_delay(claim.record.attempts),
+        record = admitted.record
+        if record is not None and record.response() is not None:
+            existing = self._bootstrap_response(request, record.response())
+            if existing.status is AssessmentRunStatus.failed:
+                existing = existing.model_copy(
+                    update={"retry_after_seconds": _remaining_seconds(record.retry_at)}
+                )
+            return existing
+        if admitted.state == "failed":
+            return self._bootstrap_processing_response(
+                request,
+                period_at=admitted.work.period_at,
+                status=AssessmentRunStatus.failed,
+                error=admitted.work.error or "Bootstrap assessment failed.",
             )
-            return response
-
-        published = await self.store.publish(
-            key=key,
-            token=claim.token,
-            generation=claim.generation,
-            response=response,
+        if admitted.state == "retry_wait":
+            return self._bootstrap_processing_response(
+                request,
+                period_at=admitted.work.period_at,
+                status=AssessmentRunStatus.failed,
+                error=admitted.work.error or "Bootstrap assessment is waiting to retry.",
+                retry_after_seconds=_remaining_seconds(admitted.work.retry_at),
+            )
+        response = self._bootstrap_processing_response(
+            request,
+            period_at=admitted.work.period_at,
+            status=AssessmentRunStatus.processing,
+            retry_after_seconds=self.bootstrap_retry_after_seconds,
         )
-        if published:
-            return response
-        # A lease can expire while an upstream request is in flight.  Never
-        # return a stale worker's result as if it had been published.
-        latest = await self.store.get(key)
-        if latest is not None and latest.response() is not None:
-            return latest.response()  # type: ignore[return-value]
-        return self._in_progress_response(normalized)
+        if admitted.state == "queued" and self._bootstrap_wakeup is not None:
+            self._bootstrap_wakeup()
+        return response
+
+    def _validate_bootstrap_period(self, period_at: datetime) -> None:
+        if period_at.tzinfo is None or period_at.utcoffset() is None:
+            raise InvalidAssessmentPeriodError("Assessment period must include a timezone offset.")
+        current = _now_local().astimezone(UTC)
+        normalized = period_at.astimezone(UTC)
+        if normalized > current:
+            raise InvalidAssessmentPeriodError("Assessment periods cannot be in the future.")
+        if normalized.date() < current.date() - timedelta(days=self.period_history_days):
+            raise InvalidAssessmentPeriodError("Assessment period is outside retention window.")
+
+    def _bootstrap_response(
+        self,
+        request: AssessmentSnapshotRequest,
+        response: AssessmentSnapshotResponse | None,
+    ) -> AssessmentSnapshotResponse:
+        if response is None:
+            return self._bootstrap_processing_response(
+                request,
+                period_at=request.period_at,
+                status=AssessmentRunStatus.processing,
+                retry_after_seconds=self.bootstrap_retry_after_seconds,
+            )
+        return response.model_copy(
+            update={
+                "mode": AssessmentMode.bootstrap,
+                "bootstrap_key": request.bootstrap_key,
+            }
+        )
+
+    def _bootstrap_processing_response(
+        self,
+        request: AssessmentSnapshotRequest,
+        *,
+        period_at: datetime,
+        status: AssessmentRunStatus,
+        error: str | None = None,
+        retry_after_seconds: int | None = None,
+    ) -> AssessmentSnapshotResponse:
+        return AssessmentSnapshotResponse(
+            mode=AssessmentMode.bootstrap,
+            bootstrap_key=request.bootstrap_key,
+            ticker=request.ticker,
+            kind=request.kind,
+            profile=None,
+            venue=request.venue,
+            period_at=period_at,
+            status=status,
+            error=error,
+            retry_after_seconds=retry_after_seconds,
+        )
 
     def _normalize_request(self, request: AssessmentSnapshotRequest) -> AssessmentSnapshotRequest:
         normalized = request
@@ -176,6 +274,60 @@ class AssessmentSnapshotService:
         if ticker == normalized.ticker:
             return normalized
         return normalized.model_copy(update={"ticker": ticker})
+
+    async def _execute_claim(
+        self,
+        request: AssessmentSnapshotRequest,
+        key: str,
+        claim: ClaimResult,
+    ) -> tuple[AssessmentSnapshotResponse, bool]:
+        assert claim.token is not None
+        assert claim.generation is not None
+        try:
+            response = await self._build(request)
+        # Provider adapters normalize their expected failures below, but an
+        # ordinary programming or integration exception must still leave a
+        # durable, sanitized failure for this claim. ``Exception`` excludes
+        # ``CancelledError``/other control-flow ``BaseException`` values, so
+        # shutdown and task cancellation continue to propagate normally.
+        except Exception as exc:
+            response = self._unexpected_failure(request, exc)
+            saved = await self.store.fail(
+                key=key,
+                token=claim.token,
+                generation=claim.generation,
+                response=response,
+                retry_after_seconds=self._retry_delay(claim.record.attempts),
+            )
+            return response, saved
+
+        # A build with no usable component is a provider failure.  Route it
+        # through ``fail`` so a transient outage cannot replace the durable
+        # last-good snapshot with an empty completed result.
+        if response.status is AssessmentRunStatus.failed:
+            saved = await self.store.fail(
+                key=key,
+                token=claim.token,
+                generation=claim.generation,
+                response=response,
+                retry_after_seconds=self._retry_delay(claim.record.attempts),
+            )
+            return response, saved
+
+        published = await self.store.publish(
+            key=key,
+            token=claim.token,
+            generation=claim.generation,
+            response=response,
+        )
+        if published:
+            return response, True
+        # A lease can expire while an upstream request is in flight.  Never
+        # return a stale worker's result as if it had been published.
+        latest = await self.store.get(key)
+        if latest is not None and latest.response() is not None:
+            return latest.response(), False  # type: ignore[return-value]
+        return self._in_progress_response(request), False
 
     def _validate_period(
         self,
@@ -209,6 +361,8 @@ class AssessmentSnapshotService:
             }
             digest = _digest(components, None, None, None)
             return AssessmentSnapshotResponse(
+                mode=request.mode,
+                bootstrap_key=request.bootstrap_key,
                 ticker=request.ticker,
                 kind=request.kind,
                 profile=None,
@@ -244,6 +398,8 @@ class AssessmentSnapshotService:
             quality.value,
         )
         return AssessmentSnapshotResponse(
+            mode=request.mode,
+            bootstrap_key=request.bootstrap_key,
             ticker=request.ticker,
             kind=request.kind,
             profile=_quality_profile(quality.value),
@@ -309,6 +465,10 @@ class AssessmentSnapshotService:
         # safe to use for a globally shared lookup.  When it is unavailable or
         # untrusted, pass ``None`` so FundamentalsService follows its typed
         # fallback instead of letting the first caller poison the snapshot.
+        # Request-level names are hints retained by the bootstrap queue for
+        # wire compatibility, but provider-owned B3 identity remains the only
+        # safe source for a shared CVM lookup.  A caller label must never be
+        # allowed to choose the issuer persisted for every other client.
         corporate_name = _trusted_b3_name(request.ticker, instrument)
         try:
             result = await self.fundamentals.snapshot(
@@ -422,6 +582,8 @@ class AssessmentSnapshotService:
             else AssessmentRunStatus.failed
         )
         return AssessmentSnapshotResponse(
+            mode=request.mode,
+            bootstrap_key=request.bootstrap_key,
             ticker=request.ticker,
             kind=request.kind,
             profile=None,
@@ -446,6 +608,8 @@ class AssessmentSnapshotService:
         state = _error_state(exc)
         digest = _digest({"assessment": state}, None, None, None)
         return AssessmentSnapshotResponse(
+            mode=request.mode,
+            bootstrap_key=request.bootstrap_key,
             ticker=request.ticker,
             kind=request.kind,
             profile=None,
@@ -461,6 +625,8 @@ class AssessmentSnapshotService:
         self, request: AssessmentSnapshotRequest
     ) -> AssessmentSnapshotResponse:
         return AssessmentSnapshotResponse(
+            mode=request.mode,
+            bootstrap_key=request.bootstrap_key,
             ticker=request.ticker,
             kind=request.kind,
             profile=None,
@@ -477,9 +643,22 @@ class AssessmentSnapshotService:
 def assessment_key(request: AssessmentSnapshotRequest) -> str:
     """Build a bounded key from the immutable assessment identity."""
 
+    if request.mode is AssessmentMode.bootstrap:
+        return bootstrap_assessment_key(request)
     venue = request.venue or "-"
     return f"assessment:{ASSESSMENT_EVIDENCE_VERSION}:" + ":".join(
         (request.ticker, request.kind.value, venue, request.period_at.isoformat())
+    )
+
+
+def bootstrap_assessment_key(request: AssessmentSnapshotRequest) -> str:
+    """Build the timestamp-independent key for one bootstrap identity."""
+
+    if request.bootstrap_key is None:
+        raise ValueError("bootstrap_key is required for a bootstrap assessment")
+    venue = request.venue or "-"
+    return f"assessment:{ASSESSMENT_EVIDENCE_VERSION}:bootstrap:" + ":".join(
+        (request.ticker, request.kind.value, venue, request.bootstrap_key)
     )
 
 
@@ -614,6 +793,8 @@ def _remaining_seconds(value: datetime | None) -> int | None:
 __all__ = [
     "ASSESSMENT_EVIDENCE_VERSION",
     "AssessmentSnapshotService",
+    "BootstrapIdentityConflictError",
     "InvalidAssessmentPeriodError",
     "assessment_key",
+    "bootstrap_assessment_key",
 ]

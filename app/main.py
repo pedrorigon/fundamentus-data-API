@@ -7,7 +7,7 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api import router
-from app.assessment import AssessmentSnapshotService, AssessmentStore
+from app.assessment import AssessmentSnapshotService, AssessmentStore, BootstrapAssessmentWorker
 from app.assessment.routes import router as assessment_router
 from app.cache import CacheStore
 from app.config import get_settings
@@ -48,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     instrument_directory_warm_task: asyncio.Task[None] | None = None
     fixed_income_valuation_service: FixedIncomeValuationService | None = None
     assessment_store: AssessmentStore | None = None
+    bootstrap_worker: BootstrapAssessmentWorker | None = None
     maintenance_task: asyncio.Task[None] | None = None
     startup_complete = False
     cleanup_error: Exception | None = None
@@ -159,7 +160,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.quality_facts_service,
             period_history_days=settings.assessment_period_history_days,
             retry_backoff_seconds=settings.assessment_retry_backoff_seconds,
+            bootstrap_retry_after_seconds=getattr(
+                settings, "assessment_bootstrap_retry_after_seconds", 2
+            ),
         )
+
+        # Bootstrap work is optional for lightweight embedding doubles used by
+        # integrations and lifecycle tests.  The production store implements
+        # every queue method, so it always starts the durable worker.
+        if all(
+            callable(getattr(assessment_store, name, None))
+            for name in (
+                "enqueue_bootstrap",
+                "claim_bootstrap_due",
+                "complete_bootstrap",
+                "claim",
+                "release_bootstrap",
+                "release_claim",
+                "renew_claim",
+                "renew_bootstrap_lease",
+            )
+        ):
+            bootstrap_worker = BootstrapAssessmentWorker(
+                assessment_store,
+                app.state.assessment_service,
+                concurrency=getattr(settings, "assessment_bootstrap_concurrency", 2),
+                poll_interval_seconds=getattr(
+                    settings, "assessment_bootstrap_poll_interval_seconds", 1.0
+                ),
+                lease_seconds=getattr(settings, "assessment_bootstrap_lease_seconds", 120),
+                build_timeout_seconds=getattr(
+                    settings, "assessment_bootstrap_build_timeout_seconds", 1200.0
+                ),
+                retry_after_seconds=getattr(
+                    settings, "assessment_bootstrap_retry_after_seconds", 2
+                ),
+            )
+            await bootstrap_worker.start()
+            app.state.assessment_bootstrap_worker = bootstrap_worker
+            wakeup = getattr(app.state.assessment_service, "set_bootstrap_wakeup", None)
+            if callable(wakeup):
+                wakeup(bootstrap_worker.wake)
 
         async def maintain_resources() -> None:
             interval = max(1.0, float(getattr(settings, "maintenance_interval_seconds", 60)))
@@ -184,6 +225,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if maintenance_task is not None:
             maintenance_task.cancel()
             await asyncio.gather(maintenance_task, return_exceptions=True)
+        if bootstrap_worker is not None:
+            await attempt_cleanup(bootstrap_worker.stop)
         # Stop the detached directory warm-up before closing other resources.
         # Its provider tasks can start network I/O as soon as shutdown yields
         # to the event loop; cancelling them first prevents transports from

@@ -150,6 +150,15 @@ class Settings(BaseSettings):
     assessment_max_attempts: int = Field(default=3, ge=1, le=10)
     assessment_period_history_days: int = Field(default=370, ge=1, le=3650)
     assessment_retry_backoff_seconds: int = Field(default=15, ge=0, le=3600)
+    # Bootstrap admissions are queued durably so HTTP requests never hold a
+    # provider lease.  Polling is lifecycle-managed and wakes immediately on
+    # a new admission; these bounds keep a crashed replica recoverable without
+    # creating an unbounded worker pool.
+    assessment_bootstrap_concurrency: int = Field(default=2, ge=1, le=16)
+    assessment_bootstrap_lease_seconds: int = Field(default=120, ge=1, le=3600)
+    assessment_bootstrap_build_timeout_seconds: float = Field(default=1200.0, ge=1.0, le=3600.0)
+    assessment_bootstrap_poll_interval_seconds: float = Field(default=1.0, ge=0.05, le=60.0)
+    assessment_bootstrap_retry_after_seconds: int = Field(default=2, ge=1, le=60)
 
     batch_limit: int = 20
     cache_invalidate_token: SecretStr | None = None

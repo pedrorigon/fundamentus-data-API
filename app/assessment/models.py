@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models.assets import OpportunityResponse
 from app.models.fundamentals import FundamentalsSnapshot
@@ -25,6 +25,13 @@ class AssessmentRunStatus(StrEnum):
     failed = "failed"
 
 
+class AssessmentMode(StrEnum):
+    """Admission path used to create an immutable assessment snapshot."""
+
+    scheduled = "scheduled"
+    bootstrap = "bootstrap"
+
+
 class AssessmentComponentStatus(StrEnum):
     available = "available"
     missing_data = "missing_data"
@@ -40,13 +47,23 @@ class AssessmentComponentState(BaseModel):
 
 
 class AssessmentSnapshotRequest(BaseModel):
-    """One bounded, globally shareable assessment period request.
+    """One bounded assessment request for a scheduled or bootstrap snapshot.
 
-    The period is a scheduler slot rather than an arbitrary timestamp.  Keeping
-    that invariant in the public model prevents callers from creating unlimited
-    cache keys and makes requests from different accounts converge on one row.
+    Scheduled periods remain fixed capture slots while bootstrap admissions use
+    an aware point-in-time input tied to their durable identity.
     """
 
+    mode: AssessmentMode = AssessmentMode.scheduled
+    # A bootstrap admission is globally idempotent for this caller-provided
+    # digest.  The period remains part of the durable admission record, but it
+    # is deliberately excluded from the bootstrap key so retries cannot move
+    # the snapshot to a new timestamp.
+    bootstrap_key: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     # Fixed-income instruments are commonly identified by product names such
     # as ``TESOURO IPCA+ 2029`` rather than exchange ticker syntax. The service
     # keeps strict ticker parsing for market-traded kinds after this bounded
@@ -87,9 +104,15 @@ class AssessmentSnapshotRequest(BaseModel):
 
     @field_validator("period_at")
     @classmethod
-    def require_aware_scheduler_period(cls, value: datetime) -> datetime:
+    def require_aware_period(cls, value: datetime, info: Any) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("period_at must include a timezone offset")
+        mode = info.data.get("mode", AssessmentMode.scheduled)
+        if mode is AssessmentMode.bootstrap or mode == AssessmentMode.bootstrap:
+            # Bootstrap periods are point-in-time inputs supplied by the
+            # caller.  Unlike scheduled slots they may use any minute/second
+            # while retaining the required timezone-aware invariant.
+            return value.astimezone(UTC)
         local = value.astimezone(ASSESSMENT_TIMEZONE)
         if (
             local.hour not in ASSESSMENT_HOURS
@@ -99,6 +122,14 @@ class AssessmentSnapshotRequest(BaseModel):
         ):
             raise ValueError("period_at must be one of 12:00, 14:00, 16:00 or 19:00 local time")
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_mode_identity(self) -> AssessmentSnapshotRequest:
+        if self.mode is AssessmentMode.bootstrap and self.bootstrap_key is None:
+            raise ValueError("bootstrap_key is required when mode is 'bootstrap'")
+        if self.mode is AssessmentMode.scheduled and self.bootstrap_key is not None:
+            raise ValueError("bootstrap_key is only valid when mode is 'bootstrap'")
+        return self
 
     @field_validator("venue", mode="before")
     @classmethod
@@ -126,6 +157,8 @@ class AssessmentSnapshotRequest(BaseModel):
 
 
 class AssessmentSnapshotResponse(BaseModel):
+    mode: AssessmentMode = AssessmentMode.scheduled
+    bootstrap_key: str | None = None
     ticker: str
     kind: QualityAssetKind
     profile: str | None = None
