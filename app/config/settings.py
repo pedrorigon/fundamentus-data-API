@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     income_refresh_ttl_seconds: int = 1800
     income_source_index_ttl_seconds: int = 1800
     income_snapshot_overlap_days: int = 365
+    # Durable income jobs process bounded source pages and renew their leases
+    # while a provider is collecting a page.  These values are configurable so
+    # deployments can match their upstream deadlines without unbounded work.
+    income_job_batch_size: int = Field(default=8, ge=1, le=100)
+    income_job_lease_seconds: int = Field(default=300, ge=1, le=3600)
+    income_job_max_attempts: int = Field(default=3, ge=1, le=10)
+    income_job_poll_seconds: float = Field(default=0.5, ge=0.05, le=60.0)
+    income_job_page_timeout_seconds: float = Field(default=180.0, ge=1.0, le=3600.0)
     fundos_net_scan_limit: int = 300
     fundos_net_fallback_documents: int = 30
     fundos_net_page_size: int = 36

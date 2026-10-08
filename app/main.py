@@ -109,6 +109,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ],
             snapshot_overlap_days=settings.income_snapshot_overlap_days,
             refresh_ttl_seconds=settings.income_refresh_ttl_seconds,
+            job_batch_size=getattr(settings, "income_job_batch_size", 8),
+            job_lease_seconds=getattr(settings, "income_job_lease_seconds", 300),
+            job_max_attempts=getattr(settings, "income_job_max_attempts", 3),
+            worker_poll_seconds=getattr(settings, "income_job_poll_seconds", 0.5),
+            job_page_timeout_seconds=getattr(
+                settings,
+                "income_job_page_timeout_seconds",
+                180.0,
+            ),
         )
         await getattr(income_event_service, "startup", _noop)()
         app.state.income_event_service = income_event_service

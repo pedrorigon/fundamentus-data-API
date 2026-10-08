@@ -7,7 +7,7 @@ import json
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -849,6 +849,90 @@ class _Source:
         )
 
 
+class _IdentitySource(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested: list[list[IncomeInstrumentRequest]] = []
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.requested.append(list(instruments))
+        del as_of
+        return IncomeSourceResult(
+            [],
+            [
+                IncomeSourceCoverage(
+                    source=self.name,
+                    ticker=instrument.ticker,
+                    status="empty",
+                    complete=True,
+                )
+                for instrument in instruments
+            ],
+        )
+
+
+class _GatedSource(_Source):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(fail=fail)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.started.set()
+        await self.release.wait()
+        return await super().collect(instruments, as_of)
+
+
+class _SlowSource(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.started.set()
+        await self.release.wait()
+        return await super().collect(instruments, as_of)
+
+
+class _CoverageSequenceSource(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.complete = False
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.calls += 1
+        del as_of
+        return IncomeSourceResult(
+            [],
+            [
+                IncomeSourceCoverage(
+                    source=self.name,
+                    ticker=instrument.ticker,
+                    status="complete" if self.complete else "partial",
+                    complete=self.complete,
+                )
+                for instrument in instruments
+            ],
+        )
+
+
 class _EventGatedSource:
     name = "gated"
     snapshot_sources: tuple[str, ...] = ("official",)
@@ -894,6 +978,79 @@ class _FailingCoverageStore(IncomeEventStore):
     ) -> int:
         del observations, snapshot_sources, complete_tickers, snapshot_from
         raise RuntimeError("observation persistence failed")
+
+
+class _OwnershipLostStore(IncomeEventStore):
+    async def refresh_item_owned(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        claim_token: str | None,
+    ) -> bool:
+        del job_id, source, ticker, claim_token
+        return False
+
+
+class _HeartbeatRecordingStore(IncomeEventStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.renewed = asyncio.Event()
+
+    async def renew_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        claim_token: str,
+        lease_seconds: int,
+        now: datetime,
+    ) -> bool:
+        self.renewed.set()
+        return await super().renew_refresh_item(
+            job_id,
+            source,
+            ticker,
+            claim_token=claim_token,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+
+
+class _FlakyPublishStore(IncomeEventStore):
+    def __init__(self, path: Path, *, failures: int) -> None:
+        super().__init__(path)
+        self.failures = failures
+
+    async def publish(
+        self,
+        events: list,
+        *,
+        scope_tickers: list[str] | None = None,
+    ) -> int:
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("publication unavailable")
+        return await super().publish(events, scope_tickers=scope_tickers)
+
+
+class _PublishRecordingStore(IncomeEventStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.publish_calls: list[list[str]] = []
+        self.published = asyncio.Event()
+
+    async def publish(
+        self,
+        events: list,
+        *,
+        scope_tickers: list[str] | None = None,
+    ) -> int:
+        self.publish_calls.append(list(scope_tickers or []))
+        self.published.set()
+        return await super().publish(events, scope_tickers=scope_tickers)
 
 
 @pytest.mark.asyncio
@@ -2177,6 +2334,25 @@ class _OfficialSource(_Source):
     name = "official_companies"
     official = True
 
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        result = await super().collect(instruments, as_of)
+        return IncomeSourceResult(
+            result.observations,
+            [
+                IncomeSourceCoverage(
+                    source=self.name,
+                    ticker=instrument.ticker,
+                    status="complete",
+                    complete=True,
+                )
+                for instrument in instruments
+            ],
+        )
+
 
 @pytest.mark.asyncio
 async def test_backfill_queues_only_official_sources(tmp_path: Path) -> None:
@@ -2345,6 +2521,462 @@ async def test_async_refresh_marks_an_exhausted_item_as_failed(tmp_path: Path) -
     assert state["status"] == "partial"
     assert state["failed"] == 1
     assert item["status"] == "failed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_job_persists_and_reconstructs_instrument_identity(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _IdentitySource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="bbas3", isin="br-id", name="Banco")],
+        mode="async",
+    )
+
+    accepted = await service.refresh_async(request)
+    queued = await service.refresh_job(accepted.job_id)
+    assert queued is not None
+    assert queued["items"][0]["isin"] == "BR-ID"
+    assert queued["items"][0]["name"] == "Banco"
+
+    assert await service.process_pending_once() == 1
+    assert source.requested[0][0] == request.instruments[0].model_copy(
+        update={"ticker": "BBAS3", "isin": "BR-ID"}
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_deduplicated_job_waits_for_owner_and_does_not_duplicate_source_call(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _GatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+    )
+
+    owner = await service.refresh_async(request)
+    follower = await service.refresh_async(request)
+    assert follower.status == "queued"
+    waiting = await service.refresh_job(follower.job_id)
+    assert waiting is not None and waiting["items"][0]["status"] == "waiting"
+
+    processing = asyncio.create_task(service.process_pending_once())
+    await source.started.wait()
+    await asyncio.sleep(0)
+    still_waiting = await service.refresh_job(follower.job_id)
+    assert still_waiting is not None and still_waiting["status"] == "queued"
+    source.release.set()
+    assert await processing == 1
+    finished = await service.refresh_job(follower.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    assert source.calls == 1
+    del owner
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_deduplicates_without_identity_payload_as_waiting_dependency(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    now = datetime.now(UTC)
+    assert (
+        await store.create_refresh_job(
+            "owner",
+            [("fake", "BBAS3")],
+            requested=1,
+            as_of=now.date(),
+            now=now,
+        )
+        == 1
+    )
+    assert (
+        await store.create_refresh_job(
+            "follower",
+            [("fake", "BBAS3")],
+            requested=1,
+            as_of=now.date(),
+            now=now,
+        )
+        == 0
+    )
+    follower = await store.refresh_job("follower")
+    assert follower is not None
+    assert follower["items"][0]["status"] == "waiting"
+    assert await store.pending_refresh_item_count("follower") == 1
+
+    claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert [(item["job_id"], item["ticker"]) for item in claimed] == [("owner", "BBAS3")]
+    assert await store.complete_refresh_item("owner", "fake", "BBAS3", now=now)
+    follower = await store.refresh_job("follower")
+    assert follower is not None
+    assert follower["items"][0]["status"] == "complete"
+    assert await store.pending_refresh_item_count("follower") == 0
+    assert await store.refresh_item_owned("follower", "fake", "BBAS3", claim_token=None)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_multiple_followers_fail_together_without_promoting_duplicate_claims(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(fail=True)
+    service = IncomeEventService(store, [source], job_max_attempts=1)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+    )
+    jobs = [await service.refresh_async(request) for _ in range(3)]
+
+    assert await service.process_pending_once() == 1
+    states = [await service.refresh_job(job.job_id) for job in jobs]
+    assert all(state is not None and state["status"] == "partial" for state in states)
+    assert all(state is not None and state["items"][0]["status"] == "failed" for state in states)
+    assert source.calls == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_coverage_retries_then_completes_empty_snapshot(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _CoverageSequenceSource()
+    service = IncomeEventService(store, [source], job_max_attempts=2)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+    )
+    job = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+    first = await service.refresh_job(job.job_id)
+    assert first is not None and first["status"] == "running"
+    assert first["items"][0]["status"] == "queued"
+
+    await store.requeue_refresh_item(
+        job.job_id,
+        source.name,
+        "BBAS3",
+        error="test",
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+        now=datetime.now(UTC),
+    )
+    source.complete = True
+    assert await service.process_pending_once() == 1
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    assert finished["items"][0]["status"] == "complete"
+    assert source.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_skips_source_persistence_and_terminal_write(tmp_path: Path) -> None:
+    store = _OwnershipLostStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source])
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    state = await service.refresh_job(job.job_id)
+    assert state is not None
+    assert state["status"] == "running"
+    assert state["items"][0]["status"] == "running"
+    assert await store.observations(["BBAS3"]) == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_retries_as_sanitized_item_error(tmp_path: Path) -> None:
+    store = _FailingCoverageStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], job_max_attempts=1)
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    state = await service.refresh_job(job.job_id)
+    assert state is not None and state["status"] == "partial"
+    assert state["items"][0]["status"] == "failed"
+    assert state["items"][0]["last_error"] == "observation persistence failed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_job_heartbeat_renews_during_collect_and_stops_cleanly(tmp_path: Path) -> None:
+    store = _HeartbeatRecordingStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _GatedSource()
+    service = IncomeEventService(store, [source], job_lease_seconds=1)
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+    processing = asyncio.create_task(service.process_pending_once())
+    await source.started.wait()
+    await asyncio.wait_for(store.renewed.wait(), timeout=1)
+    source.release.set()
+    assert await processing == 1
+
+    stop = asyncio.Event()
+    heartbeat = asyncio.create_task(service._heartbeat_items([], {}, stop))
+    await asyncio.sleep(0)
+    stop.set()
+    await heartbeat
+    state = await service.refresh_job(job.job_id)
+    assert state is not None and state["status"] == "completed"
+    await service._publish_finished_job(job.job_id, _seen={job.job_id})
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fast_source_publishes_before_slow_source_page_finishes(tmp_path: Path) -> None:
+    store = _PublishRecordingStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    fast = _Source()
+    fast.name = "fast"
+    fast.snapshot_sources = ("fast",)
+    slow = _SlowSource()
+    slow.name = "slow"
+    slow.snapshot_sources = ("slow",)
+    service = IncomeEventService(store, [fast, slow])
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    processing = asyncio.create_task(service.process_pending_once())
+    await slow.started.wait()
+    try:
+        await asyncio.wait_for(store.published.wait(), timeout=1)
+        assert store.publish_calls
+        assert any("BBAS3" in tickers for tickers in store.publish_calls)
+    finally:
+        slow.release.set()
+    assert await processing == 2
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_item_is_finalized_after_transient_publication_failure(
+    tmp_path: Path,
+) -> None:
+    store = _FlakyPublishStore(tmp_path / "income.sqlite3", failures=3)
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source])
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    first = await service.refresh_job(job.job_id)
+    assert first is not None
+    assert first["status"] == "running"
+    assert first["items"][0]["status"] == "complete"
+    assert source.calls == 1
+
+    # The second drain claims no source work, but the durable finalization scan
+    # retries the publish and closes the job.
+    assert await service.process_pending_once() == 0
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_empty_job_keeps_requested_ticker_identity(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _IdentitySource()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    await store.save_coverage(
+        [IncomeSourceCoverage(source=source.name, ticker="BBAS3", status="empty", complete=True)]
+    )
+
+    accepted = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3", isin="BR-ID", name="Banco")],
+            mode="async",
+        )
+    )
+    state = await service.refresh_job(accepted.job_id)
+    assert accepted.status == "completed"
+    assert state is not None and state["tickers"] == ["BBAS3"] and state["items"] == []
+    assert source.requested == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_is_fenced_and_heartbeat_renews_active_claim(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    claim_time = datetime(2026, 9, 1, tzinfo=UTC)
+    await store.create_refresh_job(
+        "job-fence",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=claim_time.date(),
+        now=claim_time,
+    )
+    first = await store.claim_refresh_items(limit=1, lease_seconds=1, now=claim_time)
+    assert first and first[0]["claim_token"]
+    assert await store.renew_refresh_item(
+        "job-fence",
+        "fake",
+        "BBAS3",
+        claim_token=str(first[0]["claim_token"]),
+        lease_seconds=2,
+        now=claim_time + timedelta(milliseconds=900),
+    )
+    assert (
+        await store.claim_refresh_items(
+            limit=1,
+            lease_seconds=1,
+            now=claim_time + timedelta(seconds=1),
+        )
+        == []
+    )
+    second = await store.claim_refresh_items(
+        limit=1,
+        lease_seconds=1,
+        now=claim_time + timedelta(seconds=4),
+    )
+    assert second and second[0]["claim_token"] != first[0]["claim_token"]
+    assert not await store.complete_refresh_item(
+        "job-fence",
+        "fake",
+        "BBAS3",
+        claim_token=str(first[0]["claim_token"]),
+        now=claim_time + timedelta(seconds=4),
+    )
+    assert await store.complete_refresh_item(
+        "job-fence",
+        "fake",
+        "BBAS3",
+        claim_token=str(second[0]["claim_token"]),
+        now=claim_time + timedelta(seconds=4),
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_page_timeout_bounds_retry_calls_and_close_drains_source(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _SlowSource()
+    service = IncomeEventService(
+        store,
+        [source],
+        job_page_timeout_seconds=0.01,
+        job_max_attempts=2,
+    )
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    await source.started.wait()
+    assert len(service._detached_source_tasks) == 1
+
+    # A retry can claim the row while the timed-out provider call is still
+    # draining, but it must not start another provider call for the same source.
+    now = datetime.now(UTC)
+    await store.requeue_refresh_item(
+        job.job_id,
+        source.name,
+        "BBAS3",
+        error="page timeout",
+        available_at=now,
+        now=now,
+    )
+    assert await service.process_pending_once() == 1
+    assert source.calls == 0
+    assert len(service._detached_source_tasks) == 1
+
+    closing = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    # The store remains usable while close waits for the provider task.
+    assert await store.cursor() == 0
+
+    source.release.set()
+    await asyncio.wait_for(closing, timeout=1)
+    assert source.calls == 1
+    assert not service._detached_source_tasks
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_job_store_upgrades_identity_columns_additively(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE income_refresh_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                requested INTEGER NOT NULL,
+                as_of TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE income_refresh_job_items (
+                job_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_until TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (job_id, source, ticker)
+            );
+            """
+        )
+
+    store = IncomeEventStore(path)
+    await store.startup()
+    state = await store.create_refresh_job(
+        "job-upgraded",
+        [("fake", "BBAS3", "BR-ID", "Banco")],
+        requested=1,
+        as_of=date(2026, 9, 1),
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+        requested_instruments=[IncomeInstrumentRequest(ticker="BBAS3", isin="BR-ID", name="Banco")],
+    )
+    assert state == 1
+    job = await store.refresh_job("job-upgraded")
+    assert job is not None
+    assert job["items"][0]["isin"] == "BR-ID"
+    assert job["items"][0]["name"] == "Banco"
+    assert job["tickers"] == ["BBAS3"]
     await store.close()
 
 

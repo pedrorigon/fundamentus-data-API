@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from secrets import token_hex
 
@@ -41,6 +42,7 @@ class IncomeEventService:
         job_lease_seconds: int = 120,
         job_max_attempts: int = 3,
         worker_poll_seconds: float = 0.5,
+        job_page_timeout_seconds: float | None = None,
     ) -> None:
         self.store = store
         self.sources = sources
@@ -53,13 +55,20 @@ class IncomeEventService:
         self.job_lease_seconds = max(job_lease_seconds, 1)
         self.job_max_attempts = max(job_max_attempts, 1)
         self.worker_poll_seconds = max(worker_poll_seconds, 0.01)
+        self.job_page_timeout_seconds = (
+            max(job_page_timeout_seconds, 0.1) if job_page_timeout_seconds is not None else None
+        )
         self._inflight: dict[
             tuple[tuple[tuple[str, str | None], ...], date],
             asyncio.Task[IncomeEventRefreshResponse],
         ] = {}
         self._lock = asyncio.Lock()
+        self._publish_lock = asyncio.Lock()
         self._closed = False
         self._worker_task: asyncio.Task[None] | None = None
+        self._detached_source_tasks: set[asyncio.Task[IncomeSourceResult]] = set()
+        self._detached_source_names: dict[asyncio.Task[IncomeSourceResult], str] = {}
+        self._busy_sources: set[str] = set()
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
 
@@ -107,6 +116,11 @@ class IncomeEventService:
             self._stop_event.set()
             self._wake_event.set()
             await asyncio.gather(worker, return_exceptions=True)
+        if self._detached_source_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self._detached_source_tasks)),
+                return_exceptions=True,
+            )
         async with self._lock:
             pending = tuple(self._inflight.values())
         if pending:
@@ -133,28 +147,63 @@ class IncomeEventService:
         as_of: date,
     ) -> IncomeEventRefreshResponse:
         results = await asyncio.gather(
-            *(self._collect_source(source, instruments, as_of) for source in self.sources),
+            *(
+                self._collect_and_persist_source(source, instruments, as_of)
+                for source in self.sources
+            ),
             return_exceptions=True,
         )
         observations = 0
         failed_sources: list[str] = []
+        successful_sources = 0
+        published_early = 0
         for source, result in zip(self.sources, results, strict=True):
             if isinstance(result, BaseException):
                 failed_sources.append(source.name)
                 continue
-            observations += len(result.observations)
-            if not await self._persist_source_result(source, result, as_of):
+            successful_sources += 1
+            source_observations, complete, source_published = result
+            observations += source_observations
+            published_early += source_published
+            if not complete:
                 failed_sources.append(source.name)
+        # A store/provider failure for every source leaves the existing
+        # canonical snapshot untouched.  Avoid a second read while the failed
+        # producer may still be unwinding its connection transaction.
+        if successful_sources == 0 and self.sources:
+            return IncomeEventRefreshResponse(
+                requested=len(instruments),
+                observations=observations,
+                published=0,
+                failed_sources=sorted(set(failed_sources)),
+                cursor=0,
+            )
         tickers = [item.ticker for item in instruments]
         resolved = resolve_income_events(await self.store.observations(tickers))
         published = await self.store.publish(resolved, scope_tickers=tickers)
         return IncomeEventRefreshResponse(
             requested=len(instruments),
             observations=observations,
-            published=published,
+            published=published_early + published,
             failed_sources=sorted(set(failed_sources)),
             cursor=await self.store.cursor(),
         )
+
+    async def _collect_and_persist_source(
+        self,
+        source: IncomeSource,
+        instruments: list[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> tuple[int, bool, int]:
+        """Collect and persist one source without waiting on other sources."""
+
+        result = await self._collect_source(source, instruments, as_of)
+        complete = await self._persist_source_result(source, result, as_of)
+        complete_tickers = sorted(
+            {item.ticker.upper() for item in result.coverage if item.complete}
+        )
+        published = await self._publish_tickers(complete_tickers)
+        return len(result.observations), complete, published
 
     async def _persist_source_result(
         self,
@@ -236,11 +285,10 @@ class IncomeEventService:
         instruments: list[IncomeInstrumentRequest],
         as_of: date,
     ) -> IncomeEventAsyncRefreshResponse:
-        items: list[tuple[str, str]] = []
+        items: list[tuple[str, IncomeInstrumentRequest]] = []
         for source in sources:
             items.extend(
-                (source.name, item.ticker)
-                for item in await self._stale_instruments(source, instruments)
+                (source.name, item) for item in await self._stale_instruments(source, instruments)
             )
         job_id = token_hex(12)
         now = datetime.now(UTC)
@@ -250,8 +298,10 @@ class IncomeEventService:
             requested=len(instruments),
             as_of=as_of,
             now=now,
+            requested_instruments=instruments,
         )
-        if queued:
+        pending = await self.store.pending_refresh_item_count(job_id)
+        if queued or pending:
             self._wake_event.set()
         else:
             await self.store.finish_refresh_job(
@@ -262,7 +312,7 @@ class IncomeEventService:
             )
         return IncomeEventAsyncRefreshResponse(
             job_id=job_id,
-            status="queued" if queued else REFRESH_COMPLETED,
+            status="queued" if (queued or pending) else REFRESH_COMPLETED,
             requested=len(instruments),
             queued=queued,
             deduplicated=len(items) - queued,
@@ -307,6 +357,7 @@ class IncomeEventService:
             now=now,
         )
         if not items:
+            await self._finalize_ready_jobs()
             return 0
         groups: dict[tuple[str, str], list[dict[str, object]]] = {}
         for item in items:
@@ -320,8 +371,22 @@ class IncomeEventService:
             return_exceptions=True,
         )
         for job_id in {str(item["job_id"]) for item in items}:
-            await self._publish_finished_job(job_id)
+            await self._try_publish_finished_job(job_id)
+        await self._finalize_ready_jobs()
         return len(items)
+
+    async def _finalize_ready_jobs(self) -> None:
+        """Retry publication for jobs whose item work finished previously."""
+
+        job_ids = await self.store.refresh_jobs_ready_for_publication(limit=self.job_batch_size)
+        for job_id in job_ids:
+            await self._try_publish_finished_job(job_id)
+
+    async def _try_publish_finished_job(self, job_id: str) -> None:
+        try:
+            await self._publish_finished_job(job_id)
+        except Exception:  # noqa: BLE001 - publication retries on the next drain
+            _LOGGER.exception("income refresh publication failed", extra={"job_id": job_id})
 
     async def _process_item_page(
         self,
@@ -332,64 +397,238 @@ class IncomeEventService:
     ) -> None:
         source = known_sources.get(source_name)
         if source is None:
-            await self._fail_items(rows, error="unknown source")
-            return
-        instruments = [IncomeInstrumentRequest(ticker=str(row["ticker"])) for row in rows]
-        try:
-            result = await source.collect(instruments, date.fromisoformat(as_of))
-        except Exception as exc:  # noqa: BLE001 - source failures are retried
-            await self._retry_items(rows, error=str(exc))
-            return
-        await self._persist_source_result(source, result, date.fromisoformat(as_of))
-        now = datetime.now(UTC)
-        for row in rows:
-            await self.store.complete_refresh_item(
-                str(row["job_id"]),
-                str(row["source"]),
-                str(row["ticker"]),
-                now=now,
+            await self._fail_items(
+                rows,
+                error="unknown source",
+                claim_tokens={
+                    (str(row["job_id"]), str(row["source"]), str(row["ticker"])): _optional_text(
+                        row.get("claim_token")
+                    )
+                    for row in rows
+                },
             )
+            return
+        if source_name in self._busy_sources:
+            await self._retry_items(
+                rows,
+                error="source page still draining",
+                claim_tokens={
+                    (str(row["job_id"]), str(row["source"]), str(row["ticker"])): _optional_text(
+                        row.get("claim_token")
+                    )
+                    for row in rows
+                },
+            )
+            return
+        instruments = [
+            IncomeInstrumentRequest(
+                ticker=str(row["ticker"]),
+                isin=_optional_text(row.get("isin")),
+                name=_optional_text(row.get("name")),
+            )
+            for row in rows
+        ]
+        claim_tokens = {
+            (str(row["job_id"]), str(row["source"]), str(row["ticker"])): _optional_text(
+                row.get("claim_token")
+            )
+            for row in rows
+        }
+        heartbeat_stop = asyncio.Event()
+        heartbeat = asyncio.create_task(self._heartbeat_items(rows, claim_tokens, heartbeat_stop))
+        try:
+            try:
+                result = await self._collect_page(source, instruments, date.fromisoformat(as_of))
+            except Exception as exc:  # noqa: BLE001 - source failures are retried
+                await self._retry_items(
+                    rows,
+                    error=_source_error(exc),
+                    claim_tokens=claim_tokens,
+                )
+                return
+            owned_rows: list[dict[str, object]] = []
+            for row in rows:
+                key = (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
+                if await self.store.refresh_item_owned(
+                    *key,
+                    claim_token=claim_tokens.get(key),
+                ):
+                    owned_rows.append(row)
+            if not owned_rows:
+                return
+            owned_tickers = {str(row["ticker"]).upper() for row in owned_rows}
+            result = IncomeSourceResult(
+                [item for item in result.observations if item.ticker.upper() in owned_tickers],
+                [item for item in result.coverage if item.ticker.upper() in owned_tickers],
+            )
+            try:
+                await self._persist_source_result(source, result, date.fromisoformat(as_of))
+            except Exception as exc:  # noqa: BLE001 - persistence failures are retried
+                await self._retry_items(
+                    owned_rows,
+                    error=_source_error(exc),
+                    claim_tokens=claim_tokens,
+                )
+                return
+            coverage = {
+                item.ticker.upper(): item for item in result.coverage if item.source == source.name
+            }
+            complete_rows: list[dict[str, object]] = []
+            incomplete_rows: list[dict[str, object]] = []
+            for row in owned_rows:
+                item_coverage = coverage.get(str(row["ticker"]).upper())
+                if item_coverage is not None and item_coverage.complete:
+                    complete_rows.append(row)
+                else:
+                    incomplete_rows.append(row)
+            now = datetime.now(UTC)
+            published_tickers: set[str] = set()
+            for row in complete_rows:
+                key = (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
+                completed = await self.store.complete_refresh_item(
+                    *key,
+                    now=now,
+                    claim_token=claim_tokens.get(key),
+                )
+                if completed:
+                    published_tickers.add(str(row["ticker"]).upper())
+            if incomplete_rows:
+                await self._retry_items(
+                    incomplete_rows,
+                    error="source coverage incomplete",
+                    claim_tokens=claim_tokens,
+                )
+            if published_tickers:
+                await self._publish_tickers(sorted(published_tickers))
+        finally:
+            heartbeat_stop.set()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
-    async def _retry_items(self, rows: list[dict[str, object]], *, error: str) -> None:
+    async def _collect_page(
+        self,
+        source: IncomeSource,
+        instruments: list[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        """Bound the worker page while allowing shielded source cleanup to drain."""
+
+        task = asyncio.create_task(source.collect(instruments, as_of))
+        if self.job_page_timeout_seconds is None:
+            return await task
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.job_page_timeout_seconds,
+            )
+        except TimeoutError:
+            self._detached_source_tasks.add(task)
+            self._detached_source_names[task] = source.name
+            self._busy_sources.add(source.name)
+            task.add_done_callback(self._cleanup_detached_source_task)
+            raise
+
+    def _cleanup_detached_source_task(
+        self,
+        task: asyncio.Future[IncomeSourceResult],
+    ) -> None:
+        if isinstance(task, asyncio.Task):
+            self._detached_source_tasks.discard(task)
+            source_name = self._detached_source_names.pop(task, None)
+            if source_name is not None and source_name not in self._detached_source_names.values():
+                self._busy_sources.discard(source_name)
+        if not task.cancelled():
+            task.exception()
+
+    async def _retry_items(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        error: str,
+        claim_tokens: dict[tuple[str, str, str], str | None] | None = None,
+    ) -> None:
         now = datetime.now(UTC)
         for row in rows:
             raw_attempts = row.get("attempts")
             attempts = raw_attempts if isinstance(raw_attempts, int) else 1
+            key = (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
+            claim_token = claim_tokens.get(key) if claim_tokens is not None else None
             if attempts >= self.job_max_attempts:
                 await self.store.fail_refresh_item(
-                    str(row["job_id"]),
-                    str(row["source"]),
-                    str(row["ticker"]),
+                    *key,
                     error=error,
                     now=now,
+                    claim_token=claim_token,
                 )
                 continue
             await self.store.requeue_refresh_item(
-                str(row["job_id"]),
-                str(row["source"]),
-                str(row["ticker"]),
+                *key,
                 error=error,
                 available_at=now + timedelta(seconds=min(60, 2**attempts)),
                 now=now,
+                claim_token=claim_token,
             )
 
-    async def _fail_items(self, rows: list[dict[str, object]], *, error: str) -> None:
+    async def _fail_items(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        error: str,
+        claim_tokens: dict[tuple[str, str, str], str | None] | None = None,
+    ) -> None:
         now = datetime.now(UTC)
         for row in rows:
+            key = (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
             await self.store.fail_refresh_item(
-                str(row["job_id"]),
-                str(row["source"]),
-                str(row["ticker"]),
+                *key,
                 error=error,
                 now=now,
+                claim_token=claim_tokens.get(key) if claim_tokens is not None else None,
             )
 
-    async def _publish_finished_job(self, job_id: str) -> None:
+    async def _heartbeat_items(
+        self,
+        rows: list[dict[str, object]],
+        claim_tokens: dict[tuple[str, str, str], str | None],
+        stop: asyncio.Event,
+    ) -> None:
+        interval = max(min(self.job_lease_seconds / 3, 30), 0.1)
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+            now = datetime.now(UTC)
+            await asyncio.gather(
+                *(
+                    self.store.renew_refresh_item(
+                        str(row["job_id"]),
+                        str(row["source"]),
+                        str(row["ticker"]),
+                        claim_token=token,
+                        lease_seconds=self.job_lease_seconds,
+                        now=now,
+                    )
+                    for row in rows
+                    if (
+                        token := claim_tokens.get(
+                            (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
+                        )
+                    )
+                ),
+                return_exceptions=True,
+            )
+
+    async def _publish_finished_job(self, job_id: str, *, _seen: set[str] | None = None) -> None:
+        seen = _seen if _seen is not None else set()
+        if job_id in seen:
+            return
+        seen.add(job_id)
         if await self.store.pending_refresh_item_count(job_id):
             return
         tickers = await self.store.job_tickers(job_id)
-        resolved = resolve_income_events(await self.store.observations(tickers))
-        await self.store.publish(resolved, scope_tickers=tickers)
+        await self._publish_tickers(tickers)
         job = await self.store.refresh_job(job_id)
         failed = 0
         if job is not None:
@@ -401,6 +640,16 @@ class IncomeEventService:
             error=None,
             now=datetime.now(UTC),
         )
+        dependents = await self.store.refresh_job_dependents(job_id)
+        for dependent in dependents:
+            await self._publish_finished_job(dependent, _seen=seen)
+
+    async def _publish_tickers(self, tickers: list[str]) -> int:
+        if not tickers:
+            return 0
+        async with self._publish_lock:
+            resolved = resolve_income_events(await self.store.observations(tickers))
+            return await self.store.publish(resolved, scope_tickers=tickers)
 
     async def batch(self, request: IncomeEventBatchRequest) -> IncomeEventBatchResponse:
         return IncomeEventBatchResponse(
@@ -427,6 +676,30 @@ def _coverage_item(coverage: IncomeSourceCoverage) -> IncomeEventCoverageItem:
         observed_at=coverage.observed_at,
         detail=coverage.detail,
     )
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+_SAFE_SOURCE_ERROR = re.compile(r"^[A-Za-z0-9 _.:/\\-]{1,120}$")
+
+
+def _source_error(error: BaseException) -> str:
+    """Return a bounded provider error without copying credentials to jobs."""
+
+    detail = str(error).strip()
+    lowered = detail.lower()
+    if (
+        not detail
+        or not _SAFE_SOURCE_ERROR.fullmatch(detail)
+        or any(marker in lowered for marker in ("token", "secret", "password", "bearer"))
+    ):
+        return f"{type(error).__name__}"
+    return detail[:200]
 
 
 def _unique_instruments(
