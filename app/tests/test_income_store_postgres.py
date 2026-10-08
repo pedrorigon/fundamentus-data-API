@@ -393,7 +393,7 @@ async def test_postgres_job_lifecycle_counts_only_new_items(
         tmp_path,
         _Result(rowcount=0),
         _Result(rowcount=1),
-        _Result(rowcount=0),
+        _Result(rowcount=1),
         _Result(
             row={
                 "job_id": "job-1",
@@ -422,6 +422,7 @@ async def test_postgres_job_lifecycle_counts_only_new_items(
                 },
             ]
         ),
+        _Result(rows=[]),
     )
     now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
 
@@ -445,13 +446,80 @@ async def test_postgres_job_lifecycle_counts_only_new_items(
     await store.fail_refresh_item("job-1", "b3", "petr4", error="boom", now=now)
     await store.finish_refresh_job("job-1", status="partial", error=None, now=now)
 
-    assert inserted == 1
+    assert inserted == 2
     assert job is not None
     assert (job["completed"], job["failed"]) == (1, 1)
     item_insert = database.statements[1][0]
     assert "ON CONFLICT DO NOTHING" in item_insert
     assert "%s" in item_insert
     assert database.statements[-1][1][0] == "partial"
+
+
+async def test_postgres_duplicate_owner_completion_is_reconciled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store, _database = await _store(
+        monkeypatch,
+        tmp_path,
+        _Result(rowcount=0),
+        _Result(rowcount=0),
+        _Result(row=None),
+        _Result(
+            row={
+                "job_id": "owner",
+                "source": "b3",
+                "ticker": "BBAS3",
+                "status": "complete",
+            }
+        ),
+        _Result(rowcount=1),
+    )
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+
+    inserted = await store.create_refresh_job(
+        "follower",
+        [("b3", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+
+    assert inserted == 0
+
+
+async def test_postgres_duplicate_race_links_to_second_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store, _database = await _store(
+        monkeypatch,
+        tmp_path,
+        _Result(rowcount=0),
+        _Result(rowcount=0),
+        _Result(row=None),
+        _Result(row=None),
+        _Result(rowcount=0),
+        _Result(
+            row={
+                "job_id": "owner",
+                "source": "b3",
+                "ticker": "BBAS3",
+            }
+        ),
+        _Result(rowcount=1),
+    )
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+
+    inserted = await store.create_refresh_job(
+        "follower",
+        [("b3", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+
+    assert inserted == 0
 
 
 async def test_postgres_sessions_report_missing_sequence(

@@ -123,6 +123,8 @@ class IncomeEventAsyncRefreshResponse(APIModel):
 class IncomeEventRefreshJobItem(APIModel):
     source: str
     ticker: str
+    isin: str | None = None
+    name: str | None = None
     status: str
     attempts: int
     last_error: str | None = None
@@ -138,6 +140,10 @@ class IncomeEventRefreshJobResponse(APIModel):
     created_at: datetime
     updated_at: datetime
     items: list[IncomeEventRefreshJobItem] = Field(default_factory=list)
+    # ``items`` contains source-level work.  ``tickers`` keeps the requested
+    # instrument set visible when every source was already fresh or another
+    # job owns the source call and this job has no active work rows of its own.
+    tickers: list[str] = Field(default_factory=list)
 
 
 class IncomeEventCoverageItem(APIModel):

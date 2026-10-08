@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from secrets import token_hex
 from typing import Any
 
 import aiosqlite
@@ -36,6 +37,7 @@ from app.models.income_events import (
     CanonicalIncomeEvent,
     IncomeEventObservation,
     IncomeEventStatus,
+    IncomeInstrumentRequest,
     IncomeSourceCoverage,
 )
 
@@ -45,6 +47,7 @@ REFRESH_COMPLETED = "completed"
 REFRESH_PARTIAL = "partial"
 ITEM_QUEUED = "queued"
 ITEM_RUNNING = "running"
+ITEM_WAITING = "waiting"
 ITEM_COMPLETE = "complete"
 ITEM_FAILED = "failed"
 
@@ -136,14 +139,36 @@ def _schema_statements(*, postgres: bool) -> tuple[str, ...]:
             job_id TEXT NOT NULL,
             source TEXT NOT NULL,
             ticker TEXT NOT NULL,
+            isin TEXT,
+            name TEXT,
             status TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             lease_until TEXT,
+            claim_token TEXT,
+            depends_on_job_id TEXT,
+            depends_on_source TEXT,
+            depends_on_ticker TEXT,
             last_error TEXT,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (job_id, source, ticker)
         )
         """,
+        *(
+            (
+                "ALTER TABLE income_refresh_job_items ADD COLUMN IF NOT EXISTS id BIGSERIAL",
+                "ALTER TABLE income_refresh_job_items ADD COLUMN IF NOT EXISTS isin TEXT",
+                "ALTER TABLE income_refresh_job_items ADD COLUMN IF NOT EXISTS name TEXT",
+                "ALTER TABLE income_refresh_job_items ADD COLUMN IF NOT EXISTS claim_token TEXT",
+                "ALTER TABLE income_refresh_job_items "
+                "ADD COLUMN IF NOT EXISTS depends_on_job_id TEXT",
+                "ALTER TABLE income_refresh_job_items "
+                "ADD COLUMN IF NOT EXISTS depends_on_source TEXT",
+                "ALTER TABLE income_refresh_job_items "
+                "ADD COLUMN IF NOT EXISTS depends_on_ticker TEXT",
+            )
+            if postgres
+            else ()
+        ),
         """
         CREATE INDEX IF NOT EXISTS ix_income_refresh_item_claim
             ON income_refresh_job_items (status, lease_until)
@@ -154,6 +179,19 @@ def _schema_statements(*, postgres: bool) -> tuple[str, ...]:
         CREATE UNIQUE INDEX IF NOT EXISTS uq_income_refresh_item_inflight
             ON income_refresh_job_items (source, ticker)
             WHERE status IN ('queued', 'running')
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS income_refresh_job_requests (
+            job_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            isin TEXT,
+            name TEXT,
+            PRIMARY KEY (job_id, ticker)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS ix_income_refresh_job_request_ticker
+            ON income_refresh_job_requests (ticker)
         """,
     )
 
@@ -187,9 +225,15 @@ ON CONFLICT(source, ticker) DO UPDATE SET
 
 _JOB_ITEM_INSERT = """
 INSERT INTO income_refresh_job_items (
-    job_id, source, ticker, status, attempts, lease_until,
+    job_id, source, ticker, isin, name, status, attempts, lease_until,
+    claim_token, depends_on_job_id, depends_on_source, depends_on_ticker,
     last_error, updated_at
-) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?)
+) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, NULL, ?)
+"""
+
+_JOB_REQUEST_INSERT = """
+INSERT INTO income_refresh_job_requests (job_id, ticker, isin, name)
+VALUES (?, ?, ?, ?)
 """
 
 
@@ -273,6 +317,7 @@ class IncomeEventStore:
                             await db.execute(statement)
                         await self._ensure_observation_active_column()
                         await self._ensure_observation_payment_date_column()
+                        await self._ensure_refresh_job_schema()
             except BaseException:
                 await db.close()
                 self._db = None
@@ -554,14 +599,38 @@ class IncomeEventStore:
     async def create_refresh_job(
         self,
         job_id: str,
-        items: list[tuple[str, str]],
+        items: Sequence[
+            tuple[str, str]
+            | tuple[str, IncomeInstrumentRequest]
+            | tuple[str, str, str | None, str | None]
+        ],
         *,
         requested: int,
         as_of: date,
         now: datetime,
+        requested_instruments: Sequence[IncomeInstrumentRequest] | None = None,
     ) -> int:
-        """Create a job and enqueue only the items no other job owns."""
+        """Create a job and enqueue only items no other job currently owns.
+
+        A duplicate source/ticker gets a durable ``waiting`` row linked to the
+        active owner.  The waiting row keeps the follower visible and is
+        released when the owner finishes, so a deduplicated request cannot be
+        reported complete while its source call is still running.
+
+        ``requested_instruments`` is optional for compatibility with callers
+        that used the original two-column API.  The service always supplies it
+        so identities survive a restart and fresh-cache jobs remain inspectable.
+        """
         moment = now.isoformat()
+        normalized_items = [_job_item_values(item) for item in items]
+        requested_values: list[IncomeInstrumentRequest] = []
+        if requested_instruments is not None:
+            seen_requested: set[tuple[str, str | None]] = set()
+            for instrument in requested_instruments:
+                key = (instrument.ticker, instrument.isin)
+                if key not in seen_requested:
+                    seen_requested.add(key)
+                    requested_values.append(instrument)
         inserted = 0
         async with self._write_session() as session:
             await session.execute(
@@ -572,11 +641,119 @@ class IncomeEventStore:
                 """,
                 (job_id, REFRESH_QUEUED, requested, as_of.isoformat(), moment, moment),
             )
-            for source, ticker in items:
-                inserted += await session.insert_ignore(
-                    _JOB_ITEM_INSERT,
-                    (job_id, source, ticker.upper(), ITEM_QUEUED, moment),
+            if requested_instruments is not None:
+                for instrument in requested_values:
+                    await session.insert_ignore(
+                        _JOB_REQUEST_INSERT,
+                        (
+                            job_id,
+                            instrument.ticker.upper(),
+                            instrument.isin,
+                            instrument.name,
+                        ),
+                    )
+            for source, ticker, isin, name in normalized_items:
+                params = (
+                    job_id,
+                    source,
+                    ticker,
+                    isin,
+                    name,
+                    ITEM_QUEUED,
+                    None,
+                    None,
+                    None,
+                    moment,
                 )
+                was_inserted = await session.insert_ignore(_JOB_ITEM_INSERT, params)
+                if was_inserted:
+                    inserted += was_inserted
+                    continue
+                owner = await session.fetchone(
+                    """
+                    SELECT job_id, source, ticker FROM income_refresh_job_items
+                    WHERE source = ? AND ticker = ? AND status IN (?, ?)
+                    ORDER BY updated_at, job_id LIMIT 1
+                    """,
+                    (source, ticker, ITEM_QUEUED, ITEM_RUNNING),
+                )
+                if owner is not None and str(owner["job_id"]) != job_id:
+                    await session.execute(
+                        _JOB_ITEM_INSERT,
+                        (
+                            job_id,
+                            source,
+                            ticker,
+                            isin,
+                            name,
+                            ITEM_WAITING,
+                            str(owner["job_id"]),
+                            str(owner["source"]),
+                            str(owner["ticker"]),
+                            moment,
+                        ),
+                    )
+                    continue
+                # The owner may have completed between the unique conflict
+                # and the lookup.  Reconcile that terminal row before retrying
+                # an active claim; otherwise the follower could duplicate a
+                # source call or be silently dropped.
+                latest = await session.fetchone(
+                    """
+                    SELECT job_id, source, ticker, status FROM income_refresh_job_items
+                    WHERE source = ? AND ticker = ?
+                    ORDER BY updated_at DESC, job_id DESC LIMIT 1
+                    """,
+                    (source, ticker),
+                )
+                if latest is not None and latest["status"] == ITEM_COMPLETE:
+                    await session.execute(
+                        _JOB_ITEM_INSERT,
+                        (
+                            job_id,
+                            source,
+                            ticker,
+                            isin,
+                            name,
+                            ITEM_COMPLETE,
+                            str(latest["job_id"]),
+                            str(latest["source"]),
+                            str(latest["ticker"]),
+                            moment,
+                        ),
+                    )
+                    continue
+                retried = await session.insert_ignore(_JOB_ITEM_INSERT, params)
+                if retried:
+                    inserted += retried
+                    continue
+                # A second owner won the race.  Link to it and keep the
+                # follower pending; this branch is only reached after the
+                # owner lookup above observed no active row.
+                owner = await session.fetchone(
+                    """
+                    SELECT job_id, source, ticker FROM income_refresh_job_items
+                    WHERE source = ? AND ticker = ? AND status IN (?, ?)
+                    ORDER BY updated_at, job_id LIMIT 1
+                    """,
+                    (source, ticker, ITEM_QUEUED, ITEM_RUNNING),
+                )
+                if owner is not None:
+                    await session.execute(
+                        _JOB_ITEM_INSERT,
+                        (
+                            job_id,
+                            source,
+                            ticker,
+                            isin,
+                            name,
+                            ITEM_WAITING,
+                            str(owner["job_id"]),
+                            str(owner["source"]),
+                            str(owner["ticker"]),
+                            moment,
+                        ),
+                    )
         return inserted
 
     async def claim_refresh_items(
@@ -591,7 +768,8 @@ class IncomeEventStore:
         order_column = "id" if self.postgres else "rowid"
         lock_clause = " FOR UPDATE OF i SKIP LOCKED" if self.postgres else ""
         select = f"""
-            SELECT i.job_id, i.source, i.ticker, i.attempts + 1 AS attempts, j.as_of
+            SELECT i.job_id, i.source, i.ticker, i.isin, i.name,
+                   i.claim_token, i.attempts + 1 AS attempts, j.as_of
             FROM income_refresh_job_items i
             JOIN income_refresh_jobs j ON j.job_id = i.job_id
             WHERE i.status = ?
@@ -602,30 +780,100 @@ class IncomeEventStore:
         async with self._write_session() as session:
             await session.execute(
                 """
-                UPDATE income_refresh_job_items
-                SET status = ?, lease_until = NULL, updated_at = ?
-                WHERE status = ? AND lease_until IS NOT NULL AND lease_until <= ?
+                UPDATE income_refresh_job_items AS i
+                SET status = CASE
+                    WHEN i.status = ? AND i.lease_until IS NOT NULL AND i.lease_until <= ?
+                        THEN ?
+                    WHEN i.status = ? AND EXISTS (
+                        SELECT 1 FROM income_refresh_job_items owner
+                        WHERE owner.job_id = i.depends_on_job_id
+                          AND owner.source = i.depends_on_source
+                          AND owner.ticker = i.depends_on_ticker
+                          AND owner.status = ?
+                    ) THEN ?
+                    WHEN i.status = ? AND EXISTS (
+                        SELECT 1 FROM income_refresh_job_items owner
+                        WHERE owner.job_id = i.depends_on_job_id
+                          AND owner.source = i.depends_on_source
+                          AND owner.ticker = i.depends_on_ticker
+                          AND owner.status = ?
+                    ) THEN ?
+                    ELSE i.status
+                END,
+                lease_until = CASE
+                    WHEN (i.status = ? AND i.lease_until IS NOT NULL AND i.lease_until <= ?)
+                      OR i.status = ? THEN NULL
+                    ELSE i.lease_until
+                END,
+                claim_token = CASE
+                    WHEN (i.status = ? AND i.lease_until IS NOT NULL AND i.lease_until <= ?)
+                      OR i.status = ? THEN NULL
+                    ELSE i.claim_token
+                END,
+                last_error = CASE WHEN i.status = ? THEN NULL ELSE i.last_error END,
+                updated_at = ?
+                WHERE (i.status = ? AND i.lease_until IS NOT NULL AND i.lease_until <= ?)
+                   OR (i.status = ? AND EXISTS (
+                        SELECT 1 FROM income_refresh_job_items owner
+                        WHERE owner.job_id = i.depends_on_job_id
+                          AND owner.source = i.depends_on_source
+                          AND owner.ticker = i.depends_on_ticker
+                          AND owner.status IN (?, ?)
+                   ))
                 """,
-                (ITEM_QUEUED, moment, ITEM_RUNNING, moment),
+                (
+                    # Expired running claims become queued.
+                    ITEM_RUNNING,
+                    moment,
+                    ITEM_QUEUED,
+                    # A completed owner releases waiting followers as complete.
+                    ITEM_WAITING,
+                    ITEM_COMPLETE,
+                    ITEM_COMPLETE,
+                    # A terminal owner failure propagates to followers.  A
+                    # later request creates a fresh owner row and retries it.
+                    ITEM_WAITING,
+                    ITEM_FAILED,
+                    ITEM_FAILED,
+                    # Clear leases/tokens for rows whose state changed.
+                    ITEM_RUNNING,
+                    moment,
+                    ITEM_WAITING,
+                    ITEM_RUNNING,
+                    moment,
+                    ITEM_WAITING,
+                    # Clear dependency columns and stale errors.
+                    ITEM_WAITING,
+                    moment,
+                    # Rows eligible for one of the transitions above.
+                    ITEM_RUNNING,
+                    moment,
+                    ITEM_WAITING,
+                    ITEM_COMPLETE,
+                    ITEM_FAILED,
+                ),
             )
             rows = await session.fetchall(select, (ITEM_QUEUED, moment, limit))
             if rows:
+                claim_tokens = [token_hex(16) for _row in rows]
                 await session.executemany(
                     """
                     UPDATE income_refresh_job_items
-                    SET status = ?, attempts = attempts + 1, lease_until = ?, updated_at = ?
+                    SET status = ?, attempts = attempts + 1, lease_until = ?,
+                        claim_token = ?, updated_at = ?
                     WHERE job_id = ? AND source = ? AND ticker = ?
                     """,
                     [
                         (
                             ITEM_RUNNING,
                             lease,
+                            claim_token,
                             moment,
                             row["job_id"],
                             row["source"],
                             row["ticker"],
                         )
-                        for row in rows
+                        for row, claim_token in zip(rows, claim_tokens, strict=True)
                     ],
                 )
                 await session.executemany(
@@ -638,7 +886,17 @@ class IncomeEventStore:
                         for job_id in {str(row["job_id"]) for row in rows}
                     ],
                 )
-        return [dict(row) for row in rows]
+        claimed: list[dict[str, object]] = []
+        for row, claim_token in zip(rows, claim_tokens if rows else [], strict=True):
+            value = dict(row)
+            # Old lightweight fakes return only the historical columns.  Keep
+            # their exact shape while real backends expose the fencing token
+            # and identity fields to the worker.
+            keys = set(row.keys()) if hasattr(row, "keys") else set(value)
+            if "claim_token" in keys:
+                value["claim_token"] = claim_token
+            claimed.append(value)
+        return claimed
 
     async def complete_refresh_item(
         self,
@@ -647,8 +905,9 @@ class IncomeEventStore:
         ticker: str,
         *,
         now: datetime,
-    ) -> None:
-        await self._set_refresh_item(
+        claim_token: str | None = None,
+    ) -> bool:
+        return await self._set_refresh_item(
             job_id,
             source,
             ticker,
@@ -656,6 +915,7 @@ class IncomeEventStore:
             lease_until=None,
             last_error=None,
             now=now,
+            claim_token=claim_token,
         )
 
     async def requeue_refresh_item(
@@ -667,8 +927,9 @@ class IncomeEventStore:
         error: str,
         available_at: datetime,
         now: datetime,
-    ) -> None:
-        await self._set_refresh_item(
+        claim_token: str | None = None,
+    ) -> bool:
+        return await self._set_refresh_item(
             job_id,
             source,
             ticker,
@@ -676,6 +937,7 @@ class IncomeEventStore:
             lease_until=available_at,
             last_error=error[:200],
             now=now,
+            claim_token=claim_token,
         )
 
     async def fail_refresh_item(
@@ -686,8 +948,9 @@ class IncomeEventStore:
         *,
         error: str,
         now: datetime,
-    ) -> None:
-        await self._set_refresh_item(
+        claim_token: str | None = None,
+    ) -> bool:
+        return await self._set_refresh_item(
             job_id,
             source,
             ticker,
@@ -695,6 +958,7 @@ class IncomeEventStore:
             lease_until=None,
             last_error=error[:200],
             now=now,
+            claim_token=claim_token,
         )
 
     async def _set_refresh_item(
@@ -707,46 +971,193 @@ class IncomeEventStore:
         lease_until: datetime | None,
         last_error: str | None,
         now: datetime,
-    ) -> None:
+        claim_token: str | None = None,
+    ) -> bool:
         async with self._write_session() as session:
-            await session.execute(
+            where = "job_id = ? AND source = ? AND ticker = ?"
+            params: list[object] = [
+                status,
+                lease_until.isoformat() if lease_until is not None else None,
+                last_error,
+                now.isoformat(),
+                job_id,
+                source,
+                ticker.upper(),
+            ]
+            if claim_token is not None:
+                where += " AND claim_token = ? AND status = ?"
+                params.extend([claim_token, ITEM_RUNNING])
+            cursor = await session.execute(
+                f"""
+                UPDATE income_refresh_job_items
+                SET status = ?, lease_until = ?, claim_token = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE {where}
+                """,
+                params,
+            )  # noqa: S608 - ``where`` only contains fixed predicates above
+            changed = int(cursor.rowcount or 0) > 0
+            if changed and status == ITEM_COMPLETE:
+                await session.execute(
+                    """
+                    UPDATE income_refresh_job_items
+                    SET status = ?, lease_until = NULL, claim_token = NULL,
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE status = ? AND depends_on_job_id = ?
+                      AND depends_on_source = ? AND depends_on_ticker = ?
+                    """,
+                    (
+                        ITEM_COMPLETE,
+                        now.isoformat(),
+                        ITEM_WAITING,
+                        job_id,
+                        source,
+                        ticker.upper(),
+                    ),
+                )
+            elif changed and status == ITEM_FAILED:
+                await session.execute(
+                    """
+                    UPDATE income_refresh_job_items
+                    SET status = ?, lease_until = NULL, claim_token = NULL,
+                        last_error = ?, updated_at = ?
+                    WHERE status = ? AND depends_on_job_id = ?
+                      AND depends_on_source = ? AND depends_on_ticker = ?
+                    """,
+                    (
+                        ITEM_FAILED,
+                        "dependency failed",
+                        now.isoformat(),
+                        ITEM_WAITING,
+                        job_id,
+                        source,
+                        ticker.upper(),
+                    ),
+                )
+            return changed
+
+    async def renew_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        claim_token: str,
+        lease_seconds: int,
+        now: datetime,
+    ) -> bool:
+        """Extend one claim only while its fencing token is still current."""
+
+        async with self._write_session() as session:
+            cursor = await session.execute(
                 """
                 UPDATE income_refresh_job_items
-                SET status = ?, lease_until = ?, last_error = ?, updated_at = ?
+                SET lease_until = ?, updated_at = ?
                 WHERE job_id = ? AND source = ? AND ticker = ?
+                  AND status = ? AND claim_token = ?
                 """,
                 (
-                    status,
-                    lease_until.isoformat() if lease_until is not None else None,
-                    last_error,
+                    (now + timedelta(seconds=max(lease_seconds, 1))).isoformat(),
                     now.isoformat(),
                     job_id,
                     source,
                     ticker.upper(),
+                    ITEM_RUNNING,
+                    claim_token,
                 ),
             )
+        return int(cursor.rowcount or 0) > 0
+
+    async def refresh_item_owned(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        claim_token: str | None,
+    ) -> bool:
+        """Check ownership immediately before a page writes source results."""
+
+        if claim_token is None:
+            # Compatibility callers created before fencing did not receive a
+            # token; their short-lived writes remain valid under the old API.
+            return True
+        async with self._read_session() as session:
+            row = await session.fetchone(
+                """
+                SELECT 1 AS owned FROM income_refresh_job_items
+                WHERE job_id = ? AND source = ? AND ticker = ?
+                  AND status = ? AND claim_token = ?
+                """,
+                (job_id, source, ticker.upper(), ITEM_RUNNING, claim_token),
+            )
+        return row is not None
 
     async def pending_refresh_item_count(self, job_id: str) -> int:
         async with self._read_session() as session:
             row = await session.fetchone(
                 """
                 SELECT COUNT(*) AS total FROM income_refresh_job_items
-                WHERE job_id = ? AND status IN (?, ?)
+                WHERE job_id = ? AND status IN (?, ?, ?)
                 """,
-                (job_id, ITEM_QUEUED, ITEM_RUNNING),
+                (job_id, ITEM_QUEUED, ITEM_RUNNING, ITEM_WAITING),
             )
         return int(row["total"]) if row else 0
+
+    async def refresh_jobs_ready_for_publication(self, *, limit: int) -> list[str]:
+        """Return queued/running jobs whose item work is already terminal."""
+
+        async with self._read_session() as session:
+            rows = await session.fetchall(
+                """
+                SELECT j.job_id
+                FROM income_refresh_jobs j
+                WHERE j.status IN (?, ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM income_refresh_job_items i
+                      WHERE i.job_id = j.job_id
+                        AND i.status IN (?, ?, ?)
+                  )
+                ORDER BY j.updated_at, j.job_id
+                LIMIT ?
+                """,
+                (
+                    REFRESH_QUEUED,
+                    REFRESH_RUNNING,
+                    ITEM_QUEUED,
+                    ITEM_RUNNING,
+                    ITEM_WAITING,
+                    max(limit, 1),
+                ),
+            )
+        return [str(row["job_id"]) for row in rows]
 
     async def job_tickers(self, job_id: str) -> list[str]:
         async with self._read_session() as session:
             rows = await session.fetchall(
                 """
-                SELECT DISTINCT ticker FROM income_refresh_job_items
-                WHERE job_id = ? ORDER BY ticker
+                SELECT ticker FROM income_refresh_job_items
+                WHERE job_id = ?
+                UNION
+                SELECT ticker FROM income_refresh_job_requests
+                WHERE job_id = ?
+                ORDER BY ticker
+                """,
+                (job_id, job_id),
+            )
+        return [str(row["ticker"]) for row in rows]
+
+    async def refresh_job_dependents(self, job_id: str) -> list[str]:
+        async with self._read_session() as session:
+            rows = await session.fetchall(
+                """
+                SELECT DISTINCT job_id FROM income_refresh_job_items
+                WHERE depends_on_job_id = ? ORDER BY job_id
                 """,
                 (job_id,),
             )
-        return [str(row["ticker"]) for row in rows]
+        return [str(row["job_id"]) for row in rows]
 
     async def finish_refresh_job(
         self,
@@ -774,12 +1185,20 @@ class IncomeEventStore:
                 return None
             items = await session.fetchall(
                 """
-                SELECT source, ticker, status, attempts, last_error
+                SELECT source, ticker, isin, name, status, attempts, last_error
                 FROM income_refresh_job_items WHERE job_id = ?
                 ORDER BY source, ticker
                 """,
                 (job_id,),
             )
+            requests = await session.fetchall(
+                """
+                SELECT ticker, isin, name FROM income_refresh_job_requests
+                WHERE job_id = ? ORDER BY ticker
+                """,
+                (job_id,),
+            )
+        tickers = {str(item["ticker"]) for item in [*items, *requests]}
         return {
             "job_id": str(job["job_id"]),
             "status": str(job["status"]),
@@ -790,6 +1209,7 @@ class IncomeEventStore:
             "completed": sum(1 for item in items if item["status"] == ITEM_COMPLETE),
             "failed": sum(1 for item in items if item["status"] == ITEM_FAILED),
             "items": [dict(item) for item in items],
+            "tickers": sorted(tickers),
         }
 
     async def coverage(self, tickers: list[str]) -> list[IncomeSourceCoverage]:
@@ -878,6 +1298,34 @@ class IncomeEventStore:
         if "payment_date" not in columns:
             await db.execute("ALTER TABLE income_event_observations ADD COLUMN payment_date TEXT")
 
+    async def _ensure_refresh_job_schema(self) -> None:
+        """Add refresh identity/lease columns to stores created by older releases."""
+
+        db = self._require_db()
+        async with db.execute("PRAGMA table_info(income_refresh_job_items)") as cursor:
+            columns = {str(row["name"]) for row in await cursor.fetchall()}
+        additions = {
+            "isin": "ALTER TABLE income_refresh_job_items ADD COLUMN isin TEXT",
+            "name": "ALTER TABLE income_refresh_job_items ADD COLUMN name TEXT",
+            "claim_token": "ALTER TABLE income_refresh_job_items ADD COLUMN claim_token TEXT",
+            "depends_on_job_id": (
+                "ALTER TABLE income_refresh_job_items ADD COLUMN depends_on_job_id TEXT"
+            ),
+            "depends_on_source": (
+                "ALTER TABLE income_refresh_job_items ADD COLUMN depends_on_source TEXT"
+            ),
+            "depends_on_ticker": (
+                "ALTER TABLE income_refresh_job_items ADD COLUMN depends_on_ticker TEXT"
+            ),
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                await db.execute(statement)
+        # The CREATE statements above are idempotent, but rerun these two
+        # explicitly so a pre-migration SQLite file receives the new table.
+        await db.execute(_SQLITE_SCHEMA[-2])
+        await db.execute(_SQLITE_SCHEMA[-1])
+
 
 def _observation_row(item: IncomeEventObservation) -> tuple[object, ...]:
     return (
@@ -903,6 +1351,25 @@ def _semantic_payload(event: CanonicalIncomeEvent) -> dict[str, object]:
     payload.pop("revision", None)
     payload.pop("updated_at", None)
     return payload
+
+
+def _job_item_values(
+    item: tuple[
+        str,
+        str,
+        str | None,
+        str | None,
+    ]
+    | tuple[str, str]
+    | tuple[str, IncomeInstrumentRequest],
+) -> tuple[str, str, str | None, str | None]:
+    source = str(item[0])
+    value = item[1]
+    if isinstance(value, IncomeInstrumentRequest):
+        return source, value.ticker.upper(), value.isin, value.name
+    if len(item) >= 4:
+        return source, str(value).upper(), item[2], item[3]
+    return source, str(value).upper(), None, None
 
 
 __all__ = ["IncomeEventStore"]
