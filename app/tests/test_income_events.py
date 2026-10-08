@@ -40,6 +40,7 @@ from app.income.sources import (
 from app.income.store import IncomeEventStore
 from app.main import create_app
 from app.models import (
+    CanonicalIncomeEvent,
     Dividend,
     IncomeEventBackfillRequest,
     IncomeEventBatchRequest,
@@ -1026,7 +1027,7 @@ class _FlakyPublishStore(IncomeEventStore):
 
     async def publish(
         self,
-        events: list,
+        events: list[CanonicalIncomeEvent],
         *,
         scope_tickers: list[str] | None = None,
     ) -> int:
@@ -1044,7 +1045,7 @@ class _PublishRecordingStore(IncomeEventStore):
 
     async def publish(
         self,
-        events: list,
+        events: list[CanonicalIncomeEvent],
         *,
         scope_tickers: list[str] | None = None,
     ) -> int:
@@ -2538,8 +2539,9 @@ async def test_async_job_persists_and_reconstructs_instrument_identity(tmp_path:
     accepted = await service.refresh_async(request)
     queued = await service.refresh_job(accepted.job_id)
     assert queued is not None
-    assert queued["items"][0]["isin"] == "BR-ID"
-    assert queued["items"][0]["name"] == "Banco"
+    queued_item = _job_item(queued)
+    assert queued_item["isin"] == "BR-ID"
+    assert queued_item["name"] == "Banco"
 
     assert await service.process_pending_once() == 1
     assert source.requested[0][0] == request.instruments[0].model_copy(
@@ -2564,7 +2566,7 @@ async def test_deduplicated_job_waits_for_owner_and_does_not_duplicate_source_ca
     follower = await service.refresh_async(request)
     assert follower.status == "queued"
     waiting = await service.refresh_job(follower.job_id)
-    assert waiting is not None and waiting["items"][0]["status"] == "waiting"
+    assert waiting is not None and _job_item(waiting)["status"] == "waiting"
 
     processing = asyncio.create_task(service.process_pending_once())
     await source.started.wait()
@@ -2609,7 +2611,7 @@ async def test_store_deduplicates_without_identity_payload_as_waiting_dependency
     )
     follower = await store.refresh_job("follower")
     assert follower is not None
-    assert follower["items"][0]["status"] == "waiting"
+    assert _job_item(follower)["status"] == "waiting"
     assert await store.pending_refresh_item_count("follower") == 1
 
     claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
@@ -2617,7 +2619,7 @@ async def test_store_deduplicates_without_identity_payload_as_waiting_dependency
     assert await store.complete_refresh_item("owner", "fake", "BBAS3", now=now)
     follower = await store.refresh_job("follower")
     assert follower is not None
-    assert follower["items"][0]["status"] == "complete"
+    assert _job_item(follower)["status"] == "complete"
     assert await store.pending_refresh_item_count("follower") == 0
     assert await store.refresh_item_owned("follower", "fake", "BBAS3", claim_token=None)
     await store.close()
@@ -2639,7 +2641,7 @@ async def test_multiple_followers_fail_together_without_promoting_duplicate_clai
     assert await service.process_pending_once() == 1
     states = [await service.refresh_job(job.job_id) for job in jobs]
     assert all(state is not None and state["status"] == "partial" for state in states)
-    assert all(state is not None and state["items"][0]["status"] == "failed" for state in states)
+    assert all(state is not None and _job_item(state)["status"] == "failed" for state in states)
     assert source.calls == 1
     await store.close()
 
@@ -2657,7 +2659,7 @@ async def test_incomplete_coverage_retries_then_completes_empty_snapshot(tmp_pat
     assert await service.process_pending_once() == 1
     first = await service.refresh_job(job.job_id)
     assert first is not None and first["status"] == "running"
-    assert first["items"][0]["status"] == "queued"
+    assert _job_item(first)["status"] == "queued"
 
     await store.requeue_refresh_item(
         job.job_id,
@@ -2671,7 +2673,7 @@ async def test_incomplete_coverage_retries_then_completes_empty_snapshot(tmp_pat
     assert await service.process_pending_once() == 1
     finished = await service.refresh_job(job.job_id)
     assert finished is not None and finished["status"] == "completed"
-    assert finished["items"][0]["status"] == "complete"
+    assert _job_item(finished)["status"] == "complete"
     assert source.calls == 2
     await store.close()
 
@@ -2692,7 +2694,7 @@ async def test_lost_claim_skips_source_persistence_and_terminal_write(tmp_path: 
     state = await service.refresh_job(job.job_id)
     assert state is not None
     assert state["status"] == "running"
-    assert state["items"][0]["status"] == "running"
+    assert _job_item(state)["status"] == "running"
     assert await store.observations(["BBAS3"]) == []
     await store.close()
 
@@ -2712,8 +2714,9 @@ async def test_persistence_failure_retries_as_sanitized_item_error(tmp_path: Pat
     assert await service.process_pending_once() == 1
     state = await service.refresh_job(job.job_id)
     assert state is not None and state["status"] == "partial"
-    assert state["items"][0]["status"] == "failed"
-    assert state["items"][0]["last_error"] == "observation persistence failed"
+    item = _job_item(state)
+    assert item["status"] == "failed"
+    assert item["last_error"] == "observation persistence failed"
     await store.close()
 
 
@@ -2794,7 +2797,7 @@ async def test_completed_item_is_finalized_after_transient_publication_failure(
     first = await service.refresh_job(job.job_id)
     assert first is not None
     assert first["status"] == "running"
-    assert first["items"][0]["status"] == "complete"
+    assert _job_item(first)["status"] == "complete"
     assert source.calls == 1
 
     # The second drain claims no source work, but the durable finalization scan
@@ -2974,8 +2977,9 @@ async def test_legacy_job_store_upgrades_identity_columns_additively(tmp_path: P
     assert state == 1
     job = await store.refresh_job("job-upgraded")
     assert job is not None
-    assert job["items"][0]["isin"] == "BR-ID"
-    assert job["items"][0]["name"] == "Banco"
+    job_item = _job_item(job)
+    assert job_item["isin"] == "BR-ID"
+    assert job_item["name"] == "Banco"
     assert job["tickers"] == ["BBAS3"]
     await store.close()
 
