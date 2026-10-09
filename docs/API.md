@@ -50,6 +50,10 @@ Refreshes a bounded list of instruments from independent public sources and publ
 }
 ```
 
+### `POST /v2/income-events/backfill`
+
+Queues one durable official backfill for a bounded instrument list (up to 500 tickers) and returns `202` with a job id; poll `GET /v2/income-events/refresh-jobs/{job_id}` for progress. Only the official B3/CVM source is collected, and the CVM open-data index and the parsed documents are shared across the job pages, so a catalog backfill does not scrape the complementary HTML providers per ticker. This maintenance endpoint requires `X-Cache-Token` outside local/test environments.
+
 ### `POST /v2/income-events/batch`
 
 Reads canonical events for at most 20 tickers from local SQLite storage. By default, only `corroborated` and `verified` events are returned; tentative and conflicting observations cannot inflate portfolio projections. Optional `from_date` and `to_date` fields filter payment dates. The response includes a cursor and ETag.

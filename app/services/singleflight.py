@@ -16,9 +16,19 @@ class SingleFlight:
             if task is None:
                 task = asyncio.create_task(factory())
                 self._tasks[key] = task
-        try:
-            return cast(T, await task)
-        finally:
-            async with self._lock:
-                if self._tasks.get(key) is task:
-                    self._tasks.pop(key, None)
+                task.add_done_callback(lambda completed: self._complete(key, completed))
+
+        # A cancelled caller must not propagate cancellation to the shared task.
+        # Cleanup is attached to the shared task itself so that a cancelled caller
+        # cannot remove an in-flight task and cause duplicate provider work.
+        return cast(T, await asyncio.shield(task))
+
+    def _complete(self, key: str, task: asyncio.Task[Any]) -> None:
+        if self._tasks.get(key) is task:
+            self._tasks.pop(key, None)
+
+        # If every waiter was cancelled, consume a failed task's exception so the
+        # event loop does not report an unhandled-task warning. Waiters still see
+        # the original exception when they await the shared task.
+        if not task.cancelled():
+            task.exception()

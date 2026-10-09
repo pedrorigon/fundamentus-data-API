@@ -42,10 +42,121 @@ def test_brapi_directory_parses_asset_types_and_accents() -> None:
         InstrumentType.bdr,
         InstrumentType.fii,
         InstrumentType.etf,
-        InstrumentType.fii,
+        InstrumentType.fund,
     ]
     assert results[0].country == "BR"
     assert results[0].source == "brapi_directory_complementary"
+
+
+@pytest.mark.parametrize("ticker", ["AUPO11", "AREA11", "IRFM11", "DEBB11", "BPAC11", "MXRF11"])
+@pytest.mark.parametrize("raw_type", ["fund", "FUNDS", "Fundos"])
+def test_generic_fund_type_remains_ambiguous(ticker: str, raw_type: str) -> None:
+    rows = parse_brapi_directory({"stocks": [{"stock": ticker, "type": raw_type}]})
+    assert len(rows) == 1
+    assert rows[0].instrument_type is InstrumentType.fund
+
+
+@pytest.mark.parametrize("name", ["ETF de renda fixa", "Fundo de Índice", "FUNDO DE INDICE"])
+def test_directory_recognizes_explicit_fixed_income_etf_names(name: str) -> None:
+    row = parse_brapi_directory([{"stock": "AREA11", "type": "fund", "name": name}])[0]
+    assert row.instrument_type is InstrumentType.etf
+
+
+@pytest.mark.asyncio
+async def test_official_b3_observation_replaces_generic_fund_without_a_duplicate() -> None:
+    service = InstrumentDataService(_settings())
+    generic = parse_brapi_directory([{"stock": "AUPO11", "type": "fund"}])[0]
+    official = InstrumentMetadata(
+        ticker="AUPO11",
+        name="Fundo de Índice",
+        instrument_type=InstrumentType.etf,
+        exchange="EQUITY-CASH",
+        country="BR",
+        source="b3",
+        confidence="high",
+        isin="BRAUPOCTF005",
+    )
+    service._remember(generic)
+    service._remember(official)
+    service._remember(generic)
+    results = (await service.search("AUPO11")).results
+    assert len(results) == 1
+    assert results[0].instrument_type is InstrumentType.etf
+    assert results[0].source == "b3"
+    assert results[0].isin == "BRAUPOCTF005"
+
+
+@pytest.mark.asyncio
+async def test_explicit_directory_type_survives_a_later_generic_observation() -> None:
+    service = InstrumentDataService(_settings())
+    rows = parse_brapi_directory(
+        [
+            {"stock": "AUPO11", "type": "ETF", "name": "ETF de renda fixa"},
+            {"stock": "AUPO11", "type": "fund"},
+        ]
+    )
+    # Duplicate list rows are deduplicated by the parser; distinct refreshes
+    # must retain the same explicit type as well.
+    service._remember(rows[0])
+    service._remember(parse_brapi_directory([{"stock": "AUPO11", "type": "fund"}])[0])
+    result = (await service.search("AUPO11")).results[0]
+    assert result.instrument_type is InstrumentType.etf
+    assert result.name == "ETF de renda fixa"
+
+
+@pytest.mark.parametrize(
+    "country,source,exchange",
+    [
+        (None, "b3", "B3"),
+        (None, "complementary", "EQUITY-CASH"),
+        ("BR", "complementary", "B3"),
+        ("US", "b3", "EQUITY-CASH"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cash_segment_needs_positive_brazilian_evidence(
+    country: str | None, source: str, exchange: str
+) -> None:
+    service = InstrumentDataService(_settings())
+    service._remember(
+        InstrumentMetadata(
+            ticker="AUPO11",
+            instrument_type=InstrumentType.etf,
+            exchange="EQUITY-CASH",
+            country=country,
+            source=source,
+        )
+    )
+    assert (await service.search("AUPO11")).results[0].exchange == exchange
+
+
+@pytest.mark.asyncio
+async def test_directory_does_not_merge_conflicting_isins_or_foreign_cash_segments() -> None:
+    service = InstrumentDataService(_settings())
+    for isin in ("BRAUPOCTF005", "BRAUPOCTF013"):
+        service._remember(
+            InstrumentMetadata(
+                ticker="AUPO11",
+                instrument_type=InstrumentType.etf,
+                exchange="B3",
+                country="BR",
+                isin=isin,
+            )
+        )
+    service._remember(
+        InstrumentMetadata(
+            ticker="AUPO11",
+            instrument_type=InstrumentType.etf,
+            exchange="EQUITY-CASH",
+            country="US",
+            currency="BRL",
+            source="complementary",
+        )
+    )
+    results = (await service.search("AUPO11")).results
+    assert len(results) == 3
+    assert {row.isin for row in results if row.isin} == {"BRAUPOCTF005", "BRAUPOCTF013"}
+    assert any(row.exchange == "EQUITY-CASH" and row.country == "US" for row in results)
 
 
 def test_brapi_directory_accepts_list_shapes_and_rejects_bad_rows() -> None:
@@ -96,6 +207,88 @@ async def test_brapi_directory_alias_and_unavailable_response() -> None:
     )
     assert await empty.directory() == []
     assert empty.last_error == "brapi returned no parseable instruments"
+
+
+@pytest.mark.asyncio
+async def test_brapi_directory_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BrapiInstrumentDirectoryProvider(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def load() -> list[InstrumentMetadata]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return [InstrumentMetadata(ticker="PETR4", instrument_type=InstrumentType.stock)]
+
+    monkeypatch.setattr(provider, "_load", load)
+    first = asyncio.create_task(provider.directory())
+    await started.wait()
+    second = asyncio.create_task(provider.directory())
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert calls == 1
+    assert not cancelled.is_set()
+
+    release.set()
+    result = await second
+    assert [item.ticker for item in result] == ["PETR4"]
+    await asyncio.sleep(0)
+    assert provider._inflight is None
+
+
+@pytest.mark.asyncio
+async def test_brapi_directory_failure_cleans_up_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BrapiInstrumentDirectoryProvider(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def load() -> list[InstrumentMetadata]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        raise RuntimeError("directory unavailable")
+
+    monkeypatch.setattr(provider, "_load", load)
+    first = asyncio.create_task(provider.directory())
+    await started.wait()
+    shared = provider._inflight
+    assert shared is not None
+    second = asyncio.create_task(provider.directory())
+    await asyncio.sleep(0)
+
+    first.cancel()
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    release.set()
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await shared
+    await asyncio.sleep(0)
+    assert provider._inflight is None
+
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await provider.directory()
+    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -264,6 +457,86 @@ async def test_warm_singleflight_and_stale_fallback_on_provider_outage() -> None
 
 
 @pytest.mark.asyncio
+async def test_warm_directory_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = InstrumentDataService(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def refresh() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(service, "_refresh_directory", refresh)
+    first = asyncio.create_task(service.warm_directory(force=True))
+    await started.wait()
+    second = asyncio.create_task(service.warm_directory(force=True))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert calls == 1
+    assert not cancelled.is_set()
+
+    release.set()
+    await second
+    await asyncio.sleep(0)
+    assert service._directory_task is None
+
+
+@pytest.mark.asyncio
+async def test_warm_directory_failure_cleans_up_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = InstrumentDataService(_settings())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def refresh() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        raise RuntimeError("directory unavailable")
+
+    monkeypatch.setattr(service, "_refresh_directory", refresh)
+    first = asyncio.create_task(service.warm_directory(force=True))
+    await started.wait()
+    shared = service._directory_task
+    assert shared is not None
+    second = asyncio.create_task(service.warm_directory(force=True))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    release.set()
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await shared
+    await asyncio.sleep(0)
+    assert service._directory_task is None
+
+    with pytest.raises(RuntimeError, match="directory unavailable"):
+        await service.warm_directory(force=True)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_search_ranking_ttl_refresh_and_empty_query() -> None:
     settings = Settings(instrument_directory_ttl_seconds=3600)
     service = InstrumentDataService(settings)
@@ -337,19 +610,40 @@ async def test_directory_warning_and_shutdown_cancellation_paths() -> None:
     )
 
     class Slow:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.cleaned = asyncio.Event()
+
         async def ticker_directory(self) -> list[object]:
-            await asyncio.sleep(10)
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await asyncio.sleep(0)
+                self.cleaned.set()
+                raise
             return []
 
         async def directory(self) -> list[InstrumentMetadata]:
-            await asyncio.sleep(10)
-            return []
+            return await self.ticker_directory()  # type: ignore[return-value]
 
-    slow = InstrumentDataService(_settings(), sec=Slow(), brapi_directory=Slow())  # type: ignore[arg-type]
+    sec = Slow()
+    brapi = Slow()
+    slow = InstrumentDataService(_settings(), sec=sec, brapi_directory=brapi)  # type: ignore[arg-type]
     warm_task = asyncio.create_task(slow.warm_directory())
-    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(sec.started.wait(), brapi.started.wait()), timeout=1)
+    warm_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm_task
+
+    # A cancelled warm-up waiter must leave the shared refresh running until
+    # the service is explicitly closed.
+    assert not sec.cancelled.is_set() and not brapi.cancelled.is_set()
     await slow.close()
-    await asyncio.gather(warm_task, return_exceptions=True)
+    assert sec.cancelled.is_set() and sec.cleaned.is_set()
+    assert brapi.cancelled.is_set() and brapi.cleaned.is_set()
 
 
 @pytest.mark.asyncio
