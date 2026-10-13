@@ -173,6 +173,10 @@ def _schema_statements(*, postgres: bool) -> tuple[str, ...]:
         CREATE INDEX IF NOT EXISTS ix_income_refresh_item_claim
             ON income_refresh_job_items (status, lease_until)
         """,
+        """
+        CREATE INDEX IF NOT EXISTS ix_income_refresh_item_source_ticker_status_updated
+            ON income_refresh_job_items (source, ticker, status, updated_at, job_id)
+        """,
         # Persisted single-flight: one in-flight item per source and ticker,
         # shared by every API replica.
         """
@@ -434,6 +438,101 @@ class IncomeEventStore:
         return {
             item.ticker for item in coverage if item.complete and item.observed_at >= not_before
         }
+
+    async def fresh_empty_coverage(
+        self,
+        source: str,
+        tickers: list[str],
+        *,
+        not_before: datetime,
+    ) -> set[str]:
+        """Return fresh explicit empty snapshots lacking job provenance.
+
+        An empty complete snapshot carries no events whose capture window could
+        be mistaken for another ``as_of`` request.  Keep this narrow legacy
+        cache path for callers that seed coverage directly; non-empty results
+        are reusable only through ``fresh_completed_items`` where the job
+        preserves the request window.
+        """
+
+        if not tickers:
+            return set()
+        placeholders = ",".join("?" for _ in tickers)
+        query = (
+            "SELECT payload FROM income_source_coverage "
+            f"WHERE source = ? AND ticker IN ({placeholders})"
+        )  # noqa: S608 - placeholders are generated, never user-controlled
+        async with self._read_session() as session:
+            rows = await session.fetchall(query, [source, *(ticker.upper() for ticker in tickers)])
+        coverage = [IncomeSourceCoverage.model_validate_json(row["payload"]) for row in rows]
+        return {
+            item.ticker
+            for item in coverage
+            if item.complete and item.status == "empty" and item.observed_at >= not_before
+        }
+
+    async def fresh_completed_items(
+        self,
+        source: str,
+        tickers: list[str],
+        *,
+        as_of: date,
+        not_before: datetime,
+    ) -> set[str]:
+        """Return recent complete job items for one exact source window.
+
+        Source coverage is intentionally not enough to establish the capture
+        window: a coverage row is also written by synchronous refreshes and
+        does not carry the request's ``as_of``.  Durable job items do carry
+        that provenance through their parent job.  Only the most recent
+        terminal result for each source/ticker/window is reusable; a newer
+        failed terminal result therefore cannot be hidden by an older
+        complete result.
+        """
+
+        if not tickers:
+            return set()
+        placeholders = ",".join("?" for _ in tickers)
+        query = f"""
+            SELECT item.ticker
+            FROM income_refresh_job_items item
+            JOIN income_refresh_jobs job ON job.job_id = item.job_id
+            WHERE item.source = ?
+              AND item.ticker IN ({placeholders})
+              AND item.status = ?
+              AND job.as_of = ?
+              AND item.updated_at >= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM income_refresh_job_items newer
+                  JOIN income_refresh_jobs newer_job ON newer_job.job_id = newer.job_id
+                  WHERE newer.source = item.source
+                    AND newer.ticker = item.ticker
+                    AND newer.status IN (?, ?)
+                    AND newer_job.as_of = job.as_of
+                    AND (
+                        newer.updated_at > item.updated_at
+                        OR (
+                            newer.updated_at = item.updated_at
+                            AND newer.job_id > item.job_id
+                        )
+                    )
+              )
+        """  # noqa: S608 - placeholders are generated, never user-controlled
+        async with self._read_session() as session:
+            rows = await session.fetchall(
+                query,
+                [
+                    source,
+                    *(ticker.upper() for ticker in tickers),
+                    ITEM_COMPLETE,
+                    as_of.isoformat(),
+                    not_before.isoformat(),
+                    ITEM_COMPLETE,
+                    ITEM_FAILED,
+                ],
+            )
+        return {str(row["ticker"]).upper() for row in rows}
 
     async def publish(
         self,
@@ -940,6 +1039,38 @@ class IncomeEventStore:
             claim_token=claim_token,
         )
 
+    async def defer_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        error: str,
+        available_at: datetime,
+        now: datetime,
+        claim_token: str | None = None,
+    ) -> bool:
+        """Return a claimed item to the queue without spending an attempt.
+
+        A worker claims before it can observe that another page for the same
+        source is still draining.  This transition compensates that claim's
+        attempt increment atomically and remains fenced by the current claim
+        token, so an expired worker cannot defer a successor's work.
+        """
+
+        return await self._set_refresh_item(
+            job_id,
+            source,
+            ticker,
+            status=ITEM_QUEUED,
+            lease_until=available_at,
+            last_error=error[:200],
+            now=now,
+            claim_token=claim_token,
+            release_attempt=True,
+            require_running=True,
+        )
+
     async def fail_refresh_item(
         self,
         job_id: str,
@@ -972,9 +1103,15 @@ class IncomeEventStore:
         last_error: str | None,
         now: datetime,
         claim_token: str | None = None,
+        release_attempt: bool = False,
+        require_running: bool = False,
     ) -> bool:
         async with self._write_session() as session:
             where = "job_id = ? AND source = ? AND ticker = ?"
+            if claim_token is not None:
+                where += " AND claim_token = ? AND status = ?"
+            elif require_running:
+                where += " AND status = ?"
             params: list[object] = [
                 status,
                 lease_until.isoformat() if lease_until is not None else None,
@@ -985,13 +1122,19 @@ class IncomeEventStore:
                 ticker.upper(),
             ]
             if claim_token is not None:
-                where += " AND claim_token = ? AND status = ?"
                 params.extend([claim_token, ITEM_RUNNING])
+            elif require_running:
+                params.append(ITEM_RUNNING)
+            attempts_clause = (
+                ", attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END"
+                if release_attempt
+                else ""
+            )
             cursor = await session.execute(
                 f"""
                 UPDATE income_refresh_job_items
                 SET status = ?, lease_until = ?, claim_token = NULL,
-                    last_error = ?, updated_at = ?
+                    last_error = ?, updated_at = ?{attempts_clause}
                 WHERE {where}
                 """,
                 params,

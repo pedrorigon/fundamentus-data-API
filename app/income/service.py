@@ -43,6 +43,7 @@ class IncomeEventService:
         job_max_attempts: int = 3,
         worker_poll_seconds: float = 0.5,
         job_page_timeout_seconds: float | None = None,
+        source_busy_backoff_seconds: float = 5.0,
     ) -> None:
         self.store = store
         self.sources = sources
@@ -58,8 +59,9 @@ class IncomeEventService:
         self.job_page_timeout_seconds = (
             max(job_page_timeout_seconds, 0.1) if job_page_timeout_seconds is not None else None
         )
+        self.source_busy_backoff_seconds = max(source_busy_backoff_seconds, 0.01)
         self._inflight: dict[
-            tuple[tuple[tuple[str, str | None], ...], date],
+            tuple[tuple[tuple[str, str | None], ...], date, bool],
             asyncio.Task[IncomeEventRefreshResponse],
         ] = {}
         self._lock = asyncio.Lock()
@@ -89,13 +91,20 @@ class IncomeEventService:
                 key=lambda item: (item[0], item[1] or ""),
             )
         )
-        key = (identity, as_of)
+        require_job_provenance = request.as_of is not None
+        key = (identity, as_of, require_job_provenance)
         async with self._lock:
             if self._closed:
                 raise RuntimeError("IncomeEventService is closed")
             task = self._inflight.get(key)
             if task is None:
-                task = asyncio.create_task(self._refresh(instruments, as_of))
+                task = asyncio.create_task(
+                    self._refresh(
+                        instruments,
+                        as_of,
+                        require_job_provenance=require_job_provenance,
+                    )
+                )
                 self._inflight[key] = task
                 task.add_done_callback(lambda completed: self._cleanup_inflight(key, completed))
         return await asyncio.shield(task)
@@ -132,7 +141,7 @@ class IncomeEventService:
 
     def _cleanup_inflight(
         self,
-        key: tuple[tuple[tuple[str, str | None], ...], date],
+        key: tuple[tuple[tuple[str, str | None], ...], date, bool],
         task: asyncio.Future[IncomeEventRefreshResponse],
     ) -> None:
         """Drop only the completed task that still owns its request key."""
@@ -145,10 +154,17 @@ class IncomeEventService:
         self,
         instruments: list[IncomeInstrumentRequest],
         as_of: date,
+        *,
+        require_job_provenance: bool = False,
     ) -> IncomeEventRefreshResponse:
         results = await asyncio.gather(
             *(
-                self._collect_and_persist_source(source, instruments, as_of)
+                self._collect_and_persist_source(
+                    source,
+                    instruments,
+                    as_of,
+                    require_job_provenance=require_job_provenance,
+                )
                 for source in self.sources
             ),
             return_exceptions=True,
@@ -194,10 +210,17 @@ class IncomeEventService:
         source: IncomeSource,
         instruments: list[IncomeInstrumentRequest],
         as_of: date,
+        *,
+        require_job_provenance: bool = False,
     ) -> tuple[int, bool, int]:
         """Collect and persist one source without waiting on other sources."""
 
-        result = await self._collect_source(source, instruments, as_of)
+        result = await self._collect_source(
+            source,
+            instruments,
+            as_of,
+            require_job_provenance=require_job_provenance,
+        )
         complete = await self._persist_source_result(source, result, as_of)
         complete_tickers = sorted(
             {item.ticker.upper() for item in result.coverage if item.complete}
@@ -231,8 +254,15 @@ class IncomeEventService:
         source: IncomeSource,
         instruments: list[IncomeInstrumentRequest],
         as_of: date,
+        *,
+        require_job_provenance: bool = False,
     ) -> IncomeSourceResult:
-        stale = await self._stale_instruments(source, instruments)
+        stale = await self._stale_instruments(
+            source,
+            instruments,
+            as_of=as_of if require_job_provenance else None,
+            require_job_provenance=require_job_provenance,
+        )
         if not stale:
             return IncomeSourceResult([], [])
         return await source.collect(stale, as_of)
@@ -241,14 +271,43 @@ class IncomeEventService:
         self,
         source: IncomeSource,
         instruments: list[IncomeInstrumentRequest],
+        *,
+        as_of: date | None = None,
+        require_job_provenance: bool = False,
+        allow_unprovenanced_empty: bool = False,
     ) -> list[IncomeInstrumentRequest]:
         if self.refresh_ttl_seconds <= 0:
             return list(instruments)
-        fresh = await self.store.fresh_coverage(
-            source.name,
-            [item.ticker for item in instruments],
-            not_before=datetime.now(UTC) - timedelta(seconds=self.refresh_ttl_seconds),
-        )
+        not_before = datetime.now(UTC) - timedelta(seconds=self.refresh_ttl_seconds)
+        tickers = [item.ticker for item in instruments]
+        if require_job_provenance and as_of is not None:
+            # Async jobs must reuse only a result captured for this exact
+            # request window.  Coverage rows alone have no as_of provenance.
+            fresh = await self.store.fresh_completed_items(
+                source.name,
+                tickers,
+                as_of=as_of,
+                not_before=not_before,
+            )
+            if allow_unprovenanced_empty:
+                # Preserve the legacy direct-cache behavior for an explicit
+                # empty snapshot only when the caller did not supply a window.
+                # A request with an explicit as_of must have job provenance.
+                fresh.update(
+                    await self.store.fresh_empty_coverage(
+                        source.name,
+                        tickers,
+                        not_before=not_before,
+                    )
+                )
+        else:
+            # Keep synchronous refresh compatibility: its coverage cache is
+            # the only persisted freshness signal available to that path.
+            fresh = await self.store.fresh_coverage(
+                source.name,
+                tickers,
+                not_before=not_before,
+            )
         return [item for item in instruments if item.ticker not in fresh]
 
     async def refresh_async(
@@ -260,6 +319,7 @@ class IncomeEventService:
             self.sources,
             _unique_instruments(request.instruments),
             request.as_of or date.today(),
+            allow_unprovenanced_empty=request.as_of is None,
         )
 
     async def backfill(
@@ -277,6 +337,7 @@ class IncomeEventService:
             self.official_sources,
             _unique_instruments(request.instruments),
             request.as_of or date.today(),
+            allow_unprovenanced_empty=request.as_of is None,
         )
 
     async def _submit_job(
@@ -284,11 +345,20 @@ class IncomeEventService:
         sources: list[IncomeSource],
         instruments: list[IncomeInstrumentRequest],
         as_of: date,
+        *,
+        allow_unprovenanced_empty: bool = False,
     ) -> IncomeEventAsyncRefreshResponse:
         items: list[tuple[str, IncomeInstrumentRequest]] = []
         for source in sources:
             items.extend(
-                (source.name, item) for item in await self._stale_instruments(source, instruments)
+                (source.name, item)
+                for item in await self._stale_instruments(
+                    source,
+                    instruments,
+                    as_of=as_of,
+                    require_job_provenance=True,
+                    allow_unprovenanced_empty=allow_unprovenanced_empty,
+                )
             )
         job_id = token_hex(12)
         now = datetime.now(UTC)
@@ -409,7 +479,7 @@ class IncomeEventService:
             )
             return
         if source_name in self._busy_sources:
-            await self._retry_items(
+            await self._defer_items(
                 rows,
                 error="source page still draining",
                 claim_tokens={
@@ -565,6 +635,28 @@ class IncomeEventService:
                 *key,
                 error=error,
                 available_at=now + timedelta(seconds=min(60, 2**attempts)),
+                now=now,
+                claim_token=claim_token,
+            )
+
+    async def _defer_items(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        error: str,
+        claim_tokens: dict[tuple[str, str, str], str | None] | None = None,
+    ) -> None:
+        """Defer source-busy rows without consuming their retry budget."""
+
+        now = datetime.now(UTC)
+        available_at = now + timedelta(seconds=self.source_busy_backoff_seconds)
+        for row in rows:
+            key = (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
+            claim_token = claim_tokens.get(key) if claim_tokens is not None else None
+            await self.store.defer_refresh_item(
+                *key,
+                error=error,
+                available_at=available_at,
                 now=now,
                 claim_token=claim_token,
             )
