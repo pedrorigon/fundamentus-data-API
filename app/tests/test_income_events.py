@@ -1101,6 +1101,26 @@ async def test_service_reuses_fresh_complete_source_coverage(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_sync_refresh_with_explicit_as_of_does_not_reuse_another_window(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 18),
+    )
+
+    await service.refresh(request)
+    await service.refresh(request.model_copy(update={"as_of": date(2026, 9, 19)}))
+
+    assert source.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_service_singleflight_is_scoped_to_as_of_period(tmp_path: Path) -> None:
     store = IncomeEventStore(tmp_path / "income.sqlite3")
     await store.startup()
@@ -2478,6 +2498,120 @@ async def test_async_refresh_reuses_fresh_coverage_before_queueing(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_async_refresh_reuses_only_the_same_as_of_job_result(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 18),
+        mode="async",
+    )
+
+    first = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+    same_window = await service.refresh_async(request)
+    other_window = await service.refresh_async(
+        request.model_copy(update={"as_of": date(2026, 9, 19)})
+    )
+
+    assert same_window.queued == 0
+    assert other_window.queued == 1
+    assert await service.process_pending_once() == 1
+    assert source.calls == 2
+    assert (await service.refresh_job(first.job_id) or {})["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_job_retries_only_the_source_without_a_complete_result(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    complete = _Source()
+    complete.name = "complete"
+    failed = _Source(fail=True)
+    failed.name = "failed"
+    service = IncomeEventService(
+        store,
+        [complete, failed],
+        refresh_ttl_seconds=1800,
+        job_max_attempts=1,
+    )
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 18),
+        mode="async",
+    )
+
+    first = await service.refresh_async(request)
+    assert await service.process_pending_once() == 2
+    assert (await service.refresh_job(first.job_id) or {})["status"] == "partial"
+    second = await service.refresh_async(request)
+    assert second.queued == 1
+    assert await service.process_pending_once() == 1
+    assert complete.calls == 1
+    assert failed.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_result_invalidates_older_complete_reuse(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    as_of = date(2026, 9, 18)
+    first_time = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    await store.create_refresh_job(
+        "complete-job",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=as_of,
+        now=first_time,
+    )
+    first_claim = await store.claim_refresh_items(limit=1, lease_seconds=30, now=first_time)
+    assert first_claim
+    assert await store.complete_refresh_item(
+        "complete-job",
+        "fake",
+        "BBAS3",
+        claim_token=str(first_claim[0]["claim_token"]),
+        now=first_time,
+    )
+
+    failed_time = first_time + timedelta(seconds=1)
+    await store.create_refresh_job(
+        "failed-job",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=as_of,
+        now=failed_time,
+    )
+    failed_claim = await store.claim_refresh_items(limit=1, lease_seconds=30, now=failed_time)
+    assert failed_claim
+    assert await store.fail_refresh_item(
+        "failed-job",
+        "fake",
+        "BBAS3",
+        claim_token=str(failed_claim[0]["claim_token"]),
+        error="source coverage incomplete",
+        now=failed_time,
+    )
+
+    assert (
+        await store.fresh_completed_items(
+            "fake",
+            ["BBAS3"],
+            as_of=as_of,
+            not_before=first_time - timedelta(seconds=1),
+        )
+        == set()
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_async_refresh_requeues_a_failed_item_with_backoff(tmp_path: Path) -> None:
     store = IncomeEventStore(tmp_path / "income.sqlite3")
     await store.startup()
@@ -2832,6 +2966,29 @@ async def test_fresh_empty_job_keeps_requested_ticker_identity(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_explicit_as_of_does_not_reuse_unprovenanced_empty_coverage(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _IdentitySource()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    await store.save_coverage(
+        [IncomeSourceCoverage(source=source.name, ticker="BBAS3", status="empty", complete=True)]
+    )
+
+    accepted = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+            as_of=date(2026, 9, 18),
+            mode="async",
+        )
+    )
+    assert accepted.queued == 1
+    assert await service.process_pending_once() == 1
+    assert source.requested
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_expired_claim_is_fenced_and_heartbeat_renews_active_claim(tmp_path: Path) -> None:
     store = IncomeEventStore(tmp_path / "income.sqlite3")
     await store.startup()
@@ -2880,6 +3037,77 @@ async def test_expired_claim_is_fenced_and_heartbeat_renews_active_claim(tmp_pat
         "BBAS3",
         claim_token=str(second[0]["claim_token"]),
         now=claim_time + timedelta(seconds=4),
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_deferral_compensates_attempt_and_requires_current_claim_token(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    await store.create_refresh_job(
+        "job-busy",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+    claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert claimed and claimed[0]["claim_token"]
+    token = str(claimed[0]["claim_token"])
+
+    assert not await store.defer_refresh_item(
+        "job-busy",
+        "fake",
+        "BBAS3",
+        error="source page still draining",
+        available_at=now + timedelta(seconds=5),
+        now=now,
+        claim_token="stale-token",
+    )
+    running = await store.refresh_job("job-busy")
+    assert running is not None and _job_item(running)["status"] == "running"
+    assert _job_item(running)["attempts"] == 1
+
+    assert await store.defer_refresh_item(
+        "job-busy",
+        "fake",
+        "BBAS3",
+        error="source page still draining",
+        available_at=now + timedelta(seconds=5),
+        now=now,
+        claim_token=token,
+    )
+    queued = await store.refresh_job("job-busy")
+    assert queued is not None
+    item = _job_item(queued)
+    assert item["status"] == "queued"
+    assert item["attempts"] == 0
+    assert item["last_error"] == "source page still draining"
+    assert await store.claim_refresh_items(limit=1, lease_seconds=30, now=now) == []
+
+    # Compatibility callers may not have a fencing token in their lightweight
+    # claim rows; the running-state predicate still prevents deferring a
+    # terminal successor and compensates the claim attempt.
+    await store.create_refresh_job(
+        "job-busy-legacy",
+        [("legacy", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+    legacy_claim = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert legacy_claim and legacy_claim[0]["claim_token"]
+    assert await store.defer_refresh_item(
+        "job-busy-legacy",
+        "legacy",
+        "BBAS3",
+        error="legacy source page still draining",
+        available_at=now + timedelta(seconds=5),
+        now=now,
     )
     await store.close()
 
@@ -2936,6 +3164,64 @@ async def test_page_timeout_bounds_retry_calls_and_close_drains_source(
 
 
 @pytest.mark.asyncio
+async def test_busy_source_resumes_after_drain_without_burning_attempts(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _SlowSource()
+    service = IncomeEventService(
+        store,
+        [source],
+        job_page_timeout_seconds=0.01,
+        job_max_attempts=2,
+        source_busy_backoff_seconds=0.01,
+    )
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    await source.started.wait()
+    assert len(service._detached_source_tasks) == 1
+    # Make the first timeout retry immediately eligible so this assertion
+    # exercises the busy deferral itself.
+    now = datetime.now(UTC)
+    await store.requeue_refresh_item(
+        job.job_id,
+        source.name,
+        "BBAS3",
+        error="page timeout",
+        available_at=now,
+        now=now,
+    )
+    assert await service.process_pending_once() == 1
+    deferred = await service.refresh_job(job.job_id)
+    assert deferred is not None
+    assert _job_item(deferred)["status"] == "queued"
+    # The initial timeout consumed the first attempt; the busy observation
+    # must leave that budget unchanged.
+    assert _job_item(deferred)["attempts"] == 1
+
+    source.release.set()
+    for _ in range(100):
+        if not service._busy_sources:
+            break
+        await asyncio.sleep(0.01)
+    assert not service._busy_sources
+    await asyncio.sleep(0.02)
+    assert await service.process_pending_once() == 1
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    assert _job_item(finished)["attempts"] == 2
+    # One call is the timed-out producer that drained in the background; the
+    # queued item then resumes with one fresh call after the source is idle.
+    assert source.calls == 2
+    await service.close()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_job_store_upgrades_identity_columns_additively(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(path) as connection:
@@ -2982,6 +3268,71 @@ async def test_legacy_job_store_upgrades_identity_columns_additively(tmp_path: P
     assert job_item["name"] == "Banco"
     assert job["tickers"] == ["BBAS3"]
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_reuse_index_is_restored_on_reopen_without_changing_results(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "income.sqlite3"
+    store = IncomeEventStore(path)
+    await store.startup()
+    as_of = date(2026, 9, 18)
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    await store.create_refresh_job(
+        "indexed-job",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=as_of,
+        now=now,
+    )
+    claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert claimed
+    assert await store.complete_refresh_item(
+        "indexed-job",
+        "fake",
+        "BBAS3",
+        claim_token=str(claimed[0]["claim_token"]),
+        now=now,
+    )
+    before = await store.fresh_completed_items(
+        "fake",
+        ["BBAS3"],
+        as_of=as_of,
+        not_before=now - timedelta(seconds=1),
+    )
+    await store.close()
+
+    # Simulate a pre-index database; startup must add the index through the
+    # existing idempotent schema setup without changing the lookup result.
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("DROP INDEX ix_income_refresh_item_source_ticker_status_updated")
+
+    reopened = IncomeEventStore(path)
+    await reopened.startup()
+    after = await reopened.fresh_completed_items(
+        "fake",
+        ["BBAS3"],
+        as_of=as_of,
+        not_before=now - timedelta(seconds=1),
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        index_names = {
+            str(row[1]) for row in connection.execute("PRAGMA index_list(income_refresh_job_items)")
+        }
+    assert before == after == {"BBAS3"}
+    assert "ix_income_refresh_item_source_ticker_status_updated" in index_names
+    assert (
+        await reopened.fresh_empty_coverage("fake", [], not_before=now - timedelta(seconds=1))
+        == set()
+    )
+    assert (
+        await reopened.fresh_completed_items(
+            "fake", [], as_of=as_of, not_before=now - timedelta(seconds=1)
+        )
+        == set()
+    )
+    await reopened.close()
 
 
 @pytest.mark.asyncio
