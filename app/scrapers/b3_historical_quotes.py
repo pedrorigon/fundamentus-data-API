@@ -29,12 +29,31 @@ class B3HistoricalQuoteProvider:
         settings: Settings,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        # Import lazily to keep the scraper package independent from the
+        # services package's eager exports during module initialization.
+        from app.services.singleflight import SingleFlight
+
         self.settings = settings
         self.transport = transport
+        self._download_flight = SingleFlight()
 
     async def prices(self, year: int, tickers: set[str]) -> dict[str, dict[date, Decimal]]:
         if not tickers:
             return {}
+        payload = await self._download(year)
+        if payload is None:
+            return {}
+        return await asyncio.to_thread(parse_b3_historical_quotes, payload, tickers)
+
+    async def _download(self, year: int) -> bytes | None:
+        """Share one in-flight annual archive download among all ticker sets."""
+        return await self._download_flight.run(
+            f"b3-cotahist:{year}",
+            lambda: self._request(year),
+        )
+
+    async def _request(self, year: int) -> bytes | None:
+        """Download one annual archive while preserving provider error semantics."""
         filename = f"COTAHIST_A{year}.ZIP"
         async with httpx.AsyncClient(
             base_url=self.settings.b3_historical_quote_base_url,
@@ -44,15 +63,15 @@ class B3HistoricalQuoteProvider:
         ) as client:
             async with client.stream("GET", f"/{filename}") as response:
                 if response.status_code == 404:
-                    return {}
+                    return None
                 response.raise_for_status()
                 try:
                     payload = await read_bounded_body(
                         response, self.settings.archive_download_max_bytes
                     )
                 except ArchiveSafetyError:
-                    return {}
-        return await asyncio.to_thread(parse_b3_historical_quotes, payload, tickers)
+                    return None
+        return payload
 
 
 def parse_b3_historical_quotes(payload: bytes, tickers: set[str]) -> dict[str, dict[date, Decimal]]:
