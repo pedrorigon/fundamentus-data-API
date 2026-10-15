@@ -207,9 +207,7 @@ async def test_404_and_http_errors_are_not_retained_between_requests() -> None:
 
     with pytest.raises(httpx.HTTPStatusError):
         await provider.prices(2020, {"AZUL4"})
-    assert await provider.prices(2020, {"AZUL4"}) == _expected(
-        "AZUL4", date(2020, 5, 29), "12.34"
-    )
+    assert await provider.prices(2020, {"AZUL4"}) == _expected("AZUL4", date(2020, 5, 29), "12.34")
     assert calls == 2
 
 
