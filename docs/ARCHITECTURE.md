@@ -22,7 +22,7 @@ The service is split into explicit layers:
 6. Parsers run off the event loop with `asyncio.to_thread`.
 7. Parsed models are cached and returned through FastAPI.
 
-Canonical income events use a separate write/read flow. A protected background refresh collects bounded batches from official B3/CVM publications, Fundos.NET and complementary HTML sources. Observations keep their source lineage and version. The resolver chooses fields by authority and independent corroboration, then publishes semantic revisions to SQLite. Public batch and delta routes only read the local canonical table.
+Canonical income events use a separate write/read flow. A protected background refresh collects bounded batches from official B3/CVM publications, Fundos.NET and complementary HTML sources. Observations keep their source lineage and version. The resolver chooses fields by authority and independent corroboration, then publishes semantic revisions to the canonical store (SQLite by default, or PostgreSQL when a database URL is configured). A maintenance backfill queues the official B3/CVM collection for a large instrument list as one durable job, sharing the CVM open-data index and parsed documents across pages. Public batch and delta routes only read the local canonical table.
 
 ## Performance Choices
 

@@ -16,7 +16,12 @@ import httpx
 
 from app.cache import CacheStore
 from app.config import Settings
-from app.core.errors import InvalidTickerError
+from app.core.errors import (
+    APIError,
+    InvalidTickerError,
+    ProviderInvalidResponseError,
+    ProviderUnavailableError,
+)
 from app.models.assets import InstrumentMetadata, InstrumentType
 from app.models.fundamentals import (
     FieldProvenance,
@@ -116,7 +121,36 @@ class FundamentalsService:
             )
 
         today = reference or datetime.now(UTC).date()
-        resolved = await self._resolved_company(normalized, corporate_name, today)
+        try:
+            resolved = await self._resolved_company(normalized, corporate_name, today)
+        except (ProviderUnavailableError, ProviderInvalidResponseError) as exc:
+            # A CVM outage or malformed archive is not evidence that the issuer
+            # has no fundamentals.  Give the independent public source a chance
+            # to resolve the listing; if it cannot, preserve the typed provider
+            # failure so the assessment scheduler can retry the period.
+            fallback_reason = (
+                "CVM statement archives returned an invalid response"
+                if isinstance(exc, ProviderInvalidResponseError)
+                else "CVM statement archives are unavailable"
+            )
+            try:
+                fallback = await self._fallback(
+                    normalized,
+                    fallback_reason,
+                    international_ticker=resolved_underlying,
+                    international_name=underlying_name
+                    or (
+                        instrument.underlying_name
+                        if instrument is not None
+                        and instrument.instrument_type is InstrumentType.bdr
+                        else None
+                    ),
+                )
+            except APIError as fallback_error:
+                raise exc from fallback_error
+            if fallback.periods and fallback.unavailable_reason is None:
+                return fallback
+            raise
         if resolved is None:
             return await self._fallback(
                 normalized,
@@ -311,13 +345,29 @@ class FundamentalsService:
 
     async def _archives(self, reference: date) -> list[dict[str, list[StatementPeriod]]]:
         years = range(reference.year, reference.year - self.settings.fundamentals_history_years, -1)
-        annual = await asyncio.gather(*(self._archive(StatementKind.ANNUAL, y) for y in years))
+        annual = await asyncio.gather(
+            *(self._archive(StatementKind.ANNUAL, y) for y in years),
+            return_exceptions=True,
+        )
         quarterly = await asyncio.gather(
             self._archive(StatementKind.QUARTERLY, reference.year),
             self._archive(StatementKind.QUARTERLY, reference.year - 1),
+            return_exceptions=True,
         )
-        archives = [archive for archive in annual if archive]
-        archives.extend(archive for archive in quarterly if archive)
+        archives: list[dict[str, list[StatementPeriod]]] = []
+        provider_error: ProviderUnavailableError | ProviderInvalidResponseError | None = None
+        for result in (*annual, *quarterly):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, (ProviderUnavailableError, ProviderInvalidResponseError)):
+                provider_error = provider_error or result
+                continue
+            if isinstance(result, Exception):
+                raise result
+            if isinstance(result, dict) and result:
+                archives.append(result)
+        if not archives and provider_error is not None:
+            raise provider_error
         return archives
 
     async def _archive(
@@ -376,8 +426,9 @@ class FundamentalsService:
         and the filings it points at are therefore cached under the ticker, and
         a later refresh answers from that slice alone.
 
-        Returns ``None`` when no archive could be read at all, so the caller can
-        tell an unavailable source from a company that simply did not match.
+        A provider outage is raised before this method returns.  When all
+        requested archives are confirmed absent, ``(None, [])`` is returned so
+        the caller can treat it as legitimate no-data rather than an outage.
         """
         key = f"{_CACHE_PREFIX}:resolved:{ticker}:{reference.year}"
         cached, hit = await self.cache.get(key)
@@ -396,7 +447,10 @@ class FundamentalsService:
 
         archives = await self._archives(reference)
         if not archives:
-            return None
+            # Every requested archive answered with a confirmed 404/empty
+            # result.  This is a legitimate no-data outcome; provider outages
+            # are raised by ``_archives`` before reaching this branch.
+            return None, []
         candidates = {
             cnpj: periods[0].company_name
             for archive in archives
@@ -492,10 +546,14 @@ class FundamentalsService:
         """
         source_ticker = international_ticker or ticker
         attempts: list[str] = []
+        provider_error: ProviderUnavailableError | ProviderInvalidResponseError | None = None
         if self.sec is not None:
             attempts.append("sec_edgar_companyfacts")
             try:
                 statements = await self.sec.statements(source_ticker)
+            except (ProviderUnavailableError, ProviderInvalidResponseError) as exc:
+                provider_error = exc
+                statements = None
             except (httpx.HTTPError, ValueError, TypeError, KeyError):
                 statements = None
             if statements is not None and statements.is_available:
@@ -504,9 +562,14 @@ class FundamentalsService:
             attempts.append("stockanalysis")
         try:
             statements = await self.international.statements(source_ticker)
+        except (ProviderUnavailableError, ProviderInvalidResponseError) as exc:
+            provider_error = provider_error or exc
+            statements = None
         except httpx.HTTPError:
             return _empty(ticker, _fallback_reason(reason, attempts))
         if statements is None or not statements.is_available:
+            if provider_error is not None:
+                raise provider_error
             return _empty(ticker, _fallback_reason(reason, attempts))
         statements = InternationalStatements(
             ticker=statements.ticker,

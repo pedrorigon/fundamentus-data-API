@@ -270,7 +270,22 @@ def test_historical_quote_dependency_reads_application_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lifespan_registers_historical_quote_service() -> None:
+async def test_lifespan_registers_historical_quote_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoopInstrumentDataService:
+        def __init__(self, _settings: object) -> None:
+            pass
+
+        async def warm_directory(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    # Keep this lifecycle test hermetic; directory providers have dedicated
+    # tests with deterministic transports and must not contact live services.
+    monkeypatch.setattr("app.main.InstrumentDataService", NoopInstrumentDataService)
     app = create_app()
 
     async with lifespan(app):

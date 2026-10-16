@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from zipfile import BadZipFile
 
 import httpx
 
 from app.config import Settings
-from app.core.archive_safety import ArchiveSafetyError, read_bounded_body
+from app.core.archive_safety import ArchiveSafetyError, open_validated_zip, read_bounded_body
+from app.core.errors import ProviderInvalidResponseError, ProviderUnavailableError
 from app.parsers.cvm_statements import (
     CompanyRegistration,
     ShareCapital,
@@ -58,6 +60,7 @@ class CvmOpenDataProvider:
         )
         if payload is None:
             return None
+        _validate_statement_archive(payload)
         return StatementArchive(
             kind=kind,
             year=year,
@@ -88,5 +91,44 @@ class CvmOpenDataProvider:
                     return await read_bounded_body(
                         response, self.settings.archive_download_max_bytes
                     )
-        except (ArchiveSafetyError, httpx.HTTPError):
-            return None
+        except ArchiveSafetyError as exc:
+            raise ProviderInvalidResponseError(
+                "CVM open-data response exceeded the safety limits.",
+                details={"provider": "cvm_open_data"},
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise ProviderUnavailableError(
+                "CVM open-data service is unavailable.",
+                details={
+                    "provider": "cvm_open_data",
+                    "status_code": exc.response.status_code,
+                },
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                "CVM open-data service is unavailable.",
+                details={"provider": "cvm_open_data"},
+            ) from exc
+
+
+def _validate_statement_archive(payload: bytes) -> None:
+    """Reject malformed or structurally unusable CVM statement archives.
+
+    The statement parsers intentionally return an empty mapping when a caller
+    asks for a company that is absent.  That is a legitimate no-data result,
+    so archive validation belongs at the provider boundary where a malformed
+    ZIP can still be distinguished from a valid archive with no matching
+    issuer.
+    """
+    try:
+        with open_validated_zip(payload) as archive:
+            if not any(
+                not member.is_dir() and member.filename.lower().endswith(".csv")
+                for member in archive.infolist()
+            ):
+                raise ArchiveSafetyError("archive has no CSV members")
+    except (ArchiveSafetyError, BadZipFile, OSError) as exc:
+        raise ProviderInvalidResponseError(
+            "CVM open-data statement archive is invalid.",
+            details={"provider": "cvm_open_data"},
+        ) from exc

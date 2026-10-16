@@ -75,6 +75,7 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}/details` | Details page fields and preserved sections. |
 | `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
 | `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
+| `POST /v1/assessments/snapshot` | Idempotent, period-bound assessment snapshot shared across callers. |
 | `GET /v1/assets/{ticker}/fundamentals` | Multi-year financial statements resolved from CVM open data. |
 | `POST /v1/quality/facts:resolve` | Batched, normalized quality evidence for stocks, listed funds and ETFs. |
 | `POST /v2/income-events/refresh` | Protected background refresh from public income sources. |
@@ -187,6 +188,13 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `SEC_COMPANYFACTS_TTL_SECONDS` | `86400` | Local TTL for CompanyFacts payloads. |
 | `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
 | `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
+| `DATABASE_URL` | empty | Optional PostgreSQL URL for durable assessment snapshots. `FUNDAMENTUS_API_DATABASE_URL` and `DATABASE_URL` are accepted. |
+| `INCOME_STORE_URL` | empty | Optional PostgreSQL URL for the shared income event store. Falls back to `DATABASE_URL`; `FUNDAMENTUS_API_INCOME_STORE_URL` and `INCOME_STORE_URL` are accepted. |
+| `ASSESSMENT_SQLITE_PATH` | derived from `SQLITE_CACHE_PATH` | Separate SQLite path for assessment snapshots when PostgreSQL is not configured. In Docker Compose the default is `/data/fundamentus_cache_assessments.sqlite3`. |
+| `ASSESSMENT_LEASE_SECONDS` | `3600` | Maximum ownership lease for one assessment attempt (1 to 3600 seconds). |
+| `ASSESSMENT_MAX_ATTEMPTS` | `3` | Bounded attempts for an assessment period (1 to 10). |
+| `ASSESSMENT_PERIOD_HISTORY_DAYS` | `370` | Retention window for accepted scheduler periods (1 to 3650 days). |
+| `ASSESSMENT_RETRY_BACKOFF_SECONDS` | `15` | Initial retry delay after a failed assessment attempt (0 to 3600 seconds). |
 | `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
 | `UPSTREAM_CONCURRENCY` | `4` | Maximum concurrent Fundamentus requests. |
 | `UPSTREAM_MIN_INTERVAL_SECONDS` | `0.15` | Minimum interval between upstream requests. |
@@ -200,7 +208,7 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
 
-Canonical income resolution is independent from the legacy dividend route. A maintenance worker refreshes bounded instrument batches through `/v2/income-events/refresh`; production calls require `X-Cache-Token`. Official B3/CVM and Fundos.NET observations outrank complementary HTML sources. Fund tickers are resolved to a CNPJ and queried through fund-specific Fundos.NET pages; the bounded global index is only a non-destructive fallback. Complete snapshots replace the mutable overlap while older paid history remains available for reconciliation. Conflicting official observations are retained with a non-projectable `conflicted` status instead of being guessed. `/v2/income-events/batch` and `/v2/income-events/changes` read only SQLite, so user requests never depend on upstream latency.
+Canonical income resolution is independent from the legacy dividend route. A maintenance worker refreshes bounded instrument batches through `/v2/income-events/refresh`; production calls require `X-Cache-Token`. Official B3/CVM and Fundos.NET observations outrank complementary HTML sources. Fund tickers are resolved to a CNPJ and queried through fund-specific Fundos.NET pages; the bounded global index is only a non-destructive fallback. Complete snapshots replace the mutable overlap while older paid history remains available for reconciliation. `POST /v2/income-events/backfill` queues the official B3/CVM collection for up to 500 tickers as one durable job, sharing the CVM open-data index and parsed documents across its pages and never scraping the complementary HTML sources. Conflicting official observations are retained with a non-projectable `conflicted` status instead of being guessed. `/v2/income-events/batch` and `/v2/income-events/changes` read only the local canonical store (SQLite by default, or the shared PostgreSQL store when `INCOME_STORE_URL` is configured), so user requests never depend on upstream latency.
 
 The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. SEC-covered issuers are resolved from the official [EDGAR CompanyFacts API](https://www.sec.gov/edgar/sec-api-documentation), then the existing public HTML statements are tried as a bounded fallback. Keep provider keys on the server and review their terms before production use.
 
