@@ -384,6 +384,46 @@ async def test_postgres_claims_items_with_row_locks(
     assert len(database.statements) == 4
 
 
+async def test_postgres_claim_excludes_sources_in_transition_select_and_cas(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store, database = await _store(
+        monkeypatch,
+        tmp_path,
+        _Result(rowcount=1),
+        _Result(
+            rows=[
+                {
+                    "job_id": "job-free",
+                    "source": "free",
+                    "ticker": "PETR4",
+                    "attempts": 1,
+                    "as_of": "2026-09-18",
+                }
+            ]
+        ),
+    )
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+
+    claimed = await store.claim_refresh_items(
+        limit=32,
+        lease_seconds=120,
+        now=now,
+        excluded_sources=frozenset({"busy"}),
+    )
+
+    assert [(item["job_id"], item["source"]) for item in claimed] == [("job-free", "free")]
+    transition_query = database.statements[0][0]
+    select_query = database.statements[1][0]
+    cas_query = database.statements[2][0]
+    assert "i.source NOT IN (%s)" not in transition_query
+    assert "i.source NOT IN (%s)" in select_query
+    assert "source NOT IN (%s)" in cas_query
+    assert database.statements[1][1][-2:] == ("busy", 32)
+    assert database.statements[2][1][0][-1] == "busy"
+
+
 async def test_postgres_job_lifecycle_counts_only_new_items(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

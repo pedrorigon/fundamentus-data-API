@@ -3135,8 +3135,8 @@ async def test_page_timeout_bounds_retry_calls_and_close_drains_source(
     await source.started.wait()
     assert len(service._detached_source_tasks) == 1
 
-    # A retry can claim the row while the timed-out provider call is still
-    # draining, but it must not start another provider call for the same source.
+    # A retry remains queued while the timed-out provider call is still
+    # draining, so it does not consume another claim or provider call.
     now = datetime.now(UTC)
     await store.requeue_refresh_item(
         job.job_id,
@@ -3146,7 +3146,7 @@ async def test_page_timeout_bounds_retry_calls_and_close_drains_source(
         available_at=now,
         now=now,
     )
-    assert await service.process_pending_once() == 1
+    assert await service.process_pending_once() == 0
     assert source.calls == 0
     assert len(service._detached_source_tasks) == 1
 
@@ -3184,8 +3184,8 @@ async def test_busy_source_resumes_after_drain_without_burning_attempts(tmp_path
     assert await service.process_pending_once() == 1
     await source.started.wait()
     assert len(service._detached_source_tasks) == 1
-    # Make the first timeout retry immediately eligible so this assertion
-    # exercises the busy deferral itself.
+    # Make the first timeout retry immediately eligible; the worker excludes
+    # the busy source in SQL and leaves this row untouched.
     now = datetime.now(UTC)
     await store.requeue_refresh_item(
         job.job_id,
@@ -3195,7 +3195,7 @@ async def test_busy_source_resumes_after_drain_without_burning_attempts(tmp_path
         available_at=now,
         now=now,
     )
-    assert await service.process_pending_once() == 1
+    assert await service.process_pending_once() == 0
     deferred = await service.refresh_job(job.job_id)
     assert deferred is not None
     assert _job_item(deferred)["status"] == "queued"
@@ -3218,6 +3218,65 @@ async def test_busy_source_resumes_after_drain_without_burning_attempts(tmp_path
     # queued item then resumes with one fresh call after the source is idle.
     assert source.calls == 2
     await service.close()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_excludes_busy_sources_without_mutating_their_rows(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    await store.create_refresh_job(
+        "busy-job",
+        [("busy", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+    await store.create_refresh_job(
+        "free-job",
+        [("free", "PETR4")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+
+    before = _job_item(await store.refresh_job("busy-job"))
+    claimed = await store.claim_refresh_items(
+        limit=10,
+        lease_seconds=30,
+        now=now,
+        excluded_sources=frozenset({"busy"}),
+    )
+    assert [(item["job_id"], item["source"]) for item in claimed] == [("free-job", "free")]
+    after = _job_item(await store.refresh_job("busy-job"))
+    assert after == before
+
+    # An expired queued lease is also left untouched while excluded; once the
+    # source is eligible again it is reclaimed and its attempt advances once.
+    assert await store.requeue_refresh_item(
+        "busy-job",
+        "busy",
+        "BBAS3",
+        error="page timeout",
+        available_at=now - timedelta(seconds=1),
+        now=now,
+    )
+    stale_before = _job_item(await store.refresh_job("busy-job"))
+    assert (
+        await store.claim_refresh_items(
+            limit=10,
+            lease_seconds=30,
+            now=now,
+            excluded_sources={"busy"},
+        )
+        == []
+    )
+    assert _job_item(await store.refresh_job("busy-job")) == stale_before
+    reclaimed = await store.claim_refresh_items(limit=10, lease_seconds=30, now=now)
+    assert [(item["job_id"], item["source"], item["attempts"]) for item in reclaimed] == [
+        ("busy-job", "busy", 1)
+    ]
     await store.close()
 
 

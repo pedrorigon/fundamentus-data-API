@@ -189,6 +189,179 @@ async def _run_lifecycle() -> None:
         await second.close()
 
 
+async def _run_excluded_source_claims() -> None:
+    store = await _store()
+    try:
+        now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+        assert (
+            await store.create_refresh_job(
+                "busy-job",
+                [("busy", "BBAS3")],
+                requested=1,
+                as_of=now.date(),
+                now=now,
+            )
+            == 1
+        )
+        assert (
+            await store.create_refresh_job(
+                "free-job",
+                [("free", "PETR4")],
+                requested=1,
+                as_of=now.date(),
+                now=now,
+            )
+            == 1
+        )
+
+        before = await store.refresh_job("busy-job")
+        claimed = await store.claim_refresh_items(
+            limit=10,
+            lease_seconds=1,
+            now=now,
+            excluded_sources=frozenset({"busy"}),
+        )
+        assert [(item["job_id"], item["source"]) for item in claimed] == [("free-job", "free")]
+        assert await store.refresh_job("busy-job") == before
+        assert await store.complete_refresh_item(
+            "free-job",
+            "free",
+            "PETR4",
+            claim_token=str(claimed[0]["claim_token"]),
+            now=now,
+        )
+
+        busy_claim = await store.claim_refresh_items(limit=10, lease_seconds=1, now=now)
+        assert [(item["job_id"], item["source"], item["attempts"]) for item in busy_claim] == [
+            ("busy-job", "busy", 1)
+        ]
+        expired = await store.refresh_job("busy-job")
+        assert expired is not None
+        assert (
+            await store.claim_refresh_items(
+                limit=10,
+                lease_seconds=1,
+                now=now + timedelta(seconds=2),
+                excluded_sources=frozenset({"busy"}),
+            )
+            == []
+        )
+        requeued = await store.refresh_job("busy-job")
+        assert requeued is not None
+        requeued_items = requeued["items"]
+        assert isinstance(requeued_items, list) and requeued_items
+        requeued_item = requeued_items[0]
+        assert isinstance(requeued_item, dict)
+        assert requeued_item["status"] == "queued"
+        assert requeued_item["attempts"] == 1
+        assert (
+            await store.claim_refresh_items(
+                limit=10,
+                lease_seconds=1,
+                now=now + timedelta(seconds=3),
+                excluded_sources=frozenset({"busy"}),
+            )
+            == []
+        )
+        assert await store.refresh_job("busy-job") == requeued
+        recovered = await store.claim_refresh_items(
+            limit=10,
+            lease_seconds=1,
+            now=now + timedelta(seconds=3),
+        )
+        assert [(item["job_id"], item["source"], item["attempts"]) for item in recovered] == [
+            ("busy-job", "busy", 2)
+        ]
+
+        assert (
+            await store.create_refresh_job(
+                "complete-owner",
+                [("busy_complete", "VALE3")],
+                requested=1,
+                as_of=now.date(),
+                now=now,
+            )
+            == 1
+        )
+        assert (
+            await store.create_refresh_job(
+                "complete-follower",
+                [("busy_complete", "VALE3")],
+                requested=1,
+                as_of=now.date(),
+                now=now,
+            )
+            == 0
+        )
+        complete_claim = await store.claim_refresh_items(limit=10, lease_seconds=30, now=now)
+        complete_token = str(complete_claim[0]["claim_token"])
+        assert await store.complete_refresh_item(
+            "complete-owner",
+            "busy_complete",
+            "VALE3",
+            claim_token=complete_token,
+            now=now,
+        )
+        assert (await store.refresh_job("complete-follower") or {})["completed"] == 1
+        assert (
+            await store.claim_refresh_items(
+                limit=10,
+                lease_seconds=30,
+                now=now,
+                excluded_sources=frozenset({"busy_complete"}),
+            )
+            == []
+        )
+
+        assert (
+            await store.create_refresh_job(
+                "failed-owner",
+                [("busy_failed", "ITUB3")],
+                requested=1,
+                as_of=now.date(),
+                now=now,
+            )
+            == 1
+        )
+        assert (
+            await store.create_refresh_job(
+                "failed-follower",
+                [("busy_failed", "ITUB3")],
+                requested=1,
+                as_of=now.date(),
+                now=now,
+            )
+            == 0
+        )
+        failed_claim = await store.claim_refresh_items(limit=10, lease_seconds=30, now=now)
+        failed_token = str(failed_claim[0]["claim_token"])
+        assert await store.fail_refresh_item(
+            "failed-owner",
+            "busy_failed",
+            "ITUB3",
+            claim_token=failed_token,
+            error="source unavailable",
+            now=now,
+        )
+        assert (await store.refresh_job("failed-follower") or {})["failed"] == 1
+        assert (
+            await store.claim_refresh_items(
+                limit=10,
+                lease_seconds=30,
+                now=now,
+                excluded_sources=frozenset({"busy_failed"}),
+            )
+            == []
+        )
+    finally:
+        await store.close()
+
+
 def test_postgres_store_lifecycle_is_shared_across_instances() -> None:
     asyncio.run(_reset())
     asyncio.run(_run_lifecycle())
+
+
+def test_postgres_claim_exclusion_preserves_busy_rows_and_follower_finalization() -> None:
+    asyncio.run(_reset())
+    asyncio.run(_run_excluded_source_claims())
