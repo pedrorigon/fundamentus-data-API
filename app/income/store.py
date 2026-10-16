@@ -16,7 +16,7 @@ source provider is awaited.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -861,11 +861,16 @@ class IncomeEventStore:
         limit: int,
         lease_seconds: int,
         now: datetime,
+        excluded_sources: Collection[str] | None = None,
     ) -> list[dict[str, object]]:
         moment = now.isoformat()
         lease = (now + timedelta(seconds=lease_seconds)).isoformat()
         order_column = "id" if self.postgres else "rowid"
         lock_clause = " FOR UPDATE OF i SKIP LOCKED" if self.postgres else ""
+        excluded = tuple(sorted(set(excluded_sources or ())))
+        source_placeholders = ",".join("?" for _source in excluded)
+        source_filter = f" AND i.source NOT IN ({source_placeholders})" if excluded else ""
+        claim_source_filter = f" AND source NOT IN ({source_placeholders})" if excluded else ""
         select = f"""
             SELECT i.job_id, i.source, i.ticker, i.isin, i.name,
                    i.claim_token, i.attempts + 1 AS attempts, j.as_of
@@ -873,9 +878,11 @@ class IncomeEventStore:
             JOIN income_refresh_jobs j ON j.job_id = i.job_id
             WHERE i.status = ?
               AND (i.lease_until IS NULL OR i.lease_until <= ?)
+              {source_filter}
             ORDER BY i.{order_column}
             LIMIT ?{lock_clause}
         """  # noqa: S608 - the ordering column is a fixed literal
+        select_params: list[object] = [ITEM_QUEUED, moment, *excluded, limit]
         async with self._write_session() as session:
             await session.execute(
                 """
@@ -952,15 +959,16 @@ class IncomeEventStore:
                     ITEM_FAILED,
                 ),
             )
-            rows = await session.fetchall(select, (ITEM_QUEUED, moment, limit))
+            rows = await session.fetchall(select, select_params)
             if rows:
                 claim_tokens = [token_hex(16) for _row in rows]
                 await session.executemany(
-                    """
+                    f"""
                     UPDATE income_refresh_job_items
                     SET status = ?, attempts = attempts + 1, lease_until = ?,
                         claim_token = ?, updated_at = ?
                     WHERE job_id = ? AND source = ? AND ticker = ?
+                    {claim_source_filter}
                     """,
                     [
                         (
@@ -971,6 +979,7 @@ class IncomeEventStore:
                             row["job_id"],
                             row["source"],
                             row["ticker"],
+                            *excluded,
                         )
                         for row, claim_token in zip(rows, claim_tokens, strict=True)
                     ],

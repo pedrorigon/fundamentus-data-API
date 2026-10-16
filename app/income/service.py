@@ -5,7 +5,16 @@ import logging
 import re
 from datetime import UTC, date, datetime, timedelta
 from secrets import token_hex
+from time import monotonic
+from types import TracebackType
+from typing import Literal, cast
 
+from app.core.metrics import (
+    initialize_income_source_busy,
+    normalize_income_source,
+    record_income_phase,
+    set_income_source_busy,
+)
 from app.income.resolver import resolve_income_events
 from app.income.sources import IncomeSource, IncomeSourceResult
 from app.income.store import (
@@ -30,6 +39,45 @@ from app.models.income_events import (
 _LOGGER = logging.getLogger(__name__)
 
 
+class _IncomePhaseTimer:
+    """Best-effort phase timing that cannot change producer control flow."""
+
+    def __init__(self, source: object, phase: str) -> None:
+        self.source = source
+        self.phase = phase
+        self._started: float | None = None
+        self._outcome: str | None = None
+
+    def __enter__(self) -> _IncomePhaseTimer:
+        self._started = monotonic()
+        return self
+
+    def finish(self, outcome: str) -> None:
+        self._outcome = outcome
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        del exc_value, traceback
+        if self._started is None:
+            return False
+        if self._outcome is not None:
+            outcome = self._outcome
+        elif exc_type is None:
+            outcome = "success"
+        elif issubclass(exc_type, asyncio.CancelledError):
+            outcome = "cancelled"
+        elif issubclass(exc_type, TimeoutError):
+            outcome = "timeout"
+        else:
+            outcome = "failed"
+        record_income_phase(self.source, self.phase, outcome, monotonic() - self._started)
+        return False
+
+
 class IncomeEventService:
     def __init__(
         self,
@@ -47,6 +95,7 @@ class IncomeEventService:
     ) -> None:
         self.store = store
         self.sources = sources
+        initialize_income_source_busy()
         # ``getattr`` keeps lightweight embedding and test doubles compatible
         # while the protocol marks the official publications.
         self.official_sources = [source for source in sources if getattr(source, "official", False)]
@@ -70,6 +119,7 @@ class IncomeEventService:
         self._worker_task: asyncio.Task[None] | None = None
         self._detached_source_tasks: set[asyncio.Task[IncomeSourceResult]] = set()
         self._detached_source_names: dict[asyncio.Task[IncomeSourceResult], str] = {}
+        self._detached_source_started: dict[asyncio.Task[IncomeSourceResult], float] = {}
         self._busy_sources: set[str] = set()
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
@@ -195,8 +245,9 @@ class IncomeEventService:
                 cursor=0,
             )
         tickers = [item.ticker for item in instruments]
-        resolved = resolve_income_events(await self.store.observations(tickers))
-        published = await self.store.publish(resolved, scope_tickers=tickers)
+        with _IncomePhaseTimer("other", "publish"):
+            resolved = resolve_income_events(await self.store.observations(tickers))
+            published = await self.store.publish(resolved, scope_tickers=tickers)
         return IncomeEventRefreshResponse(
             requested=len(instruments),
             observations=observations,
@@ -215,17 +266,19 @@ class IncomeEventService:
     ) -> tuple[int, bool, int]:
         """Collect and persist one source without waiting on other sources."""
 
-        result = await self._collect_source(
-            source,
-            instruments,
-            as_of,
-            require_job_provenance=require_job_provenance,
-        )
-        complete = await self._persist_source_result(source, result, as_of)
+        with _IncomePhaseTimer(source.name, "collect"):
+            result = await self._collect_source(
+                source,
+                instruments,
+                as_of,
+                require_job_provenance=require_job_provenance,
+            )
+        with _IncomePhaseTimer(source.name, "persist"):
+            complete = await self._persist_source_result(source, result, as_of)
         complete_tickers = sorted(
             {item.ticker.upper() for item in result.coverage if item.complete}
         )
-        published = await self._publish_tickers(complete_tickers)
+        published = await self._publish_tickers(complete_tickers, source_name=source.name)
         return len(result.observations), complete, published
 
     async def _persist_source_result(
@@ -420,11 +473,17 @@ class IncomeEventService:
         """Claim and process one page of queued items; returns how many ran."""
         if self._closed:
             return 0
+
+        with _IncomePhaseTimer("other", "worker"):
+            return await self._process_pending_once(limit=limit)
+
+    async def _process_pending_once(self, *, limit: int | None = None) -> int:
         now = datetime.now(UTC)
         items = await self.store.claim_refresh_items(
             limit=limit or self.job_batch_size,
             lease_seconds=self.job_lease_seconds,
             now=now,
+            excluded_sources=frozenset(self._busy_sources),
         )
         if not items:
             await self._finalize_ready_jobs()
@@ -467,28 +526,36 @@ class IncomeEventService:
     ) -> None:
         source = known_sources.get(source_name)
         if source is None:
-            await self._fail_items(
-                rows,
-                error="unknown source",
-                claim_tokens={
-                    (str(row["job_id"]), str(row["source"]), str(row["ticker"])): _optional_text(
-                        row.get("claim_token")
-                    )
-                    for row in rows
-                },
-            )
+            with _IncomePhaseTimer(source_name, "worker") as unknown_timer:
+                unknown_timer.finish("failed")
+                await self._fail_items(
+                    rows,
+                    error="unknown source",
+                    claim_tokens={
+                        (
+                            str(row["job_id"]),
+                            str(row["source"]),
+                            str(row["ticker"]),
+                        ): _optional_text(row.get("claim_token"))
+                        for row in rows
+                    },
+                )
             return
         if source_name in self._busy_sources:
-            await self._defer_items(
-                rows,
-                error="source page still draining",
-                claim_tokens={
-                    (str(row["job_id"]), str(row["source"]), str(row["ticker"])): _optional_text(
-                        row.get("claim_token")
-                    )
-                    for row in rows
-                },
-            )
+            with _IncomePhaseTimer(source.name, "worker") as deferred_timer:
+                deferred_timer.finish("deferred")
+                await self._defer_items(
+                    rows,
+                    error="source page still draining",
+                    claim_tokens={
+                        (
+                            str(row["job_id"]),
+                            str(row["source"]),
+                            str(row["ticker"]),
+                        ): _optional_text(row.get("claim_token"))
+                        for row in rows
+                    },
+                )
             return
         instruments = [
             IncomeInstrumentRequest(
@@ -507,15 +574,23 @@ class IncomeEventService:
         heartbeat_stop = asyncio.Event()
         heartbeat = asyncio.create_task(self._heartbeat_items(rows, claim_tokens, heartbeat_stop))
         try:
-            try:
-                result = await self._collect_page(source, instruments, date.fromisoformat(as_of))
-            except Exception as exc:  # noqa: BLE001 - source failures are retried
-                await self._retry_items(
-                    rows,
-                    error=_source_error(exc),
-                    claim_tokens=claim_tokens,
-                )
+            collect_error: str | None = None
+            collected: IncomeSourceResult | None = None
+            with _IncomePhaseTimer(source.name, "collect") as collect_timer:
+                try:
+                    collected = await self._collect_page(
+                        source, instruments, date.fromisoformat(as_of)
+                    )
+                except TimeoutError as exc:
+                    collect_timer.finish("timeout")
+                    collect_error = _source_error(exc)
+                except Exception as exc:  # noqa: BLE001 - source failures are retried
+                    collect_timer.finish("failed")
+                    collect_error = _source_error(exc)
+            if collect_error is not None:
+                await self._retry_items(rows, error=collect_error, claim_tokens=claim_tokens)
                 return
+            result = cast(IncomeSourceResult, collected)
             owned_rows: list[dict[str, object]] = []
             for row in rows:
                 key = (str(row["job_id"]), str(row["source"]), str(row["ticker"]))
@@ -525,20 +600,23 @@ class IncomeEventService:
                 ):
                     owned_rows.append(row)
             if not owned_rows:
+                with _IncomePhaseTimer(source.name, "worker") as lost_claim_timer:
+                    lost_claim_timer.finish("lost_claim")
                 return
             owned_tickers = {str(row["ticker"]).upper() for row in owned_rows}
             result = IncomeSourceResult(
                 [item for item in result.observations if item.ticker.upper() in owned_tickers],
                 [item for item in result.coverage if item.ticker.upper() in owned_tickers],
             )
-            try:
-                await self._persist_source_result(source, result, date.fromisoformat(as_of))
-            except Exception as exc:  # noqa: BLE001 - persistence failures are retried
-                await self._retry_items(
-                    owned_rows,
-                    error=_source_error(exc),
-                    claim_tokens=claim_tokens,
-                )
+            persist_error: str | None = None
+            with _IncomePhaseTimer(source.name, "persist") as persist_timer:
+                try:
+                    await self._persist_source_result(source, result, date.fromisoformat(as_of))
+                except Exception as exc:  # noqa: BLE001 - persistence failures are retried
+                    persist_timer.finish("failed")
+                    persist_error = _source_error(exc)
+            if persist_error is not None:
+                await self._retry_items(owned_rows, error=persist_error, claim_tokens=claim_tokens)
                 return
             coverage = {
                 item.ticker.upper(): item for item in result.coverage if item.source == source.name
@@ -569,7 +647,7 @@ class IncomeEventService:
                     claim_tokens=claim_tokens,
                 )
             if published_tickers:
-                await self._publish_tickers(sorted(published_tickers))
+                await self._publish_tickers(sorted(published_tickers), source_name=source.name)
         finally:
             heartbeat_stop.set()
             heartbeat.cancel()
@@ -594,7 +672,9 @@ class IncomeEventService:
         except TimeoutError:
             self._detached_source_tasks.add(task)
             self._detached_source_names[task] = source.name
+            self._detached_source_started[task] = monotonic()
             self._busy_sources.add(source.name)
+            set_income_source_busy(source.name, True)
             task.add_done_callback(self._cleanup_detached_source_task)
             raise
 
@@ -605,8 +685,18 @@ class IncomeEventService:
         if isinstance(task, asyncio.Task):
             self._detached_source_tasks.discard(task)
             source_name = self._detached_source_names.pop(task, None)
+            started = self._detached_source_started.pop(task, None)
             if source_name is not None and source_name not in self._detached_source_names.values():
                 self._busy_sources.discard(source_name)
+                remaining_labels = {
+                    normalize_income_source(name) for name in self._detached_source_names.values()
+                }
+                if normalize_income_source(source_name) not in remaining_labels:
+                    set_income_source_busy(source_name, False)
+                self._wake_event.set()
+            if source_name is not None and started is not None:
+                outcome = "cancelled" if task.cancelled() else "drained"
+                record_income_phase(source_name, "collect", outcome, monotonic() - started)
         if not task.cancelled():
             task.exception()
 
@@ -736,12 +826,13 @@ class IncomeEventService:
         for dependent in dependents:
             await self._publish_finished_job(dependent, _seen=seen)
 
-    async def _publish_tickers(self, tickers: list[str]) -> int:
+    async def _publish_tickers(self, tickers: list[str], *, source_name: str | None = None) -> int:
         if not tickers:
             return 0
-        async with self._publish_lock:
-            resolved = resolve_income_events(await self.store.observations(tickers))
-            return await self.store.publish(resolved, scope_tickers=tickers)
+        with _IncomePhaseTimer(source_name or "other", "publish"):
+            async with self._publish_lock:
+                resolved = resolve_income_events(await self.store.observations(tickers))
+                return await self.store.publish(resolved, scope_tickers=tickers)
 
     async def batch(self, request: IncomeEventBatchRequest) -> IncomeEventBatchResponse:
         return IncomeEventBatchResponse(
