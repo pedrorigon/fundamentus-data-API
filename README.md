@@ -9,11 +9,11 @@ Local HTTP API for Fundamentus asset details and dividend events. It uses direct
 
 The service is designed for local consumption by portfolio tools, data pipelines and research scripts. It binds to `127.0.0.1` by default and does not use Selenium, Playwright or a headless browser.
 
-API version is resolved from package metadata at runtime. Release artifacts use the pushed Git tag as the build version.
+API version is resolved from package metadata at runtime. Release artifacts use the immutable Git tag created from the merged release pull request as the build version.
 
 ## What It Does
 
-- Exposes a typed HTTP API for asset details and dividend events from Fundamentus.
+- Exposes typed asset data and canonical income events resolved from independent public sources.
 - Preserves raw table values while also returning normalized Brazilian dates, numbers, percentages and monetary values.
 - Supports stocks, banks, FIIs, BDRs and other asset classes by preserving all parsed detail sections.
 - Classifies B3 ETFs and exposes quotes and market data through brapi.
@@ -22,6 +22,8 @@ API version is resolved from package metadata at runtime. Release artifacts use 
 - Exposes profiles, holdings and fundamentals for international ETFs and stocks through Alpha Vantage, with SEC EDGAR CompanyFacts as the keyless official filing source when an issuer is SEC-covered.
 - Keeps BDR identity separate from its foreign issuer and routes quality facts through a verified underlying ticker; unresolved BDRs return an actionable unavailable reason instead of querying the local code abroad.
 - Filters dividends by `all`, `past`, `future` and `upcoming_ex_date`.
+- Resolves stock income from official B3/CVM publications and listed-fund income from Fundos.NET, with Fundamentus and Status Invest as lower-authority complements.
+- Keeps canonical events in SQLite and serves batched and incremental reads without waiting for an upstream website.
 - Uses local caching to reduce repeated upstream requests.
 - Provides OpenAPI docs, Prometheus-compatible metrics and consistent JSON errors.
 - Ships fixture-based tests that do not require internet access.
@@ -73,8 +75,12 @@ The compose file publishes the service only on `127.0.0.1:8000` and stores the S
 | `GET /v1/assets/{ticker}/details` | Details page fields and preserved sections. |
 | `GET /v1/assets/{ticker}/dividends` | Dividend events with optional period filtering. |
 | `GET /v1/assets/{ticker}/opportunity` | Current valuation metrics with source and reference date. |
+| `POST /v1/assessments/snapshot` | Idempotent, period-bound assessment snapshot shared across callers. |
 | `GET /v1/assets/{ticker}/fundamentals` | Multi-year financial statements resolved from CVM open data. |
 | `POST /v1/quality/facts:resolve` | Batched, normalized quality evidence for stocks, listed funds and ETFs. |
+| `POST /v2/income-events/refresh` | Protected background refresh from public income sources. |
+| `POST /v2/income-events/batch` | Low-latency local read of canonical income events. |
+| `GET /v2/income-events/changes` | Cursor-based incremental event changes. |
 | `GET /v1/instruments/{ticker}` | B3 instrument classification, including funds outside Fundamentus. |
 | `GET /v2/instruments/{ticker}` | ETF and stock data from B3, brapi and Alpha Vantage. |
 | `GET /v1/assets` | Batch query for multiple tickers. |
@@ -172,6 +178,9 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `INSTRUMENT_DATA_TTL_SECONDS` | `86400` | In-memory TTL for ETF and international instrument data. |
 | `BRAPI_TOKEN` | empty | brapi backend token required for production coverage of B3 symbols. |
 | `ALPHA_VANTAGE_API_KEY` | empty | Alpha Vantage key for international ETF profiles and stock fundamentals. |
+| `ANBIMA_FEED_CLIENT_ID` | empty | Optional ANBIMA Feed client ID for retained official debenture prices. |
+| `ANBIMA_FEED_CLIENT_SECRET` | empty | Optional ANBIMA Feed secret; required with the client ID. |
+| `SND_DEBENTURE_BASE_URL` | `https://www.debentures.com.br` | Public SND download used for credential-free retained debenture trade PUs. |
 | `SEC_EDGAR_BASE_URL` | `https://data.sec.gov` | Public SEC CompanyFacts endpoint. |
 | `SEC_COMPANY_TICKERS_URL` | `https://www.sec.gov/files/company_tickers.json` | Official SEC ticker-to-CIK directory. |
 | `SEC_USER_AGENT` | `USER_AGENT` | Optional descriptive SEC User-Agent; no secret is required. |
@@ -179,12 +188,32 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `SEC_COMPANYFACTS_TTL_SECONDS` | `86400` | Local TTL for CompanyFacts payloads. |
 | `SQLITE_CACHE_ENABLED` | `true` | Enables persistent local cache. |
 | `SQLITE_CACHE_PATH` | `.cache/fundamentus_cache.sqlite3` | SQLite cache path. |
+| `DATABASE_URL` | empty | Optional PostgreSQL URL for durable assessment snapshots. `FUNDAMENTUS_API_DATABASE_URL` and `DATABASE_URL` are accepted. |
+| `INCOME_STORE_URL` | empty | Optional PostgreSQL URL for the shared income event store. Falls back to `DATABASE_URL`; `FUNDAMENTUS_API_INCOME_STORE_URL` and `INCOME_STORE_URL` are accepted. |
+| `ASSESSMENT_SQLITE_PATH` | derived from `SQLITE_CACHE_PATH` | Separate SQLite path for assessment snapshots when PostgreSQL is not configured. In Docker Compose the default is `/data/fundamentus_cache_assessments.sqlite3`. |
+| `ASSESSMENT_LEASE_SECONDS` | `3600` | Maximum ownership lease for one assessment attempt (1 to 3600 seconds). |
+| `ASSESSMENT_MAX_ATTEMPTS` | `3` | Bounded attempts for an assessment period (1 to 10). |
+| `ASSESSMENT_PERIOD_HISTORY_DAYS` | `370` | Retention window for accepted scheduler periods (1 to 3650 days). |
+| `ASSESSMENT_RETRY_BACKOFF_SECONDS` | `15` | Initial retry delay after a failed assessment attempt (0 to 3600 seconds). |
 | `BATCH_LIMIT` | `20` | Maximum tickers accepted by `/v1/assets`. |
 | `UPSTREAM_CONCURRENCY` | `4` | Maximum concurrent Fundamentus requests. |
 | `UPSTREAM_MIN_INTERVAL_SECONDS` | `0.15` | Minimum interval between upstream requests. |
 | `CACHE_INVALIDATE_TOKEN` | empty | Optional token for cache invalidation. |
+| `INCOME_REFRESH_TTL_SECONDS` | `1800` | Per-source/ticker refresh TTL shared by every caller. |
+| `INCOME_SOURCE_INDEX_TTL_SECONDS` | `1800` | TTL for CVM and Fundos.NET indexes and parsed Fundos.NET documents. |
+| `CVM_INCOME_DOCUMENT_CACHE_MAX_BYTES` | `134217728` | Retained decoded CVM report-text budget (128 MiB), counted with `sys.getsizeof(str)`; raw PDF responses use `INCOME_DOCUMENT_MAX_BYTES`. |
+| `INCOME_SOURCE_TOTAL_TIMEOUT_SECONDS` | `150` | Absolute budget for one official B3/CVM collection; keep it below the worker page timeout so partial progress returns before the outer deadline. |
+| `INCOME_JOB_PAGE_TIMEOUT_SECONDS` | `180` | Outer worker page deadline; timed-out source work is retried without publishing an incomplete snapshot. |
+| `INCOME_SNAPSHOT_OVERLAP_DAYS` | `365` | Mutable overlap replaced by complete source snapshots; older history remains immutable. |
+| `FUNDOS_NET_SCAN_LIMIT` | `300` | Maximum recent Fundos.NET documents considered per index refresh. |
+| `FUNDOS_NET_FALLBACK_DOCUMENTS` | `30` | Bounded fallback scan when fund names do not identify a document. |
+| `FUNDOS_NET_PAGE_SIZE` | `36` | Page size for fund-specific Fundos.NET income queries. |
 
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
+
+Canonical income resolution is independent from the legacy dividend route. A maintenance worker refreshes bounded instrument batches through `/v2/income-events/refresh`; production calls require `X-Cache-Token`. Official B3/CVM and Fundos.NET observations outrank complementary HTML sources. Fund tickers are resolved to a CNPJ and queried through fund-specific Fundos.NET pages; the bounded global index is only a non-destructive fallback. Complete snapshots replace the mutable overlap while older paid history remains available for reconciliation. `POST /v2/income-events/backfill` queues the official B3/CVM collection for up to 500 tickers as one durable job, sharing the CVM open-data index and parsed documents across its pages and never scraping the complementary HTML sources. Conflicting official observations are retained with a non-projectable `conflicted` status instead of being guessed. `/v2/income-events/batch` and `/v2/income-events/changes` read only the local canonical store (SQLite by default, or the shared PostgreSQL store when `INCOME_STORE_URL` is configured), so user requests never depend on upstream latency.
+
+The official B3/CVM source propagates one absolute source budget through B3, CVM index and document waits. Validated observations completed before the budget are returned with explicit partial coverage, while successful document text is reused by later attempts. The decoded-text cache measures retained Python `str` allocations with `sys.getsizeof`; raw PDF bytes remain bounded separately. Network and semaphore waits are cancellable, but synchronous JSON, ZIP and PDF parsing cannot be preempted once started.
 
 The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. SEC-covered issuers are resolved from the official [EDGAR CompanyFacts API](https://www.sec.gov/edgar/sec-api-documentation), then the existing public HTML statements are tried as a bounded fallback. Keep provider keys on the server and review their terms before production use.
 
@@ -268,7 +297,7 @@ Releases follow semantic versioning:
 
 Release notes live in [CHANGELOG.md](CHANGELOG.md). The release process is documented in [RELEASING.md](RELEASING.md).
 
-Pushing a tag such as `vMAJOR.MINOR.PATCH` runs the release pipeline, injects that tag version into the build, creates a GitHub Release from the matching changelog section and uploads build artifacts.
+Running the `Release PR` workflow for `MAJOR.MINOR.PATCH` prepares the changelog and package version in a pull request. Merging that trusted pull request creates an immutable tag, builds the artifacts and publishes the matching GitHub Release.
 
 ## Documentation
 

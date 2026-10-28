@@ -1,9 +1,10 @@
 from datetime import date
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_HISTORICAL_QUOTE_DATES = 2500
+MAX_HISTORICAL_QUOTE_YEARS = 25
 
 
 class HistoricalQuote(BaseModel):
@@ -35,6 +36,12 @@ class HistoricalQuoteRequest(BaseModel):
     @classmethod
     def unique_dates(cls, values: list[date]) -> list[date]:
         return list(dict.fromkeys(values))
+
+    @model_validator(mode="after")
+    def bounded_archive_span(self) -> "HistoricalQuoteRequest":
+        if len({value.year for value in self.dates}) > MAX_HISTORICAL_QUOTE_YEARS:
+            raise ValueError("historical quote request exceeds the archive-year budget")
+        return self
 
 
 class HistoricalQuoteResponse(BaseModel):

@@ -1,0 +1,3481 @@
+from __future__ import annotations
+
+import asyncio
+import gc
+import io
+import json
+import sqlite3
+from collections.abc import Sequence
+from contextlib import closing
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+import httpx
+import pytest
+
+from app.api.dependencies import get_income_event_service
+from app.config import Settings
+from app.income.parsers import (
+    parse_b3_income_events,
+    parse_cvm_income_adjustment_text,
+    parse_cvm_income_report_text,
+    parse_fundos_net_xml,
+    parse_status_invest_income_events,
+)
+from app.income.resolver import _amounts_compatible, canonical_event_type, resolve_income_events
+from app.income.service import IncomeEventService
+from app.income.sources import (
+    FundamentusIncomeSource,
+    FundosNetIncomeSource,
+    IncomeSourceResult,
+    OfficialCompanyIncomeSource,
+    StatusInvestIncomeSource,
+    _debt_isin,
+    _fundos_net_candidates,
+    _latest_cvm_documents,
+    _read_cvm_zip,
+)
+from app.income.store import IncomeEventStore
+from app.main import create_app
+from app.models import (
+    CanonicalIncomeEvent,
+    Dividend,
+    IncomeEventBackfillRequest,
+    IncomeEventBatchRequest,
+    IncomeEventObservation,
+    IncomeEventRefreshRequest,
+    IncomeEventStatus,
+    IncomeFieldConfidence,
+    IncomeInstrumentRequest,
+    IncomeSourceCoverage,
+    InstrumentMetadata,
+    InstrumentType,
+)
+
+
+def _observation(
+    source: str,
+    *,
+    lineage: str | None = None,
+    event_type: str = "Dividendo",
+    payment_date: date = date(2026, 9, 11),
+    amount: str = "0.50",
+    authority: int = 20,
+    source_event_id: str | None = None,
+    version: int = 1,
+) -> IncomeEventObservation:
+    return IncomeEventObservation(
+        source=source,
+        lineage=lineage or f"lineage:{source}",
+        source_event_id=source_event_id or f"{source}-event",
+        ticker="BBAS3",
+        isin="BRBBASACNOR3",
+        event_type=event_type,
+        ex_date=date(2026, 9, 1),
+        payment_date=payment_date,
+        unit_price=Decimal(amount),
+        source_version=version,
+        authority=authority,
+        payload_hash=f"hash-{source}-{version}",
+    )
+
+
+class _IdentityProvider:
+    def __init__(
+        self,
+        result: InstrumentMetadata | None = None,
+        *,
+        error: Exception | None = None,
+        delay: float = 0,
+    ) -> None:
+        self.result = result
+        self.error = error
+        self.delay = delay
+        self.calls = 0
+
+    async def get(self, _ticker: str) -> InstrumentMetadata | None:
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def _identity(
+    ticker: str,
+    isin: str | None,
+    instrument_type: InstrumentType = InstrumentType.stock,
+) -> InstrumentMetadata:
+    return InstrumentMetadata(ticker=ticker, isin=isin, instrument_type=instrument_type)
+
+
+def test_b3_parser_filters_isin_deduplicates_and_returns_cvm_code() -> None:
+    row = {
+        "isinCode": "BRBBASACNOR3",
+        "label": "JRS CAP PROPRIO",
+        "lastDatePrior": "01/09/2026",
+        "paymentDate": "11/09/2026",
+        "rate": "0,03450628312",
+        "relatedTo": "3º Trimestre/2026",
+    }
+    payload = [{"codeCVM": "1023", "cashDividends": [row, row, {**row, "isinCode": "OTHER"}]}]
+
+    events, code = parse_b3_income_events(
+        payload,
+        ticker="BBAS3",
+        requested_isin="BRBBASACNOR3",
+    )
+
+    assert code == "1023"
+    assert len(events) == 1
+    assert events[0].event_type == "JRS CAP PROPRIO"
+    assert events[0].ex_date == date(2026, 9, 1)
+    assert events[0].unit_price == Decimal("0.03450628312")
+    assert parse_b3_income_events({}, ticker="BBAS3") == ([], None)
+    invalid, _code = parse_b3_income_events(
+        [{"cashDividends": [None, {"lastDatePrior": "bad", "rate": "-"}]}],
+        ticker="BBAS3",
+    )
+    assert invalid == []
+
+
+def test_b3_parser_keeps_equal_installments_paid_on_different_dates() -> None:
+    row = {
+        "isinCode": "BRPETRACNPR6",
+        "label": "JRS CAP PROPRIO",
+        "lastDatePrior": "22/04/2026",
+        "paymentDate": "20/05/2026",
+        "rate": "0,31311454000",
+    }
+
+    events, _code = parse_b3_income_events(
+        [{"cashDividends": [row, {**row, "paymentDate": "22/06/2026"}]}],
+        ticker="PETR4",
+        requested_isin="BRPETRACNPR6",
+    )
+
+    assert [event.payment_date for event in events] == [date(2026, 5, 20), date(2026, 6, 22)]
+    assert events[0].source_event_id != events[1].source_event_id
+
+
+def test_b3_parser_rejects_unknown_payment_date_sentinel() -> None:
+    row = {
+        "isinCode": "BREGIEACNOR9",
+        "label": "DIVIDENDO",
+        "lastDatePrior": "20/08/2026",
+        "paymentDate": "31/12/9999",
+        "rate": "0,54420748",
+    }
+
+    events, _code = parse_b3_income_events(
+        [{"cashDividends": [row]}],
+        ticker="EGIE3",
+        requested_isin="BREGIEACNOR9",
+    )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_skips_debenture_rows_without_a_known_isin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;"
+        "Assunto;Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;ENGIE;9512;2026-07-10;Relatório Proventos;;;Provento;"
+        "2026-07-10;AP;;1;https://cvm.test/provento.pdf\n"
+    ).encode("iso-8859-1")
+    archive = _zip(csv_payload)
+    b3 = [{"codeCVM": "9512", "cashDividends": []}]
+    # One notice pays the shares and the debentures of the same issuer.
+    report = (
+        "Provento\n"
+        "Ultimo dia de negociação com Direitos 14/07/2026\n"
+        "Código ISIN Valor Bruto (R$/Unidade) Data Pagamento\n"
+        "BREGIEACNOR9 0,48828976 Anual 2026 15/07/2026\n"
+        "BREGIEDBS043 333,30000000 Anual 2026 15/07/2026\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cvm.test":
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: report)
+    source = OfficialCompanyIncomeSource(
+        Settings(
+            b3_listed_companies_base_url="https://b3.test",
+            cvm_open_data_base_url="https://dados.test",
+        ),
+        httpx.MockTransport(handler),
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="EGIE3")],
+        date(2026, 7, 20),
+    )
+
+    assert [item.unit_price for item in result.observations] == [Decimal("0.48828976")]
+
+
+def test_issuer_debentures_are_not_read_as_share_income() -> None:
+    # A CVM notice covers every security the issuer pays on, so the shares and
+    # the debentures appear side by side. A debenture pays on a face value in
+    # the hundreds while the share pays cents, and only the ISIN separates them.
+    assert _debt_isin("BRVALEDBS077") is True
+    assert _debt_isin("BREGIEDBS043") is True
+    assert _debt_isin("BRVALEACNOR0") is False
+    assert _debt_isin("BREGIEACNOR9") is False
+    assert _debt_isin("BRHGLGCTF004") is False
+    assert _debt_isin(None) is False
+
+
+def test_fundos_net_parser_reads_income_and_amortization() -> None:
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <DadosEconomicoFinanceiros><InformeRendimentos><Provento>
+      <CodISIN>BRHGLGCTF004</CodISIN><CodNegociacao>HGLG11</CodNegociacao>
+      <Rendimento><DataBase>2026-07-31</DataBase><ValorProvento>1.17</ValorProvento>
+      <DataPagamento>2026-08-14</DataPagamento><PeriodoReferencia>Julho</PeriodoReferencia></Rendimento>
+      <Amortizacao><DataBase>2026-07-31</DataBase><ValorProvento>0.25</ValorProvento>
+      <DataPagamento>2026-08-14</DataPagamento></Amortizacao>
+    </Provento></InformeRendimentos></DadosEconomicoFinanceiros>"""
+
+    events = parse_fundos_net_xml(xml, document_id="1272107", version=2)
+
+    assert [event.event_type for event in events] == ["Rendimento", "Amortização"]
+    assert events[0].ticker == "HGLG11"
+    assert events[0].source_version == 2
+    assert events[0].authority == 100
+    assert parse_fundos_net_xml(b"not xml", document_id="bad") == []
+    assert parse_fundos_net_xml(b"<root><Provento/></root>", document_id="empty") == []
+
+
+def test_status_invest_parser_keeps_ex_and_payment_dates() -> None:
+    payload = json.dumps(
+        [
+            {
+                "id": 7,
+                "et": "RENDIMENTO",
+                "etd": "Rendimento",
+                "ed": "31/07/2026",
+                "pd": "14/08/2026",
+                "v": 1.17,
+            },
+            {"id": 8, "et": "RENDIMENTO", "ed": "bad", "pd": "14/08/2026", "v": 1},
+        ]
+    ).replace('"', "&quot;")
+    html = f'<section id="earning-section"><input id="results" value="{payload}"></section>'
+
+    events = parse_status_invest_income_events(html, ticker="HGLG11")
+
+    assert len(events) == 1
+    assert events[0].ex_date == date(2026, 7, 31)
+    assert events[0].payment_date == date(2026, 8, 14)
+    assert parse_status_invest_income_events("<html></html>", ticker="HGLG11") == []
+    assert (
+        parse_status_invest_income_events(
+            '<section id="earning-section"><input id="results" value="{}"></section>',
+            ticker="HGLG11",
+        )
+        == []
+    )
+    assert (
+        parse_status_invest_income_events(
+            '<section id="earning-section"><input id="results" value="not-json"></section>',
+            ticker="HGLG11",
+        )
+        == []
+    )
+
+
+def test_cvm_parser_repairs_wrapped_isin_and_amount() -> None:
+    text = """Provento
+    Data Aprovação
+    Ultimo dia de negociação com Direitos
+    14/08/2026
+    01/09/2026
+    Código ISIN
+    Valor Bruto (R$/Unidade)
+    Data Pagamento
+    BRBBASACN
+    OR3
+    0,0345062831
+    2
+    3º Trimestre 2026 Não A Vista 11/09/2026
+    """
+
+    events = parse_cvm_income_report_text(text, ticker="BBAS3", document_id="1559729", version=2)
+
+    assert len(events) == 1
+    assert events[0].isin == "BRBBASACNOR3"
+    assert events[0].unit_price == Decimal("0.03450628312")
+    assert events[0].source_event_id == "cvm:1559729:0"
+    assert (
+        parse_cvm_income_report_text("missing fields", ticker="BBAS3", document_id="x", version=1)
+        == []
+    )
+
+
+def test_cvm_parser_assigns_each_installment_its_payment_date() -> None:
+    text = """Provento
+    Ultimo dia de negociação com Direitos 22/04/2026
+    Código ISIN Valor Bruto (R$/Unidade) Data Pagamento
+    BRPETRACNPR6 0,31311454000 Anual 2025 20/05/2026
+    BRPETRACNPR6 0,31311454000 Anual 2025 22/06/2026
+    """
+
+    events = parse_cvm_income_report_text(text, ticker="PETR4", document_id="1506014", version=1)
+
+    assert [event.payment_date for event in events] == [date(2026, 5, 20), date(2026, 6, 22)]
+
+
+def test_cvm_adjustment_parser_reads_each_taxable_selic_update() -> None:
+    text = """Petrobras informa sobre atualização monetária da remuneração aos acionistas
+    informa que efetuará, no dia 20/03/2026, o pagamento da segunda parcela,
+    tendo como data base para o pagamento a posição acionária de 22/12/2025.
+    Dividendos R$ 0,29642144
+    Atualização pela taxa Selic (Dividendos) R$ 0,00895486
+    Juros sobre Capital Próprio (JCP) R$ 0,17518233
+    Atualização pela taxa Selic (JCP) 0,00529224R$
+    """
+
+    events = parse_cvm_income_adjustment_text(
+        text,
+        ticker="PETR4",
+        document_id="1490561",
+        version=1,
+    )
+
+    first_installment = parse_cvm_income_adjustment_text(
+        """efetuará, no dia 20/02/2026, o pagamento da primeira parcela,
+        data base para o pagamento a posição acionária de 22/12/2025.
+        Atualização pela taxa Selic R$ 0,00892089""",
+        ticker="PETR4",
+        document_id="1476807",
+        version=1,
+    )
+
+    assert [event.unit_price for event in events] == [
+        Decimal("0.00895486"),
+        Decimal("0.00529224"),
+    ]
+    assert all(event.ex_date == date(2025, 12, 22) for event in events)
+    assert all(event.payment_date == date(2026, 3, 20) for event in events)
+    assert all(event.event_type == "Rendimento" for event in events)
+    assert len({event.source_event_id for event in events}) == 2
+    assert first_installment[0].unit_price == Decimal("0.00892089")
+    assert first_installment[0].payment_date == date(2026, 2, 20)
+    assert first_installment[0].reference_period == "Proventos"
+    assert (
+        parse_cvm_income_adjustment_text(
+            "Atualização pela taxa Selic (JCP) R$ 0,01",
+            ticker="PETR4",
+            document_id="invalid",
+            version=1,
+        )
+        == []
+    )
+
+
+def test_resolver_prefers_authority_and_attaches_generic_official_type() -> None:
+    observations = [
+        _observation("cvm", event_type="Provento", authority=100),
+        _observation("status", event_type="JCP", authority=20),
+        _observation("fundamentus", event_type="Juros Sobre Capital Próprio", authority=20),
+    ]
+
+    events = resolve_income_events(observations)
+
+    assert len(events) == 1
+    assert events[0].event_type == "Juros Sobre Capital Próprio"
+    assert events[0].status is IncomeEventStatus.verified
+    assert events[0].field_sources["payment_date"] == "cvm"
+    assert events[0].field_sources["event_type"] == "fundamentus"
+    assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.corroborated
+    assert events[0].projectable is True
+    assert canonical_event_type("rend. trib.") == "Rendimento"
+
+
+def test_resolver_attaches_a_precise_generic_observation_to_one_rounded_type() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "cvm",
+                event_type="Provento",
+                amount="0.54652244673",
+                authority=100,
+            ),
+            _observation(
+                "fundamentus",
+                event_type="JCP",
+                amount="0.5465",
+                authority=20,
+            ),
+            _observation(
+                "b3",
+                event_type="JCP",
+                amount="0.54652244673",
+                authority=90,
+            ),
+        ]
+    )
+
+    assert len(events) == 1
+    assert events[0].event_type == "Juros Sobre Capital Próprio"
+    assert events[0].unit_price == Decimal("0.54652244673")
+    assert events[0].sources == ["b3", "cvm", "fundamentus"]
+    assert events[0].status is IncomeEventStatus.verified
+    assert events[0].field_sources["event_type"] == "b3"
+    assert events[0].field_confidence["event_type"] is IncomeFieldConfidence.authoritative
+
+
+def test_resolver_coalesces_secondary_sources_at_their_reported_precision() -> None:
+    assert _amounts_compatible(None, Decimal("0.08")) is False
+    events = resolve_income_events(
+        [
+            _observation(
+                "status",
+                lineage="secondary:status",
+                event_type="Rendimento",
+                amount="0.08355",
+                authority=20,
+            ),
+            _observation(
+                "fundamentus",
+                lineage="secondary:fundamentus",
+                event_type="Rendimento",
+                amount="0.08",
+                authority=20,
+            ),
+        ]
+    )
+
+    assert len(events) == 1
+    assert events[0].unit_price == Decimal("0.08355")
+    assert events[0].sources == ["fundamentus", "status"]
+    assert events[0].status is IncomeEventStatus.corroborated
+
+
+def test_resolver_does_not_attach_one_rounded_value_to_ambiguous_events() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "status-first",
+                lineage="secondary:status",
+                amount="0.0745",
+                authority=30,
+            ),
+            _observation(
+                "status-second",
+                lineage="secondary:status",
+                amount="0.0712",
+                authority=30,
+            ),
+            _observation(
+                "fundamentus",
+                lineage="secondary:fundamentus",
+                amount="0.07",
+                authority=20,
+            ),
+        ]
+    )
+
+    assert len(events) == 3
+    assert {event.unit_price for event in events} == {
+        Decimal("0.07"),
+        Decimal("0.0712"),
+        Decimal("0.0745"),
+    }
+
+
+def test_resolver_does_not_fuzzy_merge_rounded_events_from_the_same_lineage() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "b3-first",
+                lineage="official:b3",
+                amount="0.50000",
+                authority=90,
+            ),
+            _observation(
+                "b3-second",
+                lineage="official:b3",
+                amount="0.50004",
+                authority=90,
+            ),
+        ]
+    )
+
+    assert len(events) == 2
+    assert {event.unit_price for event in events} == {
+        Decimal("0.50000"),
+        Decimal("0.50004"),
+    }
+
+
+def test_resolver_groups_repeated_installments_before_refining_generic_types() -> None:
+    first_payment = date(2026, 5, 20)
+    second_payment = date(2026, 6, 22)
+    observations = []
+    for payment_date in (first_payment, second_payment):
+        observations.extend(
+            [
+                _observation(
+                    "b3",
+                    lineage="official:b3",
+                    event_type="JCP",
+                    payment_date=payment_date,
+                    amount="0.31311454",
+                    authority=90,
+                    source_event_id=f"b3-{payment_date.isoformat()}",
+                ),
+                _observation(
+                    "fundamentus",
+                    lineage="secondary:fundamentus",
+                    event_type="JCP",
+                    payment_date=payment_date,
+                    amount="0.3131",
+                    authority=20,
+                    source_event_id=f"fundamentus-{payment_date.isoformat()}",
+                ),
+                _observation(
+                    "cvm",
+                    lineage="official:cvm",
+                    event_type="Provento",
+                    payment_date=payment_date,
+                    amount="0.31311454",
+                    authority=100,
+                    source_event_id=f"cvm-{payment_date.isoformat()}",
+                ),
+            ]
+        )
+
+    events = resolve_income_events(observations)
+
+    assert [event.payment_date for event in events] == [first_payment, second_payment]
+    assert all(event.event_type == "Juros Sobre Capital Próprio" for event in events)
+    assert all(event.unit_price == Decimal("0.31311454") for event in events)
+    assert all(event.sources == ["b3", "cvm", "fundamentus"] for event in events)
+
+
+def test_resolver_keeps_a_generic_observation_when_rounded_types_are_ambiguous() -> None:
+    events = resolve_income_events(
+        [
+            _observation(
+                "cvm",
+                event_type="Provento",
+                amount="0.50004",
+                authority=100,
+            ),
+            _observation(
+                "fundamentus",
+                event_type="Dividendo",
+                amount="0.50000",
+            ),
+            _observation(
+                "status",
+                event_type="JCP",
+                amount="0.50008",
+            ),
+        ]
+    )
+
+    assert len(events) == 3
+    assert {event.event_type for event in events} == {
+        "Dividendo",
+        "Juros Sobre Capital Próprio",
+        "Provento",
+    }
+
+
+def test_resolver_requires_independent_lineages_and_detects_official_conflict() -> None:
+    same_lineage = [
+        _observation("first", lineage="copied:b3"),
+        _observation("second", lineage="copied:b3"),
+    ]
+    assert resolve_income_events(same_lineage)[0].status is IncomeEventStatus.tentative
+
+    corroborated = [*same_lineage, _observation("third", lineage="independent")]
+    assert resolve_income_events(corroborated)[0].status is IncomeEventStatus.corroborated
+
+    conflicting = [
+        _observation("cvm", authority=100),
+        _observation("b3", authority=90, payment_date=date(2026, 9, 12)),
+    ]
+    assert resolve_income_events(conflicting)[0].status is IncomeEventStatus.conflicted
+    assert resolve_income_events([_observation("invalid", amount="0")]) == []
+
+
+def test_resolver_preserves_installments_confirmed_by_one_lineage() -> None:
+    observations = [
+        _observation("b3-may", lineage="official:b3", authority=90),
+        _observation(
+            "b3-june",
+            lineage="official:b3",
+            authority=90,
+            payment_date=date(2026, 10, 11),
+        ),
+        _observation("cvm-may", lineage="official:cvm", authority=100),
+        _observation(
+            "cvm-june",
+            lineage="official:cvm",
+            authority=100,
+            payment_date=date(2026, 10, 11),
+        ),
+    ]
+
+    events = resolve_income_events(observations)
+
+    assert [event.payment_date for event in events] == [date(2026, 9, 11), date(2026, 10, 11)]
+    assert all(event.status is IncomeEventStatus.verified for event in events)
+    assert events[0].event_id != events[1].event_id
+
+
+def test_resolver_replaces_stale_payment_date_only_when_revision_is_confirmed() -> None:
+    stale = _observation(
+        "cvm-stale",
+        lineage="official:cvm",
+        authority=100,
+        payment_date=date(2026, 8, 31),
+        version=1,
+    )
+    corrected = _observation(
+        "cvm-corrected",
+        lineage="official:cvm",
+        authority=100,
+        payment_date=date(2026, 8, 28),
+        version=2,
+    )
+    b3 = _observation(
+        "b3",
+        lineage="official:b3",
+        authority=90,
+        payment_date=date(2026, 8, 28),
+    )
+
+    confirmed = resolve_income_events([stale, corrected, b3])
+    unconfirmed = resolve_income_events([stale, corrected])
+
+    assert len(confirmed) == 1
+    assert confirmed[0].payment_date == date(2026, 8, 28)
+    assert confirmed[0].status is IncomeEventStatus.verified
+    assert len(unconfirmed) == 1
+    assert unconfirmed[0].payment_date == date(2026, 8, 28)
+    assert unconfirmed[0].status is IncomeEventStatus.conflicted
+    assert unconfirmed[0].projectable is False
+
+
+def test_resolver_requires_secondary_payment_consensus_and_uses_unique_majority() -> None:
+    first = _observation("first", lineage="independent:first")
+    disagreement = _observation(
+        "second",
+        lineage="independent:second",
+        payment_date=date(2026, 9, 12),
+    )
+
+    conflicted = resolve_income_events([first, disagreement])[0]
+    assert conflicted.status is IncomeEventStatus.conflicted
+    assert conflicted.projectable is False
+
+    majority = resolve_income_events(
+        [
+            first,
+            disagreement,
+            _observation("third", lineage="independent:third"),
+        ]
+    )[0]
+    assert majority.status is IncomeEventStatus.corroborated
+    assert majority.payment_date == first.payment_date
+
+
+@pytest.mark.asyncio
+async def test_store_publishes_semantic_changes_and_filters_reads(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    await store.startup()
+    first = _observation("cvm", authority=100, version=1)
+    corrected = _observation("cvm", authority=100, version=2, payment_date=date(2026, 9, 12))
+    await store.save_observations([first, corrected])
+    observations = await store.observations(["BBAS3"])
+    assert observations == [corrected]
+
+    canonical = resolve_income_events(observations)
+    assert await store.publish(canonical) == 1
+    assert await store.publish(canonical) == 0
+    assert (await store.events(["BBAS3"]))[0].revision == 1
+    assert await store.events(["PETR4"]) == []
+    assert await store.events([]) == []
+    assert await store.observations([]) == []
+    await store.save_coverage([])
+    assert await store.publish([]) == 0
+    filtered = await store.events(
+        ["BBAS3"],
+        from_date=date(2026, 9, 12),
+        to_date=date(2026, 9, 12),
+    )
+    assert filtered
+    changes, cursor, has_more = await store.changes(0, limit=1)
+    assert len(changes) == 1
+    assert cursor == await store.cursor() == 1
+    assert has_more is False
+
+    replacement = resolve_income_events(
+        [_observation("cvm", authority=100, amount="0.75", source_event_id="replacement")]
+    )
+    assert await store.publish(replacement, scope_tickers=["BBAS3"]) == 2
+    visible = await store.events(["BBAS3"])
+    assert visible == replacement
+    assert await store.events(["BBAS3"], include_tentative=True) == replacement
+    changes, _cursor, _has_more = await store.changes(1, limit=10)
+    assert {item.status for item in changes} == {
+        IncomeEventStatus.cancelled,
+        IncomeEventStatus.verified,
+    }
+    await store.close()
+    with pytest.raises(RuntimeError, match="not started"):
+        await store.events(["BBAS3"])
+
+
+@pytest.mark.asyncio
+async def test_store_candidate_reads_include_tentative_but_exclude_cancelled(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    tentative = resolve_income_events([_observation("fundamentus")])
+    assert await store.publish(tentative, scope_tickers=["BBAS3"]) == 1
+
+    assert await store.events(["BBAS3"]) == []
+    assert await store.events(["BBAS3"], include_tentative=True) == tentative
+
+    assert await store.publish([], scope_tickers=["BBAS3"]) == 1
+    assert await store.events(["BBAS3"], include_tentative=True) == []
+    changes, _cursor, _has_more = await store.changes(0, limit=10)
+    assert changes[-1].status is IncomeEventStatus.cancelled
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_migrates_legacy_observation_columns(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE income_event_observations (
+                source TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                source_version INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (source, source_event_id, source_version)
+            )
+            """
+        )
+    store = IncomeEventStore(path)
+
+    await store.startup()
+
+    assert await store.save_observations([_observation("cvm", authority=100)]) == 1
+    assert await store.observations(["BBAS3"])
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_replacement_retires_only_the_mutable_overlap(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    historical = _observation("cvm", authority=100).model_copy(
+        update={
+            "source_event_id": "historical",
+            "ex_date": date(2024, 6, 19),
+            "payment_date": date(2024, 7, 10),
+        }
+    )
+    current = _observation("cvm", authority=100)
+    await store.replace_observations(
+        [historical, current],
+        snapshot_sources=("cvm",),
+        complete_tickers=["BBAS3"],
+        snapshot_from=date(2025, 8, 27),
+    )
+
+    await store.replace_observations(
+        [],
+        snapshot_sources=("cvm",),
+        complete_tickers=["BBAS3"],
+        snapshot_from=date(2025, 8, 27),
+    )
+
+    assert await store.observations(["BBAS3"]) == [historical]
+    await store.close()
+
+
+class _Source:
+    name = "fake"
+    snapshot_sources: tuple[str, ...] = ("official",)
+    official = False
+
+    def __init__(self, *, delay: float = 0, fail: bool = False) -> None:
+        self.delay = delay
+        self.fail = fail
+        self.calls = 0
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        del as_of
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.fail:
+            raise RuntimeError("offline")
+        return IncomeSourceResult(
+            [_observation("official", authority=100)],
+            [
+                IncomeSourceCoverage(
+                    source=self.name, ticker=instruments[0].ticker, status="complete", complete=True
+                )
+            ],
+        )
+
+
+class _IdentitySource(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested: list[list[IncomeInstrumentRequest]] = []
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.requested.append(list(instruments))
+        del as_of
+        return IncomeSourceResult(
+            [],
+            [
+                IncomeSourceCoverage(
+                    source=self.name,
+                    ticker=instrument.ticker,
+                    status="empty",
+                    complete=True,
+                )
+                for instrument in instruments
+            ],
+        )
+
+
+class _GatedSource(_Source):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(fail=fail)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.started.set()
+        await self.release.wait()
+        return await super().collect(instruments, as_of)
+
+
+class _SlowSource(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.started.set()
+        await self.release.wait()
+        return await super().collect(instruments, as_of)
+
+
+class _CoverageSequenceSource(_Source):
+    def __init__(self) -> None:
+        super().__init__()
+        self.complete = False
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.calls += 1
+        del as_of
+        return IncomeSourceResult(
+            [],
+            [
+                IncomeSourceCoverage(
+                    source=self.name,
+                    ticker=instrument.ticker,
+                    status="complete" if self.complete else "partial",
+                    complete=self.complete,
+                )
+                for instrument in instruments
+            ],
+        )
+
+
+class _EventGatedSource:
+    name = "gated"
+    snapshot_sources: tuple[str, ...] = ("official",)
+    official = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.as_of_values: list[date] = []
+        self.first_call_started = asyncio.Event()
+        self.second_call_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        self.calls += 1
+        self.as_of_values.append(as_of)
+        if self.calls == 1:
+            self.first_call_started.set()
+        elif self.calls == 2:
+            self.second_call_started.set()
+        await self.release.wait()
+        return IncomeSourceResult(
+            [_observation("official", authority=100)],
+            [
+                IncomeSourceCoverage(
+                    source=self.name, ticker=instruments[0].ticker, status="complete", complete=True
+                )
+            ],
+        )
+
+
+class _FailingCoverageStore(IncomeEventStore):
+    async def replace_observations(
+        self,
+        observations: list[IncomeEventObservation],
+        *,
+        snapshot_sources: tuple[str, ...],
+        complete_tickers: list[str],
+        snapshot_from: date,
+    ) -> int:
+        del observations, snapshot_sources, complete_tickers, snapshot_from
+        raise RuntimeError("observation persistence failed")
+
+
+class _OwnershipLostStore(IncomeEventStore):
+    async def refresh_item_owned(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        claim_token: str | None,
+    ) -> bool:
+        del job_id, source, ticker, claim_token
+        return False
+
+
+class _HeartbeatRecordingStore(IncomeEventStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.renewed = asyncio.Event()
+
+    async def renew_refresh_item(
+        self,
+        job_id: str,
+        source: str,
+        ticker: str,
+        *,
+        claim_token: str,
+        lease_seconds: int,
+        now: datetime,
+    ) -> bool:
+        self.renewed.set()
+        return await super().renew_refresh_item(
+            job_id,
+            source,
+            ticker,
+            claim_token=claim_token,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+
+
+class _FlakyPublishStore(IncomeEventStore):
+    def __init__(self, path: Path, *, failures: int) -> None:
+        super().__init__(path)
+        self.failures = failures
+
+    async def publish(
+        self,
+        events: list[CanonicalIncomeEvent],
+        *,
+        scope_tickers: list[str] | None = None,
+    ) -> int:
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("publication unavailable")
+        return await super().publish(events, scope_tickers=scope_tickers)
+
+
+class _PublishRecordingStore(IncomeEventStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.publish_calls: list[list[str]] = []
+        self.published = asyncio.Event()
+
+    async def publish(
+        self,
+        events: list[CanonicalIncomeEvent],
+        *,
+        scope_tickers: list[str] | None = None,
+    ) -> int:
+        self.publish_calls.append(list(scope_tickers or []))
+        self.published.set()
+        return await super().publish(events, scope_tickers=scope_tickers)
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_batch_and_failed_source(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(delay=0.02)
+    failed = _Source(fail=True)
+    failed.name = "failed"
+    service = IncomeEventService(store, [source, failed])
+    request = IncomeEventRefreshRequest(instruments=[IncomeInstrumentRequest(ticker="bbas3")])
+
+    first, second = await asyncio.gather(service.refresh(request), service.refresh(request))
+
+    assert first == second
+    assert source.calls == 1
+    assert first.failed_sources == ["failed"]
+    batch = await service.batch(IncomeEventBatchRequest(tickers=["bbas3"]))
+    assert len(batch.events) == 1
+    changed = await service.changes(0, 100)
+    assert changed.events == batch.events
+
+    source.fail = False
+    source.collect = _empty_source_collect.__get__(source, _Source)  # type: ignore[method-assign]
+    refreshed = await service.refresh(request)
+    assert refreshed.published == 1
+    assert (await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))).events == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_reuses_fresh_complete_source_coverage(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+    )
+
+    await service.refresh(request)
+    await service.refresh(request)
+
+    assert source.calls == 1
+    assert len((await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))).events) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_refresh_with_explicit_as_of_does_not_reuse_another_window(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 18),
+    )
+
+    await service.refresh(request)
+    await service.refresh(request.model_copy(update={"as_of": date(2026, 9, 19)}))
+
+    assert source.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_is_scoped_to_as_of_period(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    first_date = date(2026, 9, 1)
+    second_date = date(2026, 9, 2)
+    request = IncomeEventRefreshRequest(instruments=[IncomeInstrumentRequest(ticker="BBAS3")])
+
+    first = asyncio.create_task(service.refresh(request.model_copy(update={"as_of": first_date})))
+    await source.first_call_started.wait()
+    second = asyncio.create_task(service.refresh(request.model_copy(update={"as_of": second_date})))
+    await source.second_call_started.wait()
+
+    assert source.calls == 2
+    assert source.as_of_values == [first_date, second_date]
+
+    source.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.requested == second_result.requested == 1
+    assert first_result.observations == second_result.observations == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_canonicalizes_instrument_order(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    as_of = date(2026, 9, 1)
+    first_request = IncomeEventRefreshRequest(
+        instruments=[
+            IncomeInstrumentRequest(ticker="BBAS3"),
+            IncomeInstrumentRequest(ticker="PETR4"),
+        ],
+        as_of=as_of,
+    )
+    reversed_request = first_request.model_copy(
+        update={"instruments": list(reversed(first_request.instruments))}
+    )
+
+    first = asyncio.create_task(service.refresh(first_request))
+    await source.first_call_started.wait()
+    second = asyncio.create_task(service.refresh(reversed_request))
+    await asyncio.sleep(0)
+    assert source.calls == 1
+    assert not second.done()
+
+    source.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == second_result
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_singleflight_shields_shared_task_from_cancelled_waiter(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 1),
+    )
+
+    first = asyncio.create_task(service.refresh(request))
+    await source.first_call_started.wait()
+    second = asyncio.create_task(service.refresh(request))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    third = asyncio.create_task(service.refresh(request))
+    await asyncio.sleep(0)
+    assert source.calls == 1
+    assert not second.done()
+    assert not third.done()
+
+    source.release.set()
+    second_result, third_result = await asyncio.gather(second, third)
+
+    assert second_result == third_result
+    assert source.calls == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_close_drains_shared_refresh_before_store_close(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 1),
+    )
+
+    refresh = asyncio.create_task(service.refresh(request))
+    await source.first_call_started.wait()
+    close = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+
+    source.release.set()
+    await close
+    assert refresh.done()
+    assert not service._inflight
+    with pytest.raises(RuntimeError, match="closed"):
+        await service.refresh(request)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_consumes_failure_when_all_waiters_cancel(tmp_path: Path) -> None:
+    store = _FailingCoverageStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _EventGatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 1),
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+
+    def capture_loop_error(
+        _loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_errors.append(context)
+
+    loop.set_exception_handler(capture_loop_error)
+    shared_task: asyncio.Task[object] | None = None
+    try:
+        first = asyncio.create_task(service.refresh(request))
+        await source.first_call_started.wait()
+        shared_task = next(iter(service._inflight.values()))
+        second = asyncio.create_task(service.refresh(request))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        second.cancel()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+
+        source.release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if shared_task.done() and not service._inflight:
+                break
+        assert shared_task.done()
+        assert not service._inflight
+
+        del shared_task
+        gc.collect()
+        assert loop_errors == []
+    finally:
+        source.release.set()
+        loop.set_exception_handler(previous_handler)
+        await store.close()
+
+
+async def _empty_source_collect(
+    self: _Source,
+    instruments: Sequence[IncomeInstrumentRequest],
+    as_of: date,
+) -> IncomeSourceResult:
+    del as_of
+    self.calls += 1
+    return IncomeSourceResult(
+        [],
+        [
+            IncomeSourceCoverage(
+                source=self.name,
+                ticker=instruments[0].ticker,
+                status="empty",
+                complete=True,
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_income_event_routes_are_cached_and_refresh_is_local(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_Source()])
+    app = create_app()
+    app.dependency_overrides[get_income_event_service] = lambda: service
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        refreshed = await client.post(
+            "/v2/income-events/refresh",
+            json={"instruments": [{"ticker": "BBAS3"}]},
+        )
+        assert refreshed.status_code == 200
+        batch = await client.post("/v2/income-events/batch", json={"tickers": ["BBAS3"]})
+        assert batch.status_code == 200
+        assert batch.headers["etag"] == 'W/"income-1"'
+        changes = await client.get("/v2/income-events/changes", params={"cursor": 0})
+        assert changes.json()["events"][0]["ticker"] == "BBAS3"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_status_source_tries_fund_then_stock_path() -> None:
+    payload = json.dumps(
+        [{"id": 1, "et": "DIVIDENDO", "ed": "01/09/2026", "pd": "11/09/2026", "v": 0.5}]
+    ).replace('"', "&quot;")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "fundos-imobiliarios" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            text=f'<section id="earning-section"><input id="results" value="{payload}"></section>',
+        )
+
+    source = StatusInvestIncomeSource(Settings(), httpx.MockTransport(handler))
+    result = await source.collect([IncomeInstrumentRequest(ticker="BBAS3")], date(2026, 8, 27))
+    assert len(result.observations) == 1
+    assert result.coverage[0].complete is True
+
+
+@pytest.mark.asyncio
+async def test_fundamentus_source_filters_incomplete_rows_and_isolates_failure() -> None:
+    class Assets:
+        async def get_dividends(
+            self,
+            ticker: str,
+            *,
+            force_refresh: bool,
+        ) -> tuple[list[Dividend], bool]:
+            assert force_refresh is True
+            if ticker == "FAIL3":
+                raise RuntimeError("offline")
+            return (
+                [
+                    Dividend(
+                        ex_date=date(2026, 9, 1),
+                        payment_date=date(2026, 9, 11),
+                        value=Decimal("0.5"),
+                        type="Dividendo",
+                        is_future_payment=True,
+                        is_future_ex_date=True,
+                        raw={},
+                    ),
+                    Dividend(
+                        ex_date=None,
+                        payment_date=date(2026, 9, 11),
+                        value=Decimal("0.5"),
+                        type="Dividendo",
+                        is_future_payment=True,
+                        is_future_ex_date=False,
+                        raw={},
+                    ),
+                ],
+                False,
+            )
+
+    source = FundamentusIncomeSource(Assets())  # type: ignore[arg-type]
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3"), IncomeInstrumentRequest(ticker="FAIL3")],
+        date(2026, 8, 27),
+    )
+    assert len(result.observations) == 1
+    assert [item.complete for item in result.coverage] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_status_source_marks_http_failure_incomplete() -> None:
+    source = StatusInvestIncomeSource(
+        Settings(),
+        httpx.MockTransport(lambda _request: httpx.Response(503)),
+    )
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3")],
+        date(2026, 8, 27),
+    )
+    assert result.observations == []
+    assert result.coverage[0].complete is False
+
+
+@pytest.mark.asyncio
+async def test_status_profile_singleflight_survives_cancelled_waiter() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, text="<profile>")
+
+    source = StatusInvestIncomeSource(
+        Settings(status_invest_base_url="https://status.test"),
+        httpx.MockTransport(handler),
+    )
+    instrument = IncomeInstrumentRequest(ticker="BBAS3")
+    async with source._client() as client:
+        first = asyncio.create_task(source._profile_html(client, instrument))
+        await started.wait()
+        second = asyncio.create_task(source._profile_html(client, instrument))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == "<profile>"
+        assert await source._profile_html(client, instrument) == "<profile>"
+
+    assert calls == 1
+    assert source._profile_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_status_collect_keeps_client_open_until_shared_producer_finishes() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        started.set()
+        await release.wait()
+        return httpx.Response(200, text="<profile>")
+
+    class TrackingTransport(httpx.MockTransport):
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+            await super().aclose()
+
+    transport = TrackingTransport(handler)
+    source = StatusInvestIncomeSource(
+        Settings(status_invest_base_url="https://status.test"),
+        transport,
+    )
+    collection = asyncio.create_task(
+        source.collect([IncomeInstrumentRequest(ticker="BBAS3")], date(2026, 9, 1))
+    )
+    await started.wait()
+
+    collection.cancel()
+    await asyncio.sleep(0)
+    assert not transport.closed
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await collection
+    assert transport.closed
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_combines_b3_and_cvm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;Assunto;"
+        "Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;BB;1023;2026-08-19;Relatório Proventos;;;;2026-08-19;AP;;2;https://cvm.test/report.pdf\n"
+    ).encode("iso-8859-1")
+    archive = _zip(csv_payload)
+    b3 = [{"codeCVM": "1023", "cashDividends": []}]
+    report = (
+        "Ultimo dia de negociação com Direitos\n14/08/2026\n01/09/2026\n"
+        "Código ISIN\nBRBBASACNOR3 0,5 11/09/2026"
+    )
+    archive_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal archive_requests
+        if request.url.host == "cvm.test":
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            archive_requests += 1
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: report)
+    settings = Settings(
+        b3_listed_companies_base_url="https://b3.test",
+        cvm_open_data_base_url="https://dados.test",
+    )
+    source = OfficialCompanyIncomeSource(settings, httpx.MockTransport(handler))
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3")],
+        date(2026, 8, 27),
+    )
+    assert len(result.observations) == 1
+    assert result.observations[0].source == "cvm"
+    assert result.coverage[0].complete is True
+    await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3")],
+        date(2026, 8, 27),
+    )
+    assert archive_requests == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ticker", "selected_isin", "other_isin"),
+    [
+        ("BBAS3", "BRBBASACNOR3", "BRBBASA04OR8"),
+        ("PETR4", "BRPETRACNPR6", "BRPETRACNOR9"),
+    ],
+)
+async def test_official_company_source_resolves_multiple_isins_with_b3_identity(
+    ticker: str,
+    selected_isin: str,
+    other_isin: str,
+) -> None:
+    rows = [
+        {
+            "isinCode": selected_isin,
+            "label": "RENDIMENTO",
+            "lastDatePrior": "22/04/2026",
+            "paymentDate": "20/05/2026",
+            "rate": "0,02",
+        },
+        {
+            "isinCode": other_isin,
+            "label": "RENDIMENTO",
+            "lastDatePrior": "22/04/2026",
+            "paymentDate": "20/05/2026",
+            "rate": "0,03",
+        },
+    ]
+    identity = _IdentityProvider(_identity(ticker, selected_isin))
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])),
+        identity_provider=identity,
+    )
+
+    result = await source.collect([IncomeInstrumentRequest(ticker=ticker)], date(2026, 8, 27))
+
+    assert [event.isin for event in result.observations] == [selected_isin]
+    assert identity.calls == 1
+    assert result.coverage[0].complete is True
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_fails_closed_when_identity_is_not_authoritative() -> None:
+    rows = [
+        {
+            "isinCode": "BRBBASACNOR3",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,02",
+        },
+        {
+            "isinCode": "BRBBASA04OR8",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,03",
+        },
+    ]
+
+    for identity in (
+        _IdentityProvider(),
+        _IdentityProvider(_identity("BBAS3", "BRMISMATCH000")),
+        _IdentityProvider(_identity("PETR4", "BRBBASACNOR3")),
+        _IdentityProvider(_identity("BBAS3", "BRVALEDBS077")),
+        _IdentityProvider(error=RuntimeError("offline")),
+    ):
+        source = OfficialCompanyIncomeSource(
+            Settings(b3_listed_companies_base_url="https://b3.test"),
+            httpx.MockTransport(
+                lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])
+            ),
+            identity_provider=identity,
+        )
+
+        result = await source.collect(
+            [IncomeInstrumentRequest(ticker="BBAS3")],
+            date(2026, 8, 27),
+        )
+
+        assert result.observations == []
+        assert result.coverage[0].complete is False
+        assert result.coverage[0].detail is not None
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_applies_resolved_isin_to_cvm_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;Assunto;"
+        "Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;BB;1023;2026-08-19;Relatório Proventos;;;;2026-08-19;AP;;2;https://cvm.test/report.pdf\n"
+    ).encode("iso-8859-1")
+    report = (
+        "Ultimo dia de negociação com Direitos\n14/08/2026\n01/09/2026\n"
+        "Código ISIN\nBRBBASACNOR3 0,5 11/09/2026\n"
+        "BRBBASA04OR8 0,7 11/09/2026"
+    )
+    b3 = [
+        {
+            "codeCVM": "1023",
+            "cashDividends": [
+                {
+                    "isinCode": "BRBBASACNOR3",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,02",
+                },
+                {
+                    "isinCode": "BRBBASA04OR8",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,03",
+                },
+            ],
+        }
+    ]
+    archive = _zip(csv_payload)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cvm.test":
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: report)
+    identity = _IdentityProvider(_identity("BBAS3", "BRBBASACNOR3"))
+    source = OfficialCompanyIncomeSource(
+        Settings(
+            b3_listed_companies_base_url="https://b3.test",
+            cvm_open_data_base_url="https://dados.test",
+        ),
+        httpx.MockTransport(handler),
+        identity_provider=identity,
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3")],
+        date(2026, 8, 27),
+    )
+
+    assert identity.calls == 1
+    assert [event.isin for event in result.observations] == [
+        "BRBBASACNOR3",
+        "BRBBASACNOR3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_does_not_resolve_known_isins() -> None:
+    identity = _IdentityProvider(_identity("BBAS3", "BRBBASACNOR3"))
+    cases = (
+        (
+            "BBAS3",
+            [
+                {
+                    "isinCode": "BRBBASACNOR3",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,02",
+                },
+                {
+                    "isinCode": "BRBBASA04OR8",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,03",
+                },
+            ],
+            IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3"),
+        ),
+        (
+            "WEGE3",
+            [
+                {
+                    "isinCode": "BRWEGEACNOR0",
+                    "label": "DIVIDENDO",
+                    "lastDatePrior": "01/09/2026",
+                    "paymentDate": "11/09/2026",
+                    "rate": "0,02",
+                }
+            ],
+            IncomeInstrumentRequest(ticker="WEGE3"),
+        ),
+        (
+            "SNAG11",
+            [
+                {
+                    "assetIssued": "BRSNAGCTF000",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "31/07/2026",
+                    "paymentDate": "24/08/2026",
+                    "rate": "0,12",
+                },
+                {
+                    "assetIssued": "BRSNAGR12M14",
+                    "label": "RENDIMENTO",
+                    "lastDatePrior": "31/07/2026",
+                    "paymentDate": "24/08/2026",
+                    "rate": "0,07",
+                },
+            ],
+            IncomeInstrumentRequest(ticker="SNAG11"),
+        ),
+    )
+    for _ticker, rows, instrument in cases:
+        source = OfficialCompanyIncomeSource(
+            Settings(b3_listed_companies_base_url="https://b3.test"),
+            httpx.MockTransport(
+                lambda _request, rows=rows: httpx.Response(200, json=[{"cashDividends": rows}])
+            ),
+            identity_provider=identity,
+        )
+        await source.collect([instrument], date(2026, 8, 27))
+        assert identity.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_singleflights_identity_lookups() -> None:
+    rows = [
+        {
+            "isinCode": "BRBBASACNOR3",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,02",
+        },
+        {
+            "isinCode": "BRBBASA04OR8",
+            "label": "RENDIMENTO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,03",
+        },
+    ]
+    identity = _IdentityProvider(_identity("BBAS3", "BRBBASACNOR3"), delay=0.01)
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])),
+        identity_provider=identity,
+    )
+
+    await asyncio.gather(
+        *(
+            source.collect([IncomeInstrumentRequest(ticker="BBAS3")], date(2026, 8, 27))
+            for _ in range(3)
+        )
+    )
+
+    assert identity.calls == 1
+    assert source._identity_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_official_cvm_document_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, content=b"pdf")
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: "report")
+    source = OfficialCompanyIncomeSource(Settings(), httpx.MockTransport(handler))
+    link = "https://cvm.test/report.pdf"
+    async with source._client() as client:
+        first = asyncio.create_task(source._cvm_document_text(client, link))
+        await started.wait()
+        second = asyncio.create_task(source._cvm_document_text(client, link))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == "report"
+        assert await source._cvm_document_text(client, link) == "report"
+
+    assert calls == 1
+    assert source._cvm_document_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_loads_and_caches_income_adjustments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_payload = (
+        "CNPJ_Companhia;Nome_Companhia;Codigo_CVM;Data_Referencia;Categoria;Tipo;Especie;"
+        "Assunto;Data_Entrega;Tipo_Apresentacao;Protocolo_Entrega;Versao;Link_Download\n"
+        "00;PETROBRAS;9512;2026-03-16;Comunicado ao Mercado;;;"
+        "Petrobras informa sobre atualização monetária da remuneração aos acionistas;"
+        "2026-03-16;AP;;1;https://cvm.test/adjustment.pdf\n"
+        "00;PETROBRAS;9512;2026-03-16;Comunicado ao Mercado;;;Operational update;"
+        "2026-03-16;AP;;1;https://cvm.test/unrelated.pdf\n"
+    ).encode("iso-8859-1")
+    archive = _zip(csv_payload)
+    b3 = [{"codeCVM": "9512", "cashDividends": []}]
+    adjustment = (
+        "efetuará, no dia 20/03/2026, o pagamento; data base para o pagamento a posição "
+        "acionária de 22/12/2025; Atualização pela taxa Selic (JCP) R$ 0,00529224"
+    )
+    document_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal document_requests
+        if request.url.host == "cvm.test":
+            document_requests += 1
+            assert request.headers["referer"] == (
+                "https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx"
+            )
+            return httpx.Response(200, content=b"pdf")
+        if "ipe_cia_aberta_2026" in request.url.path:
+            return httpx.Response(200, content=archive)
+        if "ipe_cia_aberta_2025" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=b3)
+
+    monkeypatch.setattr("app.income.sources._pdf_text", lambda _content: adjustment)
+    source = OfficialCompanyIncomeSource(
+        Settings(
+            b3_listed_companies_base_url="https://b3.test",
+            cvm_open_data_base_url="https://dados.test",
+        ),
+        httpx.MockTransport(handler),
+    )
+    instrument = IncomeInstrumentRequest(ticker="PETR4", isin="BRPETRACNPR6")
+
+    first = await source.collect([instrument], date(2026, 8, 28))
+    second = await source.collect([instrument], date(2026, 8, 28))
+
+    assert [item.unit_price for item in first.observations] == [Decimal("0.00529224")]
+    assert second.observations
+    assert document_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_uses_b3_without_cvm_code() -> None:
+    row = {
+        "isinCode": "BRBBASACNOR3",
+        "label": "DIVIDENDO",
+        "lastDatePrior": "01/09/2026",
+        "paymentDate": "11/09/2026",
+        "rate": "0,5",
+    }
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=[{"cashDividends": [row]}])
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3")],
+        date(2026, 8, 27),
+    )
+    assert len(result.observations) == 1
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_reads_each_issuer_once() -> None:
+    rows = [
+        {
+            "isinCode": "BRBBASACNOR3",
+            "label": "DIVIDENDO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,5",
+        },
+        {
+            "isinCode": "BRBBASACNOR4",
+            "label": "DIVIDENDO",
+            "lastDatePrior": "01/09/2026",
+            "paymentDate": "11/09/2026",
+            "rate": "0,7",
+        },
+    ]
+    requests = {"b3": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        requests["b3"] += 1
+        return httpx.Response(200, json=[{"cashDividends": rows}])
+
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(handler),
+    )
+    result = await source.collect(
+        [
+            IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3"),
+            IncomeInstrumentRequest(ticker="BBAS4", isin="BRBBASACNOR4"),
+        ],
+        date(2026, 8, 27),
+    )
+    await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3", isin="BRBBASACNOR3")],
+        date(2026, 8, 27),
+    )
+
+    assert len(result.observations) == 2
+    assert requests["b3"] == 1
+    assert source._b3_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_requires_isin_for_multiple_share_classes() -> None:
+    common = {
+        "label": "JRS CAP PROPRIO",
+        "lastDatePrior": "11/05/2026",
+        "paymentDate": "26/08/2026",
+    }
+    rows = [
+        {**common, "isinCode": "BRTAEEACNOR9", "rate": "0,08000000000"},
+        {**common, "isinCode": "BRTAEECDAM10", "rate": "0,55899814398"},
+    ]
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+
+    ambiguous = await source.collect(
+        [IncomeInstrumentRequest(ticker="TAEE11")],
+        date(2026, 8, 27),
+    )
+    identified = await source.collect(
+        [IncomeInstrumentRequest(ticker="TAEE11", isin="BRTAEECDAM10")],
+        date(2026, 8, 27),
+    )
+
+    assert ambiguous.observations == []
+    assert ambiguous.coverage[0].complete is False
+    assert ambiguous.coverage[0].detail is not None
+    assert ambiguous.coverage[0].detail.startswith(
+        "B3 returned multiple ISINs for TAEE11; authoritative identity lookup failed ("
+    )
+    assert len(identified.observations) == 1
+    assert identified.observations[0].isin == "BRTAEECDAM10"
+    assert identified.observations[0].unit_price == Decimal("0.55899814398")
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_selects_fund_unit_among_subscription_rights() -> None:
+    common = {
+        "label": "RENDIMENTO",
+        "lastDatePrior": "31/07/2026",
+        "paymentDate": "24/08/2026",
+    }
+    rows = [
+        {**common, "assetIssued": "BRSNAGCTF000", "rate": "0,12"},
+        {**common, "assetIssued": "BRSNAGR12M14", "rate": "0,07"},
+        {**common, "assetIssued": "BRSNAGR13M13", "rate": "0,05"},
+    ]
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=[{"cashDividends": rows}])
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="SNAG11")],
+        date(2026, 8, 27),
+    )
+
+    assert result.coverage[0].complete is True
+    assert len(result.observations) == 1
+    assert result.observations[0].isin == "BRSNAGCTF000"
+    assert result.observations[0].unit_price == Decimal("0.12")
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_keeps_mixed_fund_isins_ambiguous() -> None:
+    row = {
+        "label": "RENDIMENTO",
+        "lastDatePrior": "31/07/2026",
+        "paymentDate": "24/08/2026",
+        "rate": "0,12",
+    }
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json=[
+                {
+                    "cashDividends": [
+                        {**row, "assetIssued": "BRSNAGCTF000"},
+                        {**row, "assetIssued": "BRSNAGACNOR1"},
+                    ]
+                }
+            ],
+        )
+    )
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        transport,
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="SNAG11")],
+        date(2026, 8, 27),
+    )
+
+    assert result.observations == []
+    assert result.coverage[0].complete is False
+    assert result.coverage[0].detail is not None
+    assert result.coverage[0].detail.startswith(
+        "B3 returned multiple ISINs for SNAG11; authoritative identity lookup failed ("
+    )
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_accepts_an_unknown_b3_issuer() -> None:
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(404)),
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="UNKNOWN11")],
+        date(2026, 8, 27),
+    )
+
+    assert result.observations == []
+    assert result.coverage[0].complete is True
+
+
+@pytest.mark.asyncio
+async def test_official_company_source_isolates_transport_failure() -> None:
+    source = OfficialCompanyIncomeSource(
+        Settings(b3_listed_companies_base_url="https://b3.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(503)),
+    )
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="BBAS3")],
+        date(2026, 8, 27),
+    )
+    assert result.coverage[0].complete is False
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_source_filters_requested_ticker() -> None:
+    listing = {
+        "data": [
+            {"id": 1272107, "versao": 2, "status": "AC", "descricaoFundo": "CSHG LOGISTICA FII"}
+        ]
+    }
+    xml = b"""<DadosEconomicoFinanceiros><InformeRendimentos><Provento>
+    <CodISIN>BRHGLGCTF004</CodISIN><CodNegociacao>HGLG11</CodNegociacao><Rendimento>
+    <DataBase>2026-07-31</DataBase><ValorProvento>1.17</ValorProvento>
+    <DataPagamento>2026-08-14</DataPagamento></Rendimento></Provento></InformeRendimentos>
+    </DadosEconomicoFinanceiros>"""
+
+    requests = {"index": 0, "document": 0, "status": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        key = "index" if "pesquisar" in request.url.path else "document"
+        requests[key] += 1
+        return (
+            httpx.Response(200, json=listing)
+            if "pesquisar" in request.url.path
+            else httpx.Response(200, content=xml)
+        )
+
+    def status_handler(_request: httpx.Request) -> httpx.Response:
+        requests["status"] += 1
+        return httpx.Response(
+            200,
+            text='<h3 class="title">CNPJ</h3><strong class="value">11.728.688/0001-47</strong>',
+        )
+
+    settings = Settings(
+        fundos_net_base_url="https://fnet.test",
+        status_invest_base_url="https://status.test",
+    )
+    status_source = StatusInvestIncomeSource(
+        settings,
+        httpx.MockTransport(status_handler),
+    )
+    source = FundosNetIncomeSource(
+        settings,
+        httpx.MockTransport(handler),
+        status_source=status_source,
+    )
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="HGLG11", name="CSHG Logística")],
+        date(2026, 8, 27),
+    )
+    assert len(result.observations) == 1
+    assert result.observations[0].source_version == 2
+    repeated = await asyncio.gather(
+        source.collect(
+            [IncomeInstrumentRequest(ticker="HGLG11", name="CSHG Logística")],
+            date(2026, 8, 27),
+        ),
+        source.collect(
+            [IncomeInstrumentRequest(ticker="HGLG11", name="CSHG Logística")],
+            date(2026, 8, 27),
+        ),
+    )
+    assert all(item.observations for item in repeated)
+    assert result.coverage[0].complete is True
+    assert requests == {"index": 2, "document": 1, "status": 1}
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_targeted_income_survives_malformed_optional_index() -> None:
+    xml = b"""<DadosEconomicoFinanceiros><InformeRendimentos><Provento>
+    <CodISIN>BRJUROCTF002</CodISIN><CodNegociacao>JURO11</CodNegociacao><Rendimento>
+    <DataBase>2026-08-31</DataBase><ValorProvento>1.00</ValorProvento>
+    <DataPagamento>2026-09-15</DataPagamento></Rendimento></Provento></InformeRendimentos>
+    </DadosEconomicoFinanceiros>"""
+
+    class CnpjSource:
+        async def fund_cnpjs(self, _instruments: object) -> dict[str, str]:
+            return {"JURO11": "42730834000100"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "downloadDocumento" in request.url.path:
+            return httpx.Response(200, content=xml)
+        if "cnpj" in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": 1272107, "versao": 1, "status": "AC"}],
+                    "recordsFiltered": 1,
+                },
+            )
+        return httpx.Response(200, text="<html>invalid index</html>")
+
+    source = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(handler),
+        status_source=CnpjSource(),  # type: ignore[arg-type]
+    )
+
+    result = await source.collect(
+        [IncomeInstrumentRequest(ticker="JURO11", isin="BRJUROCTF002")],
+        date(2026, 9, 25),
+    )
+
+    assert len(result.observations) == 1
+    assert result.observations[0].unit_price == Decimal("1")
+    assert result.coverage[0].status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_rows_singleflight_survives_cancelled_waiter() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": "row-1", "dataEntrega": "02/01/2026"}],
+                "recordsFiltered": 1,
+            },
+        )
+
+    source = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(handler),
+    )
+    snapshot_from = date(2026, 1, 1)
+    expected = ([{"id": "row-1", "dataEntrega": "02/01/2026"}], True)
+    async with source._client() as client:
+        first = asyncio.create_task(source._rows_for_cnpj(client, "123", snapshot_from))
+        await started.wait()
+        second = asyncio.create_task(source._rows_for_cnpj(client, "123", snapshot_from))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == expected
+        assert await source._rows_for_cnpj(client, "123", snapshot_from) == expected
+
+    assert calls == 1
+    assert source._fund_row_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_document_singleflight_survives_cancelled_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, content=b"<document/>")
+
+    monkeypatch.setattr(
+        "app.income.sources.parse_fundos_net_xml",
+        lambda *args, **kwargs: [],
+    )
+    source = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(handler),
+    )
+    row = {"id": "doc-1", "versao": 1}
+    async with source._client() as client:
+        first = asyncio.create_task(source._document(client, row))
+        await started.wait()
+        second = asyncio.create_task(source._document(client, row))
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        release.set()
+        assert await second == []
+        assert await source._document(client, row) == []
+
+    assert calls == 1
+    assert source._document_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_fundos_net_source_preserves_empty_and_failed_coverage() -> None:
+    empty = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json={"data": []})),
+    )
+    result = await empty.collect(
+        [IncomeInstrumentRequest(ticker="HGLG11")],
+        date(2026, 8, 27),
+    )
+    assert result.coverage[0].status == "partial"
+    assert result.coverage[0].complete is False
+
+    invalid = FundosNetIncomeSource(
+        Settings(fundos_net_base_url="https://fnet.test"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=[])),
+    )
+    failed = await invalid.collect(
+        [IncomeInstrumentRequest(ticker="HGLG11")],
+        date(2026, 8, 27),
+    )
+    assert failed.coverage[0].status == "failed"
+
+
+def test_source_index_helpers_are_bounded_and_versioned() -> None:
+    rows = [
+        {"id": 1, "descricaoFundo": "CSHG LOGISTICA"},
+        {"id": 2, "descricaoFundo": "OTHER"},
+    ]
+    selected = _fundos_net_candidates(
+        rows,
+        {"HGLG11": IncomeInstrumentRequest(ticker="HGLG11", name="CSHG Logística")},
+        1,
+    )
+    assert [row["id"] for row in selected] == [1]
+
+    cvm = [
+        {"Link_Download": "?numProtocolo=1", "Versao": "1", "Data_Entrega": "2026-01-01"},
+        {"Link_Download": "?numProtocolo=1", "Versao": "2", "Data_Entrega": "2026-01-02"},
+    ]
+    assert _latest_cvm_documents(cvm)[0]["Versao"] == "2"
+    assert _read_cvm_zip(_zip(b"a;b\n1;2\n")) == [{"a": "1", "b": "2"}]
+    with pytest.raises(ValueError, match="exactly one"):
+        _read_cvm_zip(_zip_many())
+
+
+def _zip(content: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("ipe.csv", content)
+    return buffer.getvalue()
+
+
+def _zip_many() -> bytes:
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("first.csv", b"a\n1\n")
+        archive.writestr("second.csv", b"a\n2\n")
+    return buffer.getvalue()
+
+
+def _job_item(state: dict[str, object] | None) -> dict[str, object]:
+    assert state is not None
+    items = state["items"]
+    assert isinstance(items, list) and items
+    item = items[0]
+    assert isinstance(item, dict)
+    return item
+
+
+class _OfficialSource(_Source):
+    name = "official_companies"
+    official = True
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        result = await super().collect(instruments, as_of)
+        return IncomeSourceResult(
+            result.observations,
+            [
+                IncomeSourceCoverage(
+                    source=self.name,
+                    ticker=instrument.ticker,
+                    status="complete",
+                    complete=True,
+                )
+                for instrument in instruments
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_backfill_queues_only_official_sources(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    official = _OfficialSource()
+    complementary = _Source()
+    service = IncomeEventService(store, [official, complementary])
+    request = IncomeEventBackfillRequest(
+        instruments=[
+            IncomeInstrumentRequest(ticker="BBAS3"),
+            IncomeInstrumentRequest(ticker="PETR4"),
+        ],
+    )
+
+    job = await service.backfill(request)
+
+    assert (job.requested, job.queued, job.deduplicated) == (2, 2, 0)
+    state = await service.refresh_job(job.job_id)
+    assert state is not None
+    items = state["items"]
+    assert isinstance(items, list)
+    assert {item["source"] for item in items} == {"official_companies"}
+    assert {item["ticker"] for item in items} == {"BBAS3", "PETR4"}
+
+    assert await service.process_pending_once() == 2
+    assert official.calls == 1
+    assert complementary.calls == 0
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_route_queues_a_single_official_job(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_OfficialSource(), _Source()])
+    app = create_app()
+    app.dependency_overrides[get_income_event_service] = lambda: service
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post(
+            "/v2/income-events/backfill",
+            json={"instruments": [{"ticker": "BBAS3"}, {"ticker": "bbas3"}, {"ticker": "PETR4"}]},
+        )
+        assert accepted.status_code == 202
+        body = accepted.json()
+        assert body["requested"] == 2
+        assert body["queued"] == 2
+
+        await service.process_pending_once()
+        job = await client.get(f"/v2/income-events/refresh-jobs/{body['job_id']}")
+        assert job.status_code == 200
+        assert job.json()["status"] == "completed"
+        assert {item["source"] for item in job.json()["items"]} == {"official_companies"}
+
+        too_many = await client.post(
+            "/v2/income-events/backfill",
+            json={"instruments": [{"ticker": f"T{index:04d}"} for index in range(501)]},
+        )
+        assert too_many.status_code == 422
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_job_deduplicates_and_processes_in_the_background(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    first = await service.refresh_async(request)
+    second = await service.refresh_async(request)
+
+    assert first.queued == 1
+    assert first.deduplicated == 0
+    assert second.queued == 0
+    assert second.deduplicated == 1
+
+    assert await service.process_pending_once() == 1
+    assert source.calls == 1
+    first_job = await service.refresh_job(first.job_id)
+    second_job = await service.refresh_job(second.job_id)
+    assert first_job is not None and first_job["status"] == "completed"
+    assert second_job is not None and second_job["status"] == "completed"
+    batch = await service.batch(IncomeEventBatchRequest(tickers=["BBAS3"]))
+    assert len(batch.events) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_reuses_fresh_coverage_before_queueing(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+    reused = await service.refresh_async(request)
+
+    assert reused.queued == 0
+    assert reused.deduplicated == 0
+    reused_job = await service.refresh_job(reused.job_id)
+    assert reused_job is not None and reused_job["status"] == "completed"
+    assert source.calls == 1
+    coverage = await service.coverage(["BBAS3"])
+    assert coverage.items[0].complete is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_reuses_only_the_same_as_of_job_result(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 18),
+        mode="async",
+    )
+
+    first = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+    same_window = await service.refresh_async(request)
+    other_window = await service.refresh_async(
+        request.model_copy(update={"as_of": date(2026, 9, 19)})
+    )
+
+    assert same_window.queued == 0
+    assert other_window.queued == 1
+    assert await service.process_pending_once() == 1
+    assert source.calls == 2
+    assert (await service.refresh_job(first.job_id) or {})["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_job_retries_only_the_source_without_a_complete_result(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    complete = _Source()
+    complete.name = "complete"
+    failed = _Source(fail=True)
+    failed.name = "failed"
+    service = IncomeEventService(
+        store,
+        [complete, failed],
+        refresh_ttl_seconds=1800,
+        job_max_attempts=1,
+    )
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        as_of=date(2026, 9, 18),
+        mode="async",
+    )
+
+    first = await service.refresh_async(request)
+    assert await service.process_pending_once() == 2
+    assert (await service.refresh_job(first.job_id) or {})["status"] == "partial"
+    second = await service.refresh_async(request)
+    assert second.queued == 1
+    assert await service.process_pending_once() == 1
+    assert complete.calls == 1
+    assert failed.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_result_invalidates_older_complete_reuse(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    as_of = date(2026, 9, 18)
+    first_time = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    await store.create_refresh_job(
+        "complete-job",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=as_of,
+        now=first_time,
+    )
+    first_claim = await store.claim_refresh_items(limit=1, lease_seconds=30, now=first_time)
+    assert first_claim
+    assert await store.complete_refresh_item(
+        "complete-job",
+        "fake",
+        "BBAS3",
+        claim_token=str(first_claim[0]["claim_token"]),
+        now=first_time,
+    )
+
+    failed_time = first_time + timedelta(seconds=1)
+    await store.create_refresh_job(
+        "failed-job",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=as_of,
+        now=failed_time,
+    )
+    failed_claim = await store.claim_refresh_items(limit=1, lease_seconds=30, now=failed_time)
+    assert failed_claim
+    assert await store.fail_refresh_item(
+        "failed-job",
+        "fake",
+        "BBAS3",
+        claim_token=str(failed_claim[0]["claim_token"]),
+        error="source coverage incomplete",
+        now=failed_time,
+    )
+
+    assert (
+        await store.fresh_completed_items(
+            "fake",
+            ["BBAS3"],
+            as_of=as_of,
+            not_before=first_time - timedelta(seconds=1),
+        )
+        == set()
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_requeues_a_failed_item_with_backoff(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(fail=True)
+    service = IncomeEventService(store, [source], job_max_attempts=3)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    job = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+
+    state = await service.refresh_job(job.job_id)
+    item = _job_item(state)
+    assert state is not None
+    assert state["status"] == "running"
+    assert state["failed"] == 0
+    assert item["status"] == "queued"
+    assert item["attempts"] == 1
+    assert item["last_error"] == "offline"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_marks_an_exhausted_item_as_failed(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(fail=True)
+    service = IncomeEventService(store, [source], job_max_attempts=1)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+
+    job = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+
+    state = await service.refresh_job(job.job_id)
+    item = _job_item(state)
+    assert state is not None
+    assert state["status"] == "partial"
+    assert state["failed"] == 1
+    assert item["status"] == "failed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_async_job_persists_and_reconstructs_instrument_identity(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _IdentitySource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="bbas3", isin="br-id", name="Banco")],
+        mode="async",
+    )
+
+    accepted = await service.refresh_async(request)
+    queued = await service.refresh_job(accepted.job_id)
+    assert queued is not None
+    queued_item = _job_item(queued)
+    assert queued_item["isin"] == "BR-ID"
+    assert queued_item["name"] == "Banco"
+
+    assert await service.process_pending_once() == 1
+    assert source.requested[0][0] == request.instruments[0].model_copy(
+        update={"ticker": "BBAS3", "isin": "BR-ID"}
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_deduplicated_job_waits_for_owner_and_does_not_duplicate_source_call(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _GatedSource()
+    service = IncomeEventService(store, [source])
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+    )
+
+    owner = await service.refresh_async(request)
+    follower = await service.refresh_async(request)
+    assert follower.status == "queued"
+    waiting = await service.refresh_job(follower.job_id)
+    assert waiting is not None and _job_item(waiting)["status"] == "waiting"
+
+    processing = asyncio.create_task(service.process_pending_once())
+    await source.started.wait()
+    await asyncio.sleep(0)
+    still_waiting = await service.refresh_job(follower.job_id)
+    assert still_waiting is not None and still_waiting["status"] == "queued"
+    source.release.set()
+    assert await processing == 1
+    finished = await service.refresh_job(follower.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    assert source.calls == 1
+    del owner
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_deduplicates_without_identity_payload_as_waiting_dependency(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    now = datetime.now(UTC)
+    assert (
+        await store.create_refresh_job(
+            "owner",
+            [("fake", "BBAS3")],
+            requested=1,
+            as_of=now.date(),
+            now=now,
+        )
+        == 1
+    )
+    assert (
+        await store.create_refresh_job(
+            "follower",
+            [("fake", "BBAS3")],
+            requested=1,
+            as_of=now.date(),
+            now=now,
+        )
+        == 0
+    )
+    follower = await store.refresh_job("follower")
+    assert follower is not None
+    assert _job_item(follower)["status"] == "waiting"
+    assert await store.pending_refresh_item_count("follower") == 1
+
+    claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert [(item["job_id"], item["ticker"]) for item in claimed] == [("owner", "BBAS3")]
+    assert await store.complete_refresh_item("owner", "fake", "BBAS3", now=now)
+    follower = await store.refresh_job("follower")
+    assert follower is not None
+    assert _job_item(follower)["status"] == "complete"
+    assert await store.pending_refresh_item_count("follower") == 0
+    assert await store.refresh_item_owned("follower", "fake", "BBAS3", claim_token=None)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_multiple_followers_fail_together_without_promoting_duplicate_claims(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source(fail=True)
+    service = IncomeEventService(store, [source], job_max_attempts=1)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+    )
+    jobs = [await service.refresh_async(request) for _ in range(3)]
+
+    assert await service.process_pending_once() == 1
+    states = [await service.refresh_job(job.job_id) for job in jobs]
+    assert all(state is not None and state["status"] == "partial" for state in states)
+    assert all(state is not None and _job_item(state)["status"] == "failed" for state in states)
+    assert source.calls == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_coverage_retries_then_completes_empty_snapshot(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _CoverageSequenceSource()
+    service = IncomeEventService(store, [source], job_max_attempts=2)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+    )
+    job = await service.refresh_async(request)
+    assert await service.process_pending_once() == 1
+    first = await service.refresh_job(job.job_id)
+    assert first is not None and first["status"] == "running"
+    assert _job_item(first)["status"] == "queued"
+
+    await store.requeue_refresh_item(
+        job.job_id,
+        source.name,
+        "BBAS3",
+        error="test",
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+        now=datetime.now(UTC),
+    )
+    source.complete = True
+    assert await service.process_pending_once() == 1
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    assert _job_item(finished)["status"] == "complete"
+    assert source.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_skips_source_persistence_and_terminal_write(tmp_path: Path) -> None:
+    store = _OwnershipLostStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source])
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    state = await service.refresh_job(job.job_id)
+    assert state is not None
+    assert state["status"] == "running"
+    assert _job_item(state)["status"] == "running"
+    assert await store.observations(["BBAS3"]) == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_retries_as_sanitized_item_error(tmp_path: Path) -> None:
+    store = _FailingCoverageStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], job_max_attempts=1)
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    state = await service.refresh_job(job.job_id)
+    assert state is not None and state["status"] == "partial"
+    item = _job_item(state)
+    assert item["status"] == "failed"
+    assert item["last_error"] == "observation persistence failed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_job_heartbeat_renews_during_collect_and_stops_cleanly(tmp_path: Path) -> None:
+    store = _HeartbeatRecordingStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _GatedSource()
+    service = IncomeEventService(store, [source], job_lease_seconds=1)
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+    processing = asyncio.create_task(service.process_pending_once())
+    await source.started.wait()
+    await asyncio.wait_for(store.renewed.wait(), timeout=1)
+    source.release.set()
+    assert await processing == 1
+
+    stop = asyncio.Event()
+    heartbeat = asyncio.create_task(service._heartbeat_items([], {}, stop))
+    await asyncio.sleep(0)
+    stop.set()
+    await heartbeat
+    state = await service.refresh_job(job.job_id)
+    assert state is not None and state["status"] == "completed"
+    await service._publish_finished_job(job.job_id, _seen={job.job_id})
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fast_source_publishes_before_slow_source_page_finishes(tmp_path: Path) -> None:
+    store = _PublishRecordingStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    fast = _Source()
+    fast.name = "fast"
+    fast.snapshot_sources = ("fast",)
+    slow = _SlowSource()
+    slow.name = "slow"
+    slow.snapshot_sources = ("slow",)
+    service = IncomeEventService(store, [fast, slow])
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    processing = asyncio.create_task(service.process_pending_once())
+    await slow.started.wait()
+    try:
+        await asyncio.wait_for(store.published.wait(), timeout=1)
+        assert store.publish_calls
+        assert any("BBAS3" in tickers for tickers in store.publish_calls)
+    finally:
+        slow.release.set()
+    assert await processing == 2
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_item_is_finalized_after_transient_publication_failure(
+    tmp_path: Path,
+) -> None:
+    store = _FlakyPublishStore(tmp_path / "income.sqlite3", failures=3)
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source])
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    first = await service.refresh_job(job.job_id)
+    assert first is not None
+    assert first["status"] == "running"
+    assert _job_item(first)["status"] == "complete"
+    assert source.calls == 1
+
+    # The second drain claims no source work, but the durable finalization scan
+    # retries the publish and closes the job.
+    assert await service.process_pending_once() == 0
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_empty_job_keeps_requested_ticker_identity(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _IdentitySource()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    await store.save_coverage(
+        [IncomeSourceCoverage(source=source.name, ticker="BBAS3", status="empty", complete=True)]
+    )
+
+    accepted = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3", isin="BR-ID", name="Banco")],
+            mode="async",
+        )
+    )
+    state = await service.refresh_job(accepted.job_id)
+    assert accepted.status == "completed"
+    assert state is not None and state["tickers"] == ["BBAS3"] and state["items"] == []
+    assert source.requested == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_as_of_does_not_reuse_unprovenanced_empty_coverage(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _IdentitySource()
+    service = IncomeEventService(store, [source], refresh_ttl_seconds=1800)
+    await store.save_coverage(
+        [IncomeSourceCoverage(source=source.name, ticker="BBAS3", status="empty", complete=True)]
+    )
+
+    accepted = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+            as_of=date(2026, 9, 18),
+            mode="async",
+        )
+    )
+    assert accepted.queued == 1
+    assert await service.process_pending_once() == 1
+    assert source.requested
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_is_fenced_and_heartbeat_renews_active_claim(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    claim_time = datetime(2026, 9, 1, tzinfo=UTC)
+    await store.create_refresh_job(
+        "job-fence",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=claim_time.date(),
+        now=claim_time,
+    )
+    first = await store.claim_refresh_items(limit=1, lease_seconds=1, now=claim_time)
+    assert first and first[0]["claim_token"]
+    assert await store.renew_refresh_item(
+        "job-fence",
+        "fake",
+        "BBAS3",
+        claim_token=str(first[0]["claim_token"]),
+        lease_seconds=2,
+        now=claim_time + timedelta(milliseconds=900),
+    )
+    assert (
+        await store.claim_refresh_items(
+            limit=1,
+            lease_seconds=1,
+            now=claim_time + timedelta(seconds=1),
+        )
+        == []
+    )
+    second = await store.claim_refresh_items(
+        limit=1,
+        lease_seconds=1,
+        now=claim_time + timedelta(seconds=4),
+    )
+    assert second and second[0]["claim_token"] != first[0]["claim_token"]
+    assert not await store.complete_refresh_item(
+        "job-fence",
+        "fake",
+        "BBAS3",
+        claim_token=str(first[0]["claim_token"]),
+        now=claim_time + timedelta(seconds=4),
+    )
+    assert await store.complete_refresh_item(
+        "job-fence",
+        "fake",
+        "BBAS3",
+        claim_token=str(second[0]["claim_token"]),
+        now=claim_time + timedelta(seconds=4),
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_deferral_compensates_attempt_and_requires_current_claim_token(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    await store.create_refresh_job(
+        "job-busy",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+    claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert claimed and claimed[0]["claim_token"]
+    token = str(claimed[0]["claim_token"])
+
+    assert not await store.defer_refresh_item(
+        "job-busy",
+        "fake",
+        "BBAS3",
+        error="source page still draining",
+        available_at=now + timedelta(seconds=5),
+        now=now,
+        claim_token="stale-token",
+    )
+    running = await store.refresh_job("job-busy")
+    assert running is not None and _job_item(running)["status"] == "running"
+    assert _job_item(running)["attempts"] == 1
+
+    assert await store.defer_refresh_item(
+        "job-busy",
+        "fake",
+        "BBAS3",
+        error="source page still draining",
+        available_at=now + timedelta(seconds=5),
+        now=now,
+        claim_token=token,
+    )
+    queued = await store.refresh_job("job-busy")
+    assert queued is not None
+    item = _job_item(queued)
+    assert item["status"] == "queued"
+    assert item["attempts"] == 0
+    assert item["last_error"] == "source page still draining"
+    assert await store.claim_refresh_items(limit=1, lease_seconds=30, now=now) == []
+
+    # Compatibility callers may not have a fencing token in their lightweight
+    # claim rows; the running-state predicate still prevents deferring a
+    # terminal successor and compensates the claim attempt.
+    await store.create_refresh_job(
+        "job-busy-legacy",
+        [("legacy", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+    legacy_claim = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert legacy_claim and legacy_claim[0]["claim_token"]
+    assert await store.defer_refresh_item(
+        "job-busy-legacy",
+        "legacy",
+        "BBAS3",
+        error="legacy source page still draining",
+        available_at=now + timedelta(seconds=5),
+        now=now,
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_page_timeout_bounds_retry_calls_and_close_drains_source(
+    tmp_path: Path,
+) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _SlowSource()
+    service = IncomeEventService(
+        store,
+        [source],
+        job_page_timeout_seconds=0.01,
+        job_max_attempts=2,
+    )
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    await source.started.wait()
+    assert len(service._detached_source_tasks) == 1
+
+    # A retry remains queued while the timed-out provider call is still
+    # draining, so it does not consume another claim or provider call.
+    now = datetime.now(UTC)
+    await store.requeue_refresh_item(
+        job.job_id,
+        source.name,
+        "BBAS3",
+        error="page timeout",
+        available_at=now,
+        now=now,
+    )
+    assert await service.process_pending_once() == 0
+    assert source.calls == 0
+    assert len(service._detached_source_tasks) == 1
+
+    closing = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    # The store remains usable while close waits for the provider task.
+    assert await store.cursor() == 0
+
+    source.release.set()
+    await asyncio.wait_for(closing, timeout=1)
+    assert source.calls == 1
+    assert not service._detached_source_tasks
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_source_resumes_after_drain_without_burning_attempts(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _SlowSource()
+    service = IncomeEventService(
+        store,
+        [source],
+        job_page_timeout_seconds=0.01,
+        job_max_attempts=2,
+        source_busy_backoff_seconds=0.01,
+    )
+    job = await service.refresh_async(
+        IncomeEventRefreshRequest(
+            instruments=[IncomeInstrumentRequest(ticker="BBAS3")], mode="async"
+        )
+    )
+
+    assert await service.process_pending_once() == 1
+    await source.started.wait()
+    assert len(service._detached_source_tasks) == 1
+    # Make the first timeout retry immediately eligible; the worker excludes
+    # the busy source in SQL and leaves this row untouched.
+    now = datetime.now(UTC)
+    await store.requeue_refresh_item(
+        job.job_id,
+        source.name,
+        "BBAS3",
+        error="page timeout",
+        available_at=now,
+        now=now,
+    )
+    assert await service.process_pending_once() == 0
+    deferred = await service.refresh_job(job.job_id)
+    assert deferred is not None
+    assert _job_item(deferred)["status"] == "queued"
+    # The initial timeout consumed the first attempt; the busy observation
+    # must leave that budget unchanged.
+    assert _job_item(deferred)["attempts"] == 1
+
+    source.release.set()
+    for _ in range(100):
+        if not service._busy_sources:
+            break
+        await asyncio.sleep(0.01)
+    assert not service._busy_sources
+    await asyncio.sleep(0.02)
+    assert await service.process_pending_once() == 1
+    finished = await service.refresh_job(job.job_id)
+    assert finished is not None and finished["status"] == "completed"
+    assert _job_item(finished)["attempts"] == 2
+    # One call is the timed-out producer that drained in the background; the
+    # queued item then resumes with one fresh call after the source is idle.
+    assert source.calls == 2
+    await service.close()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_excludes_busy_sources_without_mutating_their_rows(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    await store.create_refresh_job(
+        "busy-job",
+        [("busy", "BBAS3")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+    await store.create_refresh_job(
+        "free-job",
+        [("free", "PETR4")],
+        requested=1,
+        as_of=now.date(),
+        now=now,
+    )
+
+    before = _job_item(await store.refresh_job("busy-job"))
+    claimed = await store.claim_refresh_items(
+        limit=10,
+        lease_seconds=30,
+        now=now,
+        excluded_sources=frozenset({"busy"}),
+    )
+    assert [(item["job_id"], item["source"]) for item in claimed] == [("free-job", "free")]
+    after = _job_item(await store.refresh_job("busy-job"))
+    assert after == before
+
+    # An expired queued lease is also left untouched while excluded; once the
+    # source is eligible again it is reclaimed and its attempt advances once.
+    assert await store.requeue_refresh_item(
+        "busy-job",
+        "busy",
+        "BBAS3",
+        error="page timeout",
+        available_at=now - timedelta(seconds=1),
+        now=now,
+    )
+    stale_before = _job_item(await store.refresh_job("busy-job"))
+    assert (
+        await store.claim_refresh_items(
+            limit=10,
+            lease_seconds=30,
+            now=now,
+            excluded_sources={"busy"},
+        )
+        == []
+    )
+    assert _job_item(await store.refresh_job("busy-job")) == stale_before
+    reclaimed = await store.claim_refresh_items(limit=10, lease_seconds=30, now=now)
+    assert [(item["job_id"], item["source"], item["attempts"]) for item in reclaimed] == [
+        ("busy-job", "busy", 1)
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_job_store_upgrades_identity_columns_additively(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE income_refresh_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                requested INTEGER NOT NULL,
+                as_of TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE income_refresh_job_items (
+                job_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_until TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (job_id, source, ticker)
+            );
+            """
+        )
+
+    store = IncomeEventStore(path)
+    await store.startup()
+    state = await store.create_refresh_job(
+        "job-upgraded",
+        [("fake", "BBAS3", "BR-ID", "Banco")],
+        requested=1,
+        as_of=date(2026, 9, 1),
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+        requested_instruments=[IncomeInstrumentRequest(ticker="BBAS3", isin="BR-ID", name="Banco")],
+    )
+    assert state == 1
+    job = await store.refresh_job("job-upgraded")
+    assert job is not None
+    job_item = _job_item(job)
+    assert job_item["isin"] == "BR-ID"
+    assert job_item["name"] == "Banco"
+    assert job["tickers"] == ["BBAS3"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_reuse_index_is_restored_on_reopen_without_changing_results(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "income.sqlite3"
+    store = IncomeEventStore(path)
+    await store.startup()
+    as_of = date(2026, 9, 18)
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    await store.create_refresh_job(
+        "indexed-job",
+        [("fake", "BBAS3")],
+        requested=1,
+        as_of=as_of,
+        now=now,
+    )
+    claimed = await store.claim_refresh_items(limit=1, lease_seconds=30, now=now)
+    assert claimed
+    assert await store.complete_refresh_item(
+        "indexed-job",
+        "fake",
+        "BBAS3",
+        claim_token=str(claimed[0]["claim_token"]),
+        now=now,
+    )
+    before = await store.fresh_completed_items(
+        "fake",
+        ["BBAS3"],
+        as_of=as_of,
+        not_before=now - timedelta(seconds=1),
+    )
+    await store.close()
+
+    # Simulate a pre-index database; startup must add the index through the
+    # existing idempotent schema setup without changing the lookup result.
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("DROP INDEX ix_income_refresh_item_source_ticker_status_updated")
+
+    reopened = IncomeEventStore(path)
+    await reopened.startup()
+    after = await reopened.fresh_completed_items(
+        "fake",
+        ["BBAS3"],
+        as_of=as_of,
+        not_before=now - timedelta(seconds=1),
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        index_names = {
+            str(row[1]) for row in connection.execute("PRAGMA index_list(income_refresh_job_items)")
+        }
+    assert before == after == {"BBAS3"}
+    assert "ix_income_refresh_item_source_ticker_status_updated" in index_names
+    assert (
+        await reopened.fresh_empty_coverage("fake", [], not_before=now - timedelta(seconds=1))
+        == set()
+    )
+    assert (
+        await reopened.fresh_completed_items(
+            "fake", [], as_of=as_of, not_before=now - timedelta(seconds=1)
+        )
+        == set()
+    )
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_income_refresh_job_and_coverage_routes(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_Source()])
+    app = create_app()
+    app.dependency_overrides[get_income_event_service] = lambda: service
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post(
+            "/v2/income-events/refresh",
+            json={"instruments": [{"ticker": "BBAS3"}], "mode": "async"},
+        )
+        assert accepted.status_code == 202
+        body = accepted.json()
+        assert body["queued"] == 1
+
+        await service.process_pending_once()
+        job = await client.get(f"/v2/income-events/refresh-jobs/{body['job_id']}")
+        assert job.status_code == 200
+        assert job.json()["status"] == "completed"
+        missing = await client.get("/v2/income-events/refresh-jobs/deadbeef")
+        assert missing.status_code == 404
+
+        coverage = await client.get(
+            "/v2/income-events/coverage",
+            params={"tickers": "BBAS3,bbas3"},
+        )
+        assert coverage.status_code == 200
+        assert coverage.json()["items"][0]["complete"] is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_processes_a_queued_job_after_startup(tmp_path: Path) -> None:
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    source = _Source()
+    service = IncomeEventService(store, [source], worker_poll_seconds=0.01)
+    request = IncomeEventRefreshRequest(
+        instruments=[IncomeInstrumentRequest(ticker="BBAS3")],
+        mode="async",
+    )
+    await service.startup()
+    try:
+        job = await service.refresh_async(request)
+        state = None
+        for _ in range(200):
+            state = await service.refresh_job(job.job_id)
+            if state is not None and state["status"] in {"completed", "partial"}:
+                break
+            await asyncio.sleep(0.01)
+        assert state is not None and state["status"] == "completed"
+        assert source.calls == 1
+    finally:
+        await service.close()
+    assert await store.coverage([]) == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_items_whose_source_is_unknown(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from app.income.store import ITEM_FAILED
+
+    store = IncomeEventStore(tmp_path / "income.sqlite3")
+    await store.startup()
+    service = IncomeEventService(store, [_Source()])
+    created = await store.create_refresh_job(
+        "job-ghost",
+        [("ghost", "BBAS3")],
+        requested=1,
+        as_of=date(2026, 9, 1),
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    assert created == 1
+    assert await service.process_pending_once() == 1
+    state = await service.refresh_job("job-ghost")
+    item = _job_item(state)
+    assert item["status"] == ITEM_FAILED
+    assert state is not None and state["status"] == "partial"
+    await store.close()

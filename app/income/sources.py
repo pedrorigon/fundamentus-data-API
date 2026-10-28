@@ -1,0 +1,1476 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import csv
+import hashlib
+import io
+import json
+import re
+import sys
+import time
+import unicodedata
+from collections.abc import Awaitable, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Any, Protocol
+
+import httpx
+from pypdf import PdfReader
+
+from app.config import Settings
+from app.core.archive_safety import open_validated_zip, read_bounded_body
+from app.core.errors import APIError
+from app.income.parsers import (
+    parse_b3_income_events,
+    parse_cvm_income_adjustment_text,
+    parse_cvm_income_report_text,
+    parse_fundos_net_xml,
+    parse_status_invest_income_events,
+)
+from app.models import Dividend, InstrumentMetadata
+from app.models.income_events import (
+    IncomeEventObservation,
+    IncomeInstrumentRequest,
+    IncomeSourceCoverage,
+)
+from app.parsers.status_invest import parse_status_invest_cnpj
+from app.services.assets import AssetService
+from app.services.opportunity import B3InstrumentProvider
+
+
+@dataclass(frozen=True)
+class IncomeSourceResult:
+    observations: list[IncomeEventObservation]
+    coverage: list[IncomeSourceCoverage]
+
+
+@dataclass(frozen=True)
+class _OfficialCollectionResult:
+    observations: list[IncomeEventObservation]
+    complete: bool = True
+    detail: str | None = None
+
+
+class IncomeSource(Protocol):
+    name: str
+    snapshot_sources: tuple[str, ...]
+    #: Official publications are the only sources a bulk backfill collects.
+    official: bool
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult: ...
+
+
+class InstrumentIdentityProvider(Protocol):
+    """Authoritative ticker-to-instrument identity lookup."""
+
+    async def get(self, ticker: str) -> InstrumentMetadata | None: ...
+
+
+def _cleanup_shared_task[Key, Value](
+    tasks: dict[Key, asyncio.Task[Value]],
+    key: Key,
+    task: asyncio.Future[Value],
+) -> None:
+    """Remove a completed owner and mark an unobserved failure as retrieved."""
+    if tasks.get(key) is task:
+        tasks.pop(key, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _drain_shared_tasks[Key, Value](
+    tasks: dict[Key, asyncio.Task[Value]],
+    lock: asyncio.Lock,
+) -> None:
+    """Keep a request client alive until its shared producers have finished."""
+    async with lock:
+        pending = tuple(tasks.values())
+    if pending:
+        await asyncio.gather(
+            *(asyncio.shield(task) for task in pending),
+            return_exceptions=True,
+        )
+        # Done callbacks remove the task from the ownership map on the next loop
+        # turn. Let them run before the request-scoped client is closed.
+        await asyncio.sleep(0)
+
+
+async def _await_until[Value](
+    awaitable: Awaitable[Value],
+    deadline: float | None,
+) -> Value:
+    """Await work until an absolute monotonic deadline, if one is set."""
+
+    if deadline is None:
+        return await awaitable
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise TimeoutError("income source deadline exceeded")
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
+async def _cancel_tasks(tasks: Sequence[asyncio.Task[object]]) -> None:
+    """Cancel owned waiter tasks and retrieve their results before returning."""
+
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+class FundamentusIncomeSource:
+    name = "fundamentus"
+    official = False
+    snapshot_sources: tuple[str, ...] = ("fundamentus",)
+
+    def __init__(self, assets: AssetService) -> None:
+        self.assets = assets
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        del as_of
+        results = await asyncio.gather(
+            *(self._instrument(item) for item in instruments),
+            return_exceptions=True,
+        )
+        return _instrument_results(self.name, instruments, results)
+
+    async def _instrument(
+        self, instrument: IncomeInstrumentRequest
+    ) -> list[IncomeEventObservation]:
+        dividends, _cached = await self.assets.get_dividends(
+            instrument.ticker,
+            force_refresh=True,
+        )
+        return [
+            _fundamentus_observation(instrument, item, ordinal)
+            for ordinal, item in enumerate(dividends)
+            if _usable_dividend(item)
+        ]
+
+
+class StatusInvestIncomeSource:
+    name = "status_invest"
+    official = False
+    snapshot_sources: tuple[str, ...] = ("status_invest",)
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self._profiles: dict[str, tuple[float, str]] = {}
+        self._profile_tasks: dict[str, asyncio.Task[str]] = {}
+        self._profile_lock = asyncio.Lock()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        del as_of
+        async with self._client() as client:
+            try:
+                results = await asyncio.gather(
+                    *(self._instrument(client, item) for item in instruments),
+                    return_exceptions=True,
+                )
+            finally:
+                await _drain_shared_tasks(self._profile_tasks, self._profile_lock)
+        return _instrument_results(self.name, instruments, results)
+
+    async def fund_cnpjs(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+    ) -> dict[str, str]:
+        funds = [item for item in instruments if item.ticker.upper().endswith("11")]
+        if not funds:
+            return {}
+        async with self._client() as client:
+            try:
+                pages = await asyncio.gather(
+                    *(self._profile_html(client, item) for item in funds),
+                    return_exceptions=True,
+                )
+            finally:
+                await _drain_shared_tasks(self._profile_tasks, self._profile_lock)
+        return {
+            instrument.ticker: cnpj
+            for instrument, page in zip(funds, pages, strict=True)
+            if isinstance(page, str) and (cnpj := parse_status_invest_cnpj(page)) is not None
+        }
+
+    async def _instrument(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+    ) -> list[IncomeEventObservation]:
+        html = await self._profile_html(client, instrument)
+        return parse_status_invest_income_events(html, ticker=instrument.ticker) if html else []
+
+    async def _profile_html(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+    ) -> str:
+        ticker = instrument.ticker.upper()
+        async with self._profile_lock:
+            cached = self._profiles.get(ticker)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._profile_tasks.get(ticker)
+            if task is None:
+                task = asyncio.create_task(
+                    self._fetch_and_cache_profile(client, ticker, instrument)
+                )
+                self._profile_tasks[ticker] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._profile_tasks,
+                        ticker,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_profile(
+        self,
+        client: httpx.AsyncClient,
+        ticker: str,
+        instrument: IncomeInstrumentRequest,
+    ) -> str:
+        html = await self._fetch_profile_html(client, instrument)
+        async with self._profile_lock:
+            self._profiles[ticker] = (time.monotonic(), html)
+            _trim_ttl_cache(self._profiles, self.settings.ticker_cache_max_entries)
+        return html
+
+    async def _fetch_profile_html(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+    ) -> str:
+        for asset_type in ("fundos-imobiliarios", "acoes"):
+            response = await client.get(f"/{asset_type}/{instrument.ticker.lower()}")
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            return response.text
+        return ""
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.settings.status_invest_base_url,
+            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
+            limits=_limits(self.settings),
+            follow_redirects=True,
+            headers={
+                "Accept": "text/html",
+                "Accept-Language": "pt-BR,pt;q=0.9",
+                "User-Agent": self.settings.user_agent,
+            },
+            transport=self.transport,
+        )
+
+
+class OfficialCompanyIncomeSource:
+    name = "official_companies"
+    official = True
+    snapshot_sources: tuple[str, ...] = ("b3", "cvm")
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        identity_provider: InstrumentIdentityProvider | None = None,
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self._identity_provider = identity_provider or B3InstrumentProvider(settings, transport)
+        self._source_total_timeout_seconds = min(
+            max(settings.income_source_total_timeout_seconds, 0.1),
+            max(getattr(settings, "income_job_page_timeout_seconds", 180.0) - 1.0, 0.1),
+        )
+        self._cvm_index: dict[int, tuple[float, list[dict[str, str]]]] = {}
+        self._cvm_lock = asyncio.Lock()
+        self._cvm_documents: dict[str, tuple[float, str]] = {}
+        self._cvm_document_sizes: dict[str, int] = {}
+        self._cvm_document_cache_bytes = 0
+        self._cvm_document_cache_max_bytes = max(
+            settings.cvm_income_document_cache_max_bytes,
+            1,
+        )
+        self._cvm_document_tasks: dict[str, asyncio.Task[str]] = {}
+        self._cvm_document_lock = asyncio.Lock()
+        self._cvm_download_semaphore = asyncio.Semaphore(
+            min(max(settings.upstream_concurrency, 1), 2)
+        )
+        # One B3 listed-company payload covers every share class of an issuer,
+        # so a bulk backfill reads each issuer once per index window.
+        self._b3_payloads: dict[str, tuple[float, Any]] = {}
+        self._b3_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._b3_lock = asyncio.Lock()
+        self._identity_tasks: dict[str, asyncio.Task[InstrumentMetadata | None]] = {}
+        self._identity_lock = asyncio.Lock()
+        self._identity_semaphore = asyncio.Semaphore(max(settings.upstream_concurrency, 1))
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        deadline = time.monotonic() + self._source_total_timeout_seconds
+        async with self._client() as client:
+            tasks = [
+                asyncio.create_task(self._instrument(client, item, as_of, deadline=deadline))
+                for item in instruments
+            ]
+            try:
+                # Each asynchronous upstream boundary receives the same
+                # absolute deadline.  Let instrument tasks finish their
+                # partial-result cleanup so completed documents are retained;
+                # bounded synchronous parsing remains non-preemptive.
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                await _cancel_tasks(tasks)
+            results = list(gathered)
+        return _official_results(self.name, instruments, results)
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.settings.cvm_request_timeout_seconds),
+            limits=_limits(self.settings),
+            follow_redirects=True,
+            headers={
+                "Accept": "application/json,application/pdf",
+                "User-Agent": self.settings.user_agent,
+            },
+            transport=self.transport,
+        )
+
+    async def _instrument(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+        as_of: date,
+        *,
+        deadline: float | None = None,
+    ) -> _OfficialCollectionResult:
+        b3_payload = await self._b3_payload(client, instrument.ticker, deadline=deadline)
+        inferred_isin = (
+            _fund_unit_isin_among_subscription_rights(b3_payload)
+            if instrument.isin is None
+            else None
+        )
+        requested_isin = instrument.isin or inferred_isin
+        if requested_isin is None and _distinct_b3_isins(b3_payload) > 1:
+            requested_isin = await self._resolve_ambiguous_isin(
+                instrument.ticker,
+                b3_payload,
+                deadline=deadline,
+            )
+        effective_instrument = (
+            instrument
+            if requested_isin == instrument.isin
+            else instrument.model_copy(update={"isin": requested_isin})
+        )
+        b3_events, cvm_code = parse_b3_income_events(
+            b3_payload,
+            ticker=instrument.ticker,
+            requested_isin=requested_isin,
+        )
+        if cvm_code is None:
+            return _OfficialCollectionResult(b3_events)
+        try:
+            cvm_result = await self._cvm_events(
+                client,
+                effective_instrument,
+                cvm_code,
+                as_of,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            return _OfficialCollectionResult(
+                b3_events,
+                complete=False,
+                detail="official income source deadline exceeded while loading CVM data",
+            )
+        return _OfficialCollectionResult(
+            [*b3_events, *cvm_result.observations],
+            complete=cvm_result.complete,
+            detail=cvm_result.detail,
+        )
+
+    async def _resolve_ambiguous_isin(
+        self,
+        ticker: str,
+        payload: Any,
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        try:
+            metadata = await self._instrument_identity(ticker, deadline=deadline)
+        except APIError as exc:
+            raise ValueError(
+                f"B3 returned multiple ISINs for {ticker}; "
+                f"authoritative identity lookup failed ({exc.code})"
+            ) from exc
+        if metadata is not None and metadata.ticker.upper() != ticker.upper():
+            raise ValueError(f"B3 identity for {ticker} returned metadata for {metadata.ticker}")
+        resolved_isin = (metadata.isin if metadata is not None else None) or ""
+        resolved_isin = resolved_isin.strip().upper()
+        if not resolved_isin:
+            raise ValueError(
+                f"B3 returned multiple ISINs for {ticker}; "
+                "authoritative identity did not return an ISIN"
+            )
+        if _debt_isin(resolved_isin):
+            raise ValueError(f"B3 identity for {ticker} resolved to debenture ISIN {resolved_isin}")
+        if resolved_isin not in _b3_isins(payload):
+            raise ValueError(
+                f"B3 identity for {ticker} resolved to ISIN {resolved_isin}, "
+                "which is absent from the issuer income payload"
+            )
+        return resolved_isin
+
+    async def _instrument_identity(
+        self,
+        ticker: str,
+        *,
+        deadline: float | None = None,
+    ) -> InstrumentMetadata | None:
+        key = ticker.upper()
+        await _await_until(self._identity_lock.acquire(), deadline)
+        try:
+            task = self._identity_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(self._fetch_instrument_identity(key, deadline=deadline))
+                self._identity_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._identity_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        finally:
+            self._identity_lock.release()
+        return await _await_until(asyncio.shield(task), deadline)
+
+    async def _fetch_instrument_identity(
+        self,
+        ticker: str,
+        *,
+        deadline: float | None = None,
+    ) -> InstrumentMetadata | None:
+        producer_deadline = deadline or (
+            time.monotonic() + max(self.settings.cvm_request_timeout_seconds, 0.1)
+        )
+        await _await_until(self._identity_semaphore.acquire(), producer_deadline)
+        try:
+            return await _await_until(
+                self._identity_provider.get(ticker),
+                producer_deadline,
+            )
+        finally:
+            self._identity_semaphore.release()
+
+    async def _b3_payload(
+        self,
+        client: httpx.AsyncClient,
+        ticker: str,
+        *,
+        deadline: float | None = None,
+    ) -> Any:
+        del client
+        issuer = _issuer_code(ticker)
+        await _await_until(self._b3_lock.acquire(), deadline)
+        try:
+            cached = self._b3_payloads.get(issuer)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._b3_tasks.get(issuer)
+            if task is None:
+                task = asyncio.create_task(self._fetch_b3_payload(issuer, deadline=deadline))
+                self._b3_tasks[issuer] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._b3_tasks,
+                        issuer,
+                        completed,
+                    )
+                )
+        finally:
+            self._b3_lock.release()
+        return await _await_until(asyncio.shield(task), deadline)
+
+    async def _fetch_b3_payload(
+        self,
+        issuer: str,
+        *,
+        deadline: float | None = None,
+    ) -> Any:
+        encoded = base64.b64encode(
+            json.dumps(
+                {"language": "pt-br", "issuingCompany": issuer}, separators=(",", ":")
+            ).encode()
+        ).decode()
+        endpoint = f"/CompanyCall/GetListedSupplementCompany/{encoded}"
+        url = f"{self.settings.b3_listed_companies_base_url.rstrip('/')}{endpoint}"
+        async with self._client() as client:
+            response = await _await_until(client.get(url), deadline)
+            if response.status_code == 404:
+                payload: Any = []
+            else:
+                response.raise_for_status()
+                raw = response.json()
+                payload = json.loads(raw) if isinstance(raw, str) else raw
+        async with self._b3_lock:
+            self._b3_payloads[issuer] = (time.monotonic(), payload)
+            _trim_ttl_cache(self._b3_payloads, self.settings.ticker_cache_max_entries)
+        return payload
+
+    async def _cvm_events(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+        cvm_code: str,
+        as_of: date,
+        *,
+        deadline: float | None = None,
+    ) -> _OfficialCollectionResult:
+        years = list(dict.fromkeys((as_of.year, as_of.year - 1)))
+        rows: list[dict[str, str]] = []
+        for year in years:
+            rows.extend(
+                await _await_until(
+                    self._cvm_rows(
+                        client,
+                        year,
+                        deadline=deadline,
+                    ),
+                    deadline,
+                )
+            )
+        company_rows = [
+            row for row in rows if row.get("Codigo_CVM", "").lstrip("0") == cvm_code.lstrip("0")
+        ]
+        reports = [
+            row for row in company_rows if _fold(row.get("Categoria", "")) == "RELATORIO PROVENTOS"
+        ]
+        adjustments = [row for row in company_rows if _cvm_income_adjustment(row)]
+        latest = [
+            *_latest_cvm_documents(reports, limit=24),
+            *_latest_cvm_documents(adjustments, limit=12),
+        ]
+        if not latest:
+            return _OfficialCollectionResult([])
+        tasks = [
+            asyncio.create_task(
+                self._cvm_document(
+                    client,
+                    instrument,
+                    row,
+                    deadline=deadline,
+                )
+            )
+            for row in latest
+        ]
+        done: set[asyncio.Task[list[IncomeEventObservation]]] = set()
+        timed_out = False
+        try:
+            done, _pending = await asyncio.wait(
+                tasks,
+                timeout=(max(deadline - time.monotonic(), 0) if deadline is not None else None),
+            )
+            timed_out = len(done) < len(tasks)
+        finally:
+            await _cancel_tasks(tasks)
+        observations: list[IncomeEventObservation] = []
+        failed = False
+        for task in tasks:
+            if task not in done:
+                failed = True
+                continue
+            try:
+                observations.extend(task.result())
+            except BaseException:  # noqa: BLE001 - retain successful documents
+                failed = True
+        if timed_out:
+            return _OfficialCollectionResult(
+                observations,
+                complete=False,
+                detail="official income source deadline exceeded while loading CVM documents",
+            )
+        if failed:
+            return _OfficialCollectionResult(
+                observations,
+                complete=False,
+                detail="CVM income document refresh was incomplete",
+            )
+        return _OfficialCollectionResult(observations)
+
+    async def _cvm_rows(
+        self,
+        client: httpx.AsyncClient,
+        year: int,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict[str, str]]:
+        await _await_until(self._cvm_lock.acquire(), deadline)
+        try:
+            cached = self._cvm_index.get(year)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            url = (
+                f"{self.settings.cvm_open_data_base_url.rstrip('/')}/dados/CIA_ABERTA/"
+                f"DOC/IPE/DADOS/ipe_cia_aberta_{year}.zip"
+            )
+            response = await _await_until(client.get(url), deadline)
+            if response.status_code == 404:
+                self._cvm_index[year] = (time.monotonic(), [])
+                _trim_ttl_cache(self._cvm_index, self.settings.ticker_cache_max_entries)
+                return []
+            response.raise_for_status()
+            payload = await _await_until(
+                read_bounded_body(response, self.settings.archive_download_max_bytes),
+                deadline,
+            )
+            rows = _read_cvm_zip(payload)
+            self._cvm_index[year] = (time.monotonic(), rows)
+            _trim_ttl_cache(self._cvm_index, self.settings.ticker_cache_max_entries)
+            return rows
+        finally:
+            self._cvm_lock.release()
+
+    async def _cvm_document(
+        self,
+        client: httpx.AsyncClient,
+        instrument: IncomeInstrumentRequest,
+        row: dict[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> list[IncomeEventObservation]:
+        link = row.get("Link_Download", "").strip()
+        if not link:
+            return []
+        text = await self._cvm_document_text(client, link, deadline=deadline)
+        parser = (
+            parse_cvm_income_adjustment_text
+            if _cvm_income_adjustment(row)
+            else parse_cvm_income_report_text
+        )
+        events = parser(
+            text,
+            ticker=instrument.ticker,
+            document_id=_cvm_document_id(row),
+            version=_positive_int(row.get("Versao")),
+        )
+        if instrument.isin:
+            return [item for item in events if item.isin in {None, instrument.isin}]
+        return [item for item in events if not _debt_isin(item.isin)]
+
+    async def _cvm_document_text(
+        self,
+        client: httpx.AsyncClient,
+        link: str,
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        del client
+        await _await_until(self._cvm_document_lock.acquire(), deadline)
+        try:
+            cached = self._cvm_documents.get(link)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._cvm_document_tasks.get(link)
+            if task is None:
+                producer_deadline = deadline or (
+                    time.monotonic() + max(self.settings.cvm_request_timeout_seconds, 0.1)
+                )
+                task = asyncio.create_task(
+                    self._fetch_and_cache_cvm_document(link, deadline=producer_deadline)
+                )
+                self._cvm_document_tasks[link] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._cvm_document_tasks,
+                        link,
+                        completed,
+                    )
+                )
+        finally:
+            self._cvm_document_lock.release()
+        return await _await_until(asyncio.shield(task), deadline)
+
+    async def _fetch_and_cache_cvm_document(
+        self,
+        link: str,
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        async with self._client() as client:
+            text = await _await_until(
+                self._fetch_cvm_document_text(client, link),
+                deadline,
+            )
+        async with self._cvm_document_lock:
+            self._cache_cvm_document(link, text)
+        return text
+
+    def _cache_cvm_document(self, link: str, text: str) -> None:
+        """Cache one decoded document while holding ``_cvm_document_lock``.
+
+        A completed producer's text is always returned to its waiters, even
+        when it cannot be retained.  Stale text for a document currently
+        being refreshed is pinned until that producer finishes so a failed
+        refresh cannot erase the last successful value.  If there is no room
+        after evicting unpinned entries, the new text is simply left
+        uncached; the caller still receives the successful result.
+        """
+
+        text_size = sys.getsizeof(text)
+        previous = self._cvm_documents.get(link)
+        previous_size = self._cvm_document_sizes.get(
+            link,
+            sys.getsizeof(previous[1]) if previous is not None else 0,
+        )
+        self._remove_cvm_document(link)
+
+        if text_size <= self._cvm_document_cache_max_bytes and self._reserve_cvm_document_space(
+            text_size
+        ):
+            self._cvm_documents[link] = (time.monotonic(), text)
+            self._cvm_document_sizes[link] = text_size
+            self._cvm_document_cache_bytes += text_size
+            return
+
+        # An oversized or temporarily uncacheable success must not discard a
+        # prior successful value.  It remains available as a last-good
+        # fallback if a later refresh fails.
+        if previous is not None:
+            self._cvm_documents[link] = previous
+            self._cvm_document_sizes[link] = previous_size
+            self._cvm_document_cache_bytes += previous_size
+
+    def _reserve_cvm_document_space(self, text_size: int) -> bool:
+        """Evict oldest unpinned entries until ``text_size`` can be stored."""
+
+        max_entries = max(self.settings.ticker_cache_max_entries, 1)
+        candidates = sorted(
+            (
+                stored_at,
+                key,
+                self._cvm_document_sizes.get(key, sys.getsizeof(cached_text)),
+            )
+            for key, (stored_at, cached_text) in self._cvm_documents.items()
+            if key not in self._cvm_document_tasks
+        )
+        removals: list[str] = []
+        projected_entries = len(self._cvm_documents) + 1
+        projected_bytes = self._cvm_document_cache_bytes + text_size
+        for _stored_at, key, size in candidates:
+            if (
+                projected_entries <= max_entries
+                and projected_bytes <= self._cvm_document_cache_max_bytes
+            ):
+                break
+            removals.append(key)
+            projected_entries -= 1
+            projected_bytes -= size
+        if projected_entries > max_entries or projected_bytes > self._cvm_document_cache_max_bytes:
+            return False
+        for key in removals:
+            self._remove_cvm_document(key)
+        return True
+
+    def _remove_cvm_document(self, link: str) -> None:
+        entry = self._cvm_documents.pop(link, None)
+        if entry is None:
+            self._cvm_document_sizes.pop(link, None)
+            return
+        size = self._cvm_document_sizes.pop(link, sys.getsizeof(entry[1]))
+        self._cvm_document_cache_bytes -= size
+
+    async def _fetch_cvm_document_text(self, client: httpx.AsyncClient, link: str) -> str:
+        async with self._cvm_download_semaphore:
+            response = await client.get(
+                link,
+                headers={"Referer": "https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx"},
+            )
+            response.raise_for_status()
+            content = await read_bounded_body(
+                response,
+                self.settings.income_document_max_bytes,
+            )
+        return _pdf_text(content)
+
+
+class FundosNetIncomeSource:
+    name = "fundos_net"
+    official = False
+    snapshot_sources: tuple[str, ...] = ("fundos_net",)
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+        status_source: StatusInvestIncomeSource | None = None,
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self.status_source = status_source
+        self._index: tuple[float, list[dict[str, Any]]] | None = None
+        self._index_lock = asyncio.Lock()
+        self._documents: dict[tuple[str, int], tuple[float, list[IncomeEventObservation]]] = {}
+        self._document_tasks: dict[tuple[str, int], asyncio.Task[list[IncomeEventObservation]]] = {}
+        self._document_lock = asyncio.Lock()
+        self._fund_rows: dict[
+            tuple[str, date],
+            tuple[float, tuple[list[dict[str, Any]], bool]],
+        ] = {}
+        self._fund_row_tasks: dict[
+            tuple[str, date],
+            asyncio.Task[tuple[list[dict[str, Any]], bool]],
+        ] = {}
+        self._fund_row_lock = asyncio.Lock()
+
+    async def collect(
+        self,
+        instruments: Sequence[IncomeInstrumentRequest],
+        as_of: date,
+    ) -> IncomeSourceResult:
+        requested = {item.ticker: item for item in instruments}
+        try:
+            observations, complete_tickers = await self._load(requested, as_of)
+        except (httpx.HTTPError, ValueError) as exc:
+            failed_coverage = [
+                _coverage(self.name, ticker, "failed", False, str(exc)) for ticker in requested
+            ]
+            return IncomeSourceResult([], failed_coverage)
+        found = {item.ticker for item in observations}
+        coverage: list[IncomeSourceCoverage] = []
+        for ticker in requested:
+            complete = ticker in complete_tickers
+            status = (
+                "complete" if complete and ticker in found else "empty" if complete else "partial"
+            )
+            coverage.append(
+                _coverage(
+                    self.name,
+                    ticker,
+                    status,
+                    complete,
+                    None if complete else "fund-specific snapshot unavailable",
+                )
+            )
+        return IncomeSourceResult(observations, coverage)
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.settings.fundos_net_base_url,
+            timeout=httpx.Timeout(self.settings.cvm_request_timeout_seconds),
+            limits=_limits(self.settings),
+            follow_redirects=True,
+            headers={
+                "Accept": "application/json,application/xml,text/xml",
+                "User-Agent": self.settings.user_agent,
+            },
+            transport=self.transport,
+        )
+
+    async def _load(
+        self,
+        requested: dict[str, IncomeInstrumentRequest],
+        as_of: date,
+    ) -> tuple[list[IncomeEventObservation], set[str]]:
+        async with self._client() as client:
+            try:
+                return await self._load_with_client(requested, as_of, client)
+            finally:
+                await _drain_shared_tasks(self._fund_row_tasks, self._fund_row_lock)
+                await _drain_shared_tasks(self._document_tasks, self._document_lock)
+
+    async def _load_with_client(
+        self,
+        requested: dict[str, IncomeInstrumentRequest],
+        as_of: date,
+        client: httpx.AsyncClient,
+    ) -> tuple[list[IncomeEventObservation], set[str]]:
+        targeted_candidates: list[dict[str, Any]] = []
+        complete_tickers: set[str] = set()
+        if self.status_source is not None:
+            cnpjs = await self.status_source.fund_cnpjs(list(requested.values()))
+            targeted = await asyncio.gather(
+                *(
+                    self._rows_for_cnpj(
+                        client,
+                        cnpj,
+                        as_of - timedelta(days=self.settings.income_snapshot_overlap_days),
+                    )
+                    for ticker, cnpj in cnpjs.items()
+                ),
+                return_exceptions=True,
+            )
+            for (ticker, _cnpj), result in zip(cnpjs.items(), targeted, strict=True):
+                if isinstance(result, BaseException):
+                    continue
+                targeted_rows, complete = result
+                targeted_candidates.extend(targeted_rows)
+                if complete:
+                    complete_tickers.add(ticker)
+        try:
+            rows = await self._rows(client)
+        except (httpx.HTTPError, ValueError):
+            # The broad index is an optional discovery path. Its malformed
+            # HTML/JSON response must not discard a complete CNPJ-targeted
+            # result already retrieved for the requested fund.
+            if not targeted_candidates and not complete_tickers:
+                raise
+            rows = []
+        candidates = list(
+            {
+                str(row["id"]): row
+                for row in [
+                    *targeted_candidates,
+                    *_fundos_net_candidates(
+                        rows,
+                        requested,
+                        self.settings.fundos_net_fallback_documents,
+                    ),
+                ]
+            }.values()
+        )
+        semaphore = asyncio.Semaphore(self.settings.upstream_concurrency)
+
+        async def download(row: dict[str, Any]) -> list[IncomeEventObservation]:
+            async with semaphore:
+                return await self._document(client, row)
+
+        parsed = await asyncio.gather(
+            *(download(row) for row in candidates), return_exceptions=True
+        )
+        failure = next((result for result in parsed if isinstance(result, BaseException)), None)
+        if failure is not None:
+            raise RuntimeError("Fundos.NET document refresh was incomplete") from failure
+        observations = [
+            event
+            for result in parsed
+            if isinstance(result, list)
+            for event in result
+            if event.ticker in requested
+        ]
+        return observations, complete_tickers
+
+    async def _rows(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
+        async with self._index_lock:
+            if self._index is not None and _fresh(
+                self._index[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return self._index[1]
+            payload = await self._index_page(
+                client,
+                params={
+                    "d": 1,
+                    "s": 0,
+                    "l": self.settings.fundos_net_scan_limit,
+                    "o[0][dataEntrega]": "desc",
+                    "idCategoriaDocumento": 14,
+                    "idTipoDocumento": 41,
+                    "tipoFundo": 1,
+                },
+            )
+            rows = _fundos_net_rows(payload)
+            self._index = (time.monotonic(), rows)
+            return rows
+
+    async def _index_page(
+        self, client: httpx.AsyncClient, *, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        async with client.stream(
+            "GET",
+            "/fnet/publico/pesquisarGerenciadorDocumentosDados",
+            params=params,
+        ) as response:
+            response.raise_for_status()
+            if "json" not in response.headers.get("content-type", "").lower():
+                raise ValueError("Fundos.NET index did not return JSON")
+            body = await read_bounded_body(response, 3_000_000)
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("Fundos.NET index returned an invalid schema")
+        return payload
+
+    async def _rows_for_cnpj(
+        self,
+        client: httpx.AsyncClient,
+        cnpj: str,
+        snapshot_from: date,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        key = (cnpj, snapshot_from)
+        async with self._fund_row_lock:
+            cached = self._fund_rows.get(key)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._fund_row_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    self._fetch_and_cache_rows(client, cnpj, snapshot_from, key)
+                )
+                self._fund_row_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._fund_row_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_rows(
+        self,
+        client: httpx.AsyncClient,
+        cnpj: str,
+        snapshot_from: date,
+        key: tuple[str, date],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        result = await self._fetch_rows_for_cnpj(client, cnpj, snapshot_from)
+        async with self._fund_row_lock:
+            self._fund_rows[key] = (time.monotonic(), result)
+            _trim_ttl_cache(self._fund_rows, self.settings.ticker_cache_max_entries)
+        return result
+
+    async def _fetch_rows_for_cnpj(
+        self,
+        client: httpx.AsyncClient,
+        cnpj: str,
+        snapshot_from: date,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        rows: list[dict[str, Any]] = []
+        page_size = max(self.settings.fundos_net_page_size, 1)
+        scan_limit = max(self.settings.fundos_net_scan_limit, page_size)
+        for offset in range(0, scan_limit, page_size):
+            payload = await self._index_page(
+                client,
+                params={
+                    "d": 1,
+                    "s": offset,
+                    "l": min(page_size, scan_limit - offset),
+                    "o[0][dataEntrega]": "desc",
+                    "idCategoriaDocumento": 14,
+                    "idTipoDocumento": 41,
+                    "idEspecieDocumento": 0,
+                    "tipoFundo": 1,
+                    "cnpj": cnpj,
+                    "cnpjFundo": cnpj,
+                },
+            )
+            page = _fundos_net_rows(payload)
+            rows.extend(page)
+            total = _positive_int(payload.get("recordsFiltered"))
+            exhausted = not page or offset + len(page) >= total
+            covered = any(
+                delivered is not None and delivered < snapshot_from
+                for delivered in (_fundos_net_delivery_date(row) for row in page)
+            )
+            if exhausted or covered:
+                return rows, True
+        return rows, False
+
+    async def _document(
+        self,
+        client: httpx.AsyncClient,
+        row: dict[str, Any],
+    ) -> list[IncomeEventObservation]:
+        key = (str(row["id"]), _positive_int(row.get("versao")))
+        async with self._document_lock:
+            cached = self._documents.get(key)
+            if cached is not None and _fresh(
+                cached[0], self.settings.income_source_index_ttl_seconds
+            ):
+                return cached[1]
+            task = self._document_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(self._fetch_and_cache_document(client, row, key))
+                self._document_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed: _cleanup_shared_task(
+                        self._document_tasks,
+                        key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_document(
+        self,
+        client: httpx.AsyncClient,
+        row: dict[str, Any],
+        key: tuple[str, int],
+    ) -> list[IncomeEventObservation]:
+        events = await self._fetch_document(client, row, key)
+        async with self._document_lock:
+            self._documents[key] = (time.monotonic(), events)
+            _trim_ttl_cache(self._documents, self.settings.fundos_net_scan_limit)
+        return events
+
+    async def _fetch_document(
+        self,
+        client: httpx.AsyncClient,
+        row: dict[str, Any],
+        key: tuple[str, int],
+    ) -> list[IncomeEventObservation]:
+        document = await client.get(
+            "/fnet/publico/downloadDocumento",
+            params={"id": key[0]},
+        )
+        document.raise_for_status()
+        content = await read_bounded_body(document, self.settings.income_document_max_bytes)
+        return parse_fundos_net_xml(
+            content,
+            document_id=key[0],
+            version=key[1],
+            source_status=_fnet_status(row),
+        )
+
+
+def _fundamentus_observation(
+    instrument: IncomeInstrumentRequest,
+    dividend: Dividend,
+    ordinal: int,
+) -> IncomeEventObservation:
+    assert dividend.ex_date is not None
+    assert dividend.payment_date is not None
+    assert dividend.value is not None
+    identity = "|".join(
+        (
+            instrument.ticker,
+            dividend.type or "Provento",
+            dividend.ex_date.isoformat(),
+            dividend.payment_date.isoformat(),
+            str(dividend.value),
+            str(ordinal),
+        )
+    )
+    return IncomeEventObservation(
+        source="fundamentus",
+        lineage="aggregator:fundamentus",
+        source_event_id=f"fundamentus:{hashlib.sha256(identity.encode()).hexdigest()[:40]}",
+        ticker=instrument.ticker,
+        isin=instrument.isin,
+        event_type=dividend.type or "Provento",
+        ex_date=dividend.ex_date,
+        payment_date=dividend.payment_date,
+        unit_price=dividend.value,
+        authority=20,
+        payload_hash=hashlib.sha256(
+            json.dumps(dividend.model_dump(mode="json"), sort_keys=True).encode()
+        ).hexdigest(),
+    )
+
+
+def _usable_dividend(dividend: Dividend) -> bool:
+    return bool(
+        dividend.ex_date
+        and dividend.payment_date
+        and dividend.value is not None
+        and dividend.value > 0
+    )
+
+
+def _coverage(
+    source: str,
+    ticker: str,
+    status: str,
+    complete: bool,
+    detail: str | None = None,
+) -> IncomeSourceCoverage:
+    return IncomeSourceCoverage(
+        source=source,
+        ticker=ticker,
+        status=status,
+        complete=complete,
+        detail=detail,
+    )
+
+
+def _instrument_results(
+    source: str,
+    instruments: Sequence[IncomeInstrumentRequest],
+    results: Sequence[list[IncomeEventObservation] | BaseException],
+) -> IncomeSourceResult:
+    observations: list[IncomeEventObservation] = []
+    coverage: list[IncomeSourceCoverage] = []
+    for instrument, result in zip(instruments, results, strict=True):
+        if isinstance(result, BaseException):
+            coverage.append(_coverage(source, instrument.ticker, "failed", False, str(result)))
+            continue
+        observations.extend(result)
+        coverage.append(_coverage(source, instrument.ticker, "complete", True))
+    return IncomeSourceResult(observations, coverage)
+
+
+def _official_results(
+    source: str,
+    instruments: Sequence[IncomeInstrumentRequest],
+    results: Sequence[_OfficialCollectionResult | BaseException],
+) -> IncomeSourceResult:
+    observations: list[IncomeEventObservation] = []
+    coverage: list[IncomeSourceCoverage] = []
+    for instrument, result in zip(instruments, results, strict=True):
+        if isinstance(result, _OfficialCollectionResult):
+            observations.extend(result.observations)
+            coverage.append(
+                _coverage(
+                    source,
+                    instrument.ticker,
+                    "complete" if result.complete else "partial",
+                    result.complete,
+                    result.detail,
+                )
+            )
+            continue
+        if isinstance(result, TimeoutError):
+            coverage.append(
+                _coverage(
+                    source,
+                    instrument.ticker,
+                    "partial",
+                    False,
+                    "official income source deadline exceeded",
+                )
+            )
+            continue
+        coverage.append(_coverage(source, instrument.ticker, "failed", False, str(result)))
+    return IncomeSourceResult(observations, coverage)
+
+
+def _issuer_code(ticker: str) -> str:
+    match = re.match(r"[A-Z]+", ticker.upper())
+    return (match.group(0) if match else ticker.upper())[:4]
+
+
+def _distinct_b3_isins(payload: Any) -> int:
+    return len(_b3_isins(payload))
+
+
+def _fund_unit_isin_among_subscription_rights(payload: Any) -> str | None:
+    isins = _b3_isins(payload)
+    fund_units = {
+        isin for isin in isins if len(isin) == 12 and isin.startswith("BR") and isin[6:9] == "CTF"
+    }
+    rights = {
+        isin for isin in isins if len(isin) == 12 and isin.startswith("BR") and isin[6] == "R"
+    }
+    if len(fund_units) == 1 and fund_units | rights == isins:
+        return next(iter(fund_units))
+    return None
+
+
+def _b3_isins(payload: Any) -> set[str]:
+    rows = payload if isinstance(payload, list) else []
+    company = next((row for row in rows if isinstance(row, dict)), None)
+    if company is None:
+        return set()
+    return {
+        isin
+        for row in company.get("cashDividends") or []
+        if isinstance(row, dict)
+        and (isin := str(row.get("isinCode") or row.get("assetIssued") or "").strip().upper())
+    }
+
+
+def _limits(settings: Settings) -> httpx.Limits:
+    return httpx.Limits(
+        max_connections=settings.max_connections,
+        max_keepalive_connections=settings.max_keepalive_connections,
+    )
+
+
+def _read_cvm_zip(payload: bytes) -> list[dict[str, str]]:
+    with open_validated_zip(payload) as archive:
+        members = [item for item in archive.infolist() if not item.is_dir()]
+        if len(members) != 1:
+            raise ValueError("CVM IPE archive must contain exactly one CSV")
+        with archive.open(members[0]) as source:
+            wrapper = io.TextIOWrapper(source, encoding="iso-8859-1", newline="")
+            return list(csv.DictReader(wrapper, delimiter=";"))
+
+
+def _latest_cvm_documents(
+    rows: list[dict[str, str]],
+    *,
+    limit: int = 24,
+) -> list[dict[str, str]]:
+    latest: dict[str, dict[str, str]] = {}
+    for row in rows:
+        protocol = _cvm_document_id(row)
+        existing = latest.get(protocol)
+        if existing is None or _positive_int(row.get("Versao")) > _positive_int(
+            existing.get("Versao")
+        ):
+            latest[protocol] = row
+    return sorted(latest.values(), key=lambda row: row.get("Data_Entrega", ""), reverse=True)[
+        : max(limit, 0)
+    ]
+
+
+_DEBT_ISIN = re.compile(r"^BR[A-Z0-9]{4}DB")
+
+
+def _debt_isin(isin: str | None) -> bool:
+    """Whether an ISIN identifies a debenture rather than a listed share.
+
+    One CVM notice often covers every security an issuer pays on, so a single
+    document lists the shares and the debentures side by side. Their amounts are
+    not comparable: a debenture pays on a face value in the hundreds while a
+    share pays cents. Rows are attributed by the instrument's own ISIN, but when
+    that is unknown the debenture rows would otherwise be read as the share's
+    income and overstate it by orders of magnitude.
+    """
+    return bool(isin and _DEBT_ISIN.match(isin.upper()))
+
+
+def _cvm_income_adjustment(row: dict[str, str]) -> bool:
+    if _fold(row.get("Categoria", "")) != "COMUNICADO AO MERCADO":
+        return False
+    subject = _fold(row.get("Assunto", ""))
+    return "ATUALIZACAO MONETARIA" in subject and any(
+        term in subject for term in ("REMUNERACAO", "PROVENT", "DIVID", "JUROS")
+    )
+
+
+def _cvm_document_id(row: dict[str, str]) -> str:
+    link = row.get("Link_Download", "")
+    match = re.search(r"numProtocolo=(\d+)", link)
+    return (
+        match.group(1)
+        if match
+        else (row.get("Protocolo_Entrega") or hashlib.sha256(link.encode()).hexdigest()[:24])
+    )
+
+
+def _pdf_text(content: bytes) -> str:
+    reader = PdfReader(io.BytesIO(content), strict=True)
+    if len(reader.pages) > 20:
+        raise ValueError("income report has too many pages")
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def _fundos_net_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ValueError("invalid Fundos.NET response")
+    return [row for row in payload["data"] if isinstance(row, dict) and row.get("id")]
+
+
+def _fundos_net_delivery_date(row: dict[str, Any]) -> date | None:
+    raw = str(row.get("dataEntrega") or "").strip().split(" ", maxsplit=1)[0]
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _fundos_net_candidates(
+    rows: list[dict[str, Any]],
+    requested: dict[str, IncomeInstrumentRequest],
+    fallback: int,
+) -> list[dict[str, Any]]:
+    terms = {
+        token
+        for instrument in requested.values()
+        for token in _distinctive_tokens(instrument.name or "")
+    }
+    matched = [
+        row
+        for row in rows
+        if terms.intersection(
+            _distinctive_tokens(
+                " ".join(
+                    str(row.get(field) or "")
+                    for field in ("descricaoFundo", "nomePregao", "informacoesAdicionais")
+                )
+            )
+        )
+    ]
+    selected = [*matched, *rows[: max(fallback, 0)]]
+    return list({str(row["id"]): row for row in selected}.values())
+
+
+def _distinctive_tokens(value: str) -> set[str]:
+    ignored = {"FUNDO", "INVESTIMENTO", "IMOBILIARIO", "RESPONSABILIDADE", "LIMITADA", "FII"}
+    return {
+        token
+        for token in re.findall(r"[A-Z0-9]+", _fold(value))
+        if len(token) >= 4 and token not in ignored
+    }
+
+
+def _fnet_status(row: dict[str, Any]) -> str:
+    status = str(row.get("status") or row.get("situacaoDocumento") or "").upper()
+    return "cancelled" if status in {"IC", "C", "CANCELADO"} else "active"
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        return max(int(value or 1), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _fold(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    ).upper()
+
+
+def _fresh(stored_at: float, ttl_seconds: int) -> bool:
+    return time.monotonic() - stored_at < max(ttl_seconds, 0)
+
+
+def _trim_ttl_cache[CacheKey, CacheValue](
+    cache: dict[CacheKey, tuple[float, CacheValue]],
+    maximum: int,
+) -> None:
+    overflow = len(cache) - max(maximum, 1)
+    if overflow <= 0:
+        return
+    oldest = sorted(cache, key=lambda key: cache[key][0])[:overflow]
+    for key in oldest:
+        cache.pop(key, None)
+
+
+__all__ = [
+    "FundamentusIncomeSource",
+    "FundosNetIncomeSource",
+    "IncomeSource",
+    "IncomeSourceResult",
+    "OfficialCompanyIncomeSource",
+    "StatusInvestIncomeSource",
+]

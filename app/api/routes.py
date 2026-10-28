@@ -1,8 +1,11 @@
 import asyncio
+import hmac
+import logging
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from fastapi.responses import PlainTextResponse
 
 from app import __version__
@@ -11,13 +14,15 @@ from app.api.dependencies import (
     get_fixed_income_valuation_service,
     get_fundamentals_service,
     get_historical_quote_service,
+    get_income_event_service,
     get_instrument_data_service,
     get_opportunity_service,
     get_quality_facts_service,
 )
-from app.config import get_settings
-from app.core.errors import UnauthorizedCacheInvalidationError
+from app.config import Settings, get_settings
+from app.core.errors import APIError, InvalidTickerError, UnauthorizedCacheInvalidationError
 from app.core.metrics import metrics
+from app.income import IncomeEventService
 from app.models import (
     AssetDetails,
     AssetResponse,
@@ -31,9 +36,21 @@ from app.models import (
     FundamentalsBatchRequest,
     FundamentalsBatchResponse,
     FundamentalsResponse,
+    FundamentalsSnapshot,
     HealthResponse,
     HistoricalQuoteRequest,
     HistoricalQuoteResponse,
+    IncomeEventAsyncRefreshResponse,
+    IncomeEventBackfillRequest,
+    IncomeEventBatchRequest,
+    IncomeEventBatchResponse,
+    IncomeEventChangesResponse,
+    IncomeEventCoverageResponse,
+    IncomeEventRefreshJobResponse,
+    IncomeEventRefreshRequest,
+    IncomeEventRefreshResponse,
+    InstrumentBatchRequest,
+    InstrumentBatchResponse,
     InstrumentDataResponse,
     InstrumentMetadata,
     InstrumentSearchResponse,
@@ -54,6 +71,7 @@ from app.services import (
 )
 
 router = APIRouter()
+_LOGGER = logging.getLogger(__name__)
 
 AssetServiceDep = Annotated[AssetService, Depends(get_asset_service)]
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
@@ -65,6 +83,7 @@ FixedIncomeServiceDep = Annotated[
     Depends(get_fixed_income_valuation_service),
 ]
 HistoricalQuoteServiceDep = Annotated[HistoricalQuoteService, Depends(get_historical_quote_service)]
+IncomeEventServiceDep = Annotated[IncomeEventService, Depends(get_income_event_service)]
 ForceRefreshQuery = Annotated[bool, Query()]
 AsOfQuery = Annotated[date | None, Query()]
 DividendPeriodQuery = Annotated[DividendPeriod, Query()]
@@ -72,6 +91,131 @@ IncludeDetailsQuery = Annotated[bool, Query()]
 IncludeDividendsQuery = Annotated[bool, Query()]
 TickersQuery = Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")]
 CacheTokenHeader = Annotated[str | None, Header(alias="X-Cache-Token")]
+
+
+@router.post(
+    "/v2/income-events/refresh",
+    response_model=IncomeEventRefreshResponse | IncomeEventAsyncRefreshResponse,
+    tags=["income-events"],
+)
+async def refresh_income_events(
+    payload: IncomeEventRefreshRequest,
+    service: IncomeEventServiceDep,
+    response: Response,
+    x_cache_token: CacheTokenHeader = None,
+) -> IncomeEventRefreshResponse | IncomeEventAsyncRefreshResponse:
+    _require_refresh_authorization(x_cache_token)
+    if payload.mode == "async":
+        response.status_code = status.HTTP_202_ACCEPTED
+        return await service.refresh_async(payload)
+    return await service.refresh(payload)
+
+
+@router.post(
+    "/v2/income-events/backfill",
+    response_model=IncomeEventAsyncRefreshResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["income-events"],
+)
+async def backfill_income_events(
+    payload: IncomeEventBackfillRequest,
+    service: IncomeEventServiceDep,
+    x_cache_token: CacheTokenHeader = None,
+) -> IncomeEventAsyncRefreshResponse:
+    _require_refresh_authorization(x_cache_token)
+    return await service.backfill(payload)
+
+
+@router.get(
+    "/v2/income-events/refresh-jobs/{job_id}",
+    response_model=IncomeEventRefreshJobResponse,
+    responses={404: {"description": "Income refresh job not found"}},
+    tags=["income-events"],
+)
+async def get_income_refresh_job(
+    job_id: str,
+    service: IncomeEventServiceDep,
+) -> IncomeEventRefreshJobResponse:
+    job = await service.refresh_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Income refresh job not found")
+    return IncomeEventRefreshJobResponse.model_validate(job)
+
+
+@router.get(
+    "/v2/income-events/coverage",
+    response_model=IncomeEventCoverageResponse,
+    tags=["income-events"],
+)
+async def income_event_coverage(
+    service: IncomeEventServiceDep,
+    tickers: Annotated[str, Query(description="Comma-separated tickers, e.g. WEGE3,ITUB4")],
+) -> IncomeEventCoverageResponse:
+    normalized = [value.strip().upper() for value in tickers.split(",") if value.strip()]
+    return await service.coverage(list(dict.fromkeys(normalized))[:100])
+
+
+@router.post(
+    "/v2/income-events/batch",
+    response_model=IncomeEventBatchResponse,
+    tags=["income-events"],
+)
+async def resolve_income_events_batch(
+    payload: IncomeEventBatchRequest,
+    service: IncomeEventServiceDep,
+    response: Response,
+) -> IncomeEventBatchResponse:
+    result = await service.batch(payload)
+    _income_cache_headers(response, result.cursor)
+    return result
+
+
+@router.get(
+    "/v2/income-events/changes",
+    response_model=IncomeEventChangesResponse,
+    tags=["income-events"],
+)
+async def income_event_changes(
+    service: IncomeEventServiceDep,
+    response: Response,
+    cursor: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> IncomeEventChangesResponse:
+    result = await service.changes(cursor, limit)
+    _income_cache_headers(response, result.cursor)
+    return result
+
+
+def _require_refresh_authorization(provided: str | None) -> None:
+    settings = get_settings()
+    if settings.environment.lower() in {"local", "test"} and not _configured_maintenance_token(
+        settings
+    ):
+        return
+    _require_maintenance_token(provided)
+
+
+def _income_cache_headers(response: Response, cursor: int) -> None:
+    _cache_headers(response)
+    response.headers["ETag"] = f'W/"income-{cursor}"'
+
+
+def _require_maintenance_token(provided: str | None) -> None:
+    configured = _configured_maintenance_token(get_settings())
+    if not configured or not provided or not hmac.compare_digest(provided, configured):
+        raise UnauthorizedCacheInvalidationError()
+
+
+def _configured_maintenance_token(settings: Settings) -> str | None:
+    configured_secret = settings.cache_invalidate_token
+    if configured_secret is None:
+        return None
+    return configured_secret.get_secret_value().strip() or None
+
+
+def _authorize_force_refresh(force_refresh: bool, provided: str | None) -> None:
+    if force_refresh:
+        _require_maintenance_token(provided)
 
 
 @router.post(
@@ -104,6 +248,18 @@ async def get_instrument(
     service: OpportunityServiceDep,
 ) -> InstrumentMetadata | None:
     return await service.instrument(ticker)
+
+
+@router.post(
+    "/v1/instruments:resolve",
+    response_model=InstrumentBatchResponse,
+    tags=["instruments"],
+)
+async def resolve_instruments(
+    payload: InstrumentBatchRequest,
+    service: OpportunityServiceDep,
+) -> InstrumentBatchResponse:
+    return InstrumentBatchResponse(instruments=await service.instruments(payload.tickers))
 
 
 @router.get("/v2/instruments/search", response_model=InstrumentSearchResponse, tags=["instruments"])
@@ -170,20 +326,36 @@ async def _resolve_fundamentals(
     opportunity: OpportunityService,
 ) -> FundamentalsResponse:
     """Resolve one ticker, shared by the single and the batch routes."""
-    opportunity_data = await opportunity.opportunity(ticker)
-    instrument = opportunity_data.instrument
-    metrics = opportunity_data.metrics
+    try:
+        opportunity_data = await opportunity.opportunity(ticker)
+    except InvalidTickerError:
+        raise
+    except APIError as error:
+        # Opportunity enrichments are optional for a CVM fundamentals
+        # snapshot.  Keep the source error visible in logs and continue with
+        # the ticker-only fundamentals path when possible.
+        _LOGGER.warning("opportunity enrichment unavailable for %s: %s", ticker, error.message)
+        opportunity_data = None
+    instrument = opportunity_data.instrument if opportunity_data is not None else None
+    metrics = opportunity_data.metrics if opportunity_data is not None else None
+
+    def _metric_value(name: str) -> Decimal | None:
+        return getattr(metrics, name).value if metrics is not None else None
+
+    def _metric_sources(name: str) -> str:
+        return ",".join(getattr(metrics, name).sources) if metrics is not None else ""
+
     snapshot = await fundamentals.snapshot(
         ticker,
         instrument.name if instrument else None,
-        reference_shares=metrics.shares_outstanding.value,
-        earnings_per_share=metrics.earnings_per_share.value,
-        book_value_per_share=metrics.book_value_per_share.value,
-        recurring_dividends_per_share=metrics.dividends_12m.value,
+        reference_shares=_metric_value("shares_outstanding"),
+        earnings_per_share=_metric_value("earnings_per_share"),
+        book_value_per_share=_metric_value("book_value_per_share"),
+        recurring_dividends_per_share=_metric_value("dividends_12m"),
         supplemental_sources={
-            "earnings_per_share": ",".join(metrics.earnings_per_share.sources),
-            "book_value_per_share": ",".join(metrics.book_value_per_share.sources),
-            "recurring_dividends_per_share": ",".join(metrics.dividends_12m.sources),
+            "earnings_per_share": _metric_sources("earnings_per_share"),
+            "book_value_per_share": _metric_sources("book_value_per_share"),
+            "recurring_dividends_per_share": _metric_sources("dividends_12m"),
         },
     )
     return FundamentalsResponse(
@@ -212,10 +384,46 @@ async def resolve_fundamentals_batch(
     """
     _cache_headers(response)
     resolved = await asyncio.gather(
-        *(_resolve_fundamentals(ticker, fundamentals, opportunity) for ticker in payload.tickers)
+        *(_resolve_fundamentals(ticker, fundamentals, opportunity) for ticker in payload.tickers),
+        return_exceptions=True,
     )
+    assets: list[FundamentalsResponse] = []
+    for ticker, item in zip(payload.tickers, resolved, strict=True):
+        if isinstance(item, FundamentalsResponse):
+            assets.append(item)
+            continue
+        if isinstance(item, InvalidTickerError):
+            raise item
+        if isinstance(item, APIError):
+            _LOGGER.warning("fundamentals resolution unavailable for %s: %s", ticker, item.message)
+            assets.append(
+                FundamentalsResponse(
+                    ticker=ticker,
+                    snapshot=FundamentalsSnapshot(
+                        ticker=ticker,
+                        unavailable_reason=item.message,
+                    ),
+                    refreshed_at=datetime.now(UTC).date(),
+                )
+            )
+            continue
+        _LOGGER.error(
+            "fundamentals resolution failed for %s: %s",
+            ticker,
+            type(item).__name__,
+        )
+        assets.append(
+            FundamentalsResponse(
+                ticker=ticker,
+                snapshot=FundamentalsSnapshot(
+                    ticker=ticker,
+                    unavailable_reason="Fundamentals resolution failed",
+                ),
+                refreshed_at=datetime.now(UTC).date(),
+            )
+        )
     return FundamentalsBatchResponse(
-        assets=list(resolved),
+        assets=assets,
         refreshed_at=datetime.now(UTC).date(),
     )
 
@@ -280,7 +488,9 @@ async def get_asset(
     period: DividendPeriodQuery = DividendPeriod.all,
     as_of: AsOfQuery = None,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> AssetResponse:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("asset_endpoint_requests")
     return await service.get_asset(
@@ -299,7 +509,9 @@ async def get_details(
     response: Response,
     service: AssetServiceDep,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> AssetDetails:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("details_endpoint_requests")
     details, _cached = await service.get_details(ticker, force_refresh=force_refresh)
@@ -314,7 +526,9 @@ async def get_dividends(
     period: DividendPeriodQuery = DividendPeriod.all,
     as_of: AsOfQuery = None,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> list[Dividend]:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("dividends_endpoint_requests")
     dividends, _cached = await service.get_dividends(
@@ -336,7 +550,9 @@ async def get_assets_batch(
     period: DividendPeriodQuery = DividendPeriod.all,
     as_of: AsOfQuery = None,
     force_refresh: ForceRefreshQuery = False,
+    x_cache_token: CacheTokenHeader = None,
 ) -> BatchAssetResponse:
+    _authorize_force_refresh(force_refresh, x_cache_token)
     _cache_headers(response, force_refresh=force_refresh)
     metrics.inc("batch_endpoint_requests")
     ticker_list = [item.strip() for item in tickers.split(",") if item.strip()]
@@ -362,15 +578,8 @@ async def invalidate_cache(
     service: AssetServiceDep,
     x_cache_token: CacheTokenHeader = None,
 ) -> CacheInvalidationResponse:
-    settings = get_settings()
-    configured = (
-        settings.cache_invalidate_token.get_secret_value()
-        if settings.cache_invalidate_token
-        else None
-    )
     provided = x_cache_token or payload.token
-    if configured and provided != configured:
-        raise UnauthorizedCacheInvalidationError()
+    _require_maintenance_token(provided)
 
     if payload.ticker:
         ticker = service.normalize_ticker(payload.ticker)

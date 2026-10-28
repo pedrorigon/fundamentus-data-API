@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.scrapers.anbima_credit import (
     AnbimaCreditProvider,
     parse_anbima_credit_prices,
 )
+from app.scrapers.anbima_feed import AnbimaFeedProvider, parse_anbima_feed_prices
 from app.scrapers.anbima_fixed_income import (
     AnbimaDebentureProvider,
     parse_anbima_debenture_prices,
@@ -25,6 +27,10 @@ from app.scrapers.anbima_fixed_income import (
 from app.scrapers.b3_fixed_income import (
     B3FixedIncomeProvider,
     parse_b3_reference_prices,
+)
+from app.scrapers.snd_fixed_income import (
+    SndDebentureTradeProvider,
+    parse_snd_debenture_trade_prices,
 )
 from app.services.fixed_income import FixedIncomeValuationService, _cached_prices
 
@@ -89,6 +95,127 @@ def test_credit_parser_maps_reference_dates_and_ignores_unavailable_rows() -> No
         "CRA019003V2": Decimal("1039.26916663")
     }
     assert parse_anbima_credit_prices(payload, date(2026, 7, 30)) == {}
+
+
+def test_feed_parser_prefers_rectified_prices_and_rejects_invalid_rows() -> None:
+    payload = [
+        {"codigo_ativo": " alar13 ", "pu": 900, "pu_retificado": "901.25"},
+        {"codigo_ativo": "CBAN32", "pu": "1421.07939094", "pu_retificado": None},
+        {"codigo_ativo": "ZERO1", "pu": 0},
+        {"codigo_ativo": "NAN1", "pu": "NaN"},
+        {"codigo_ativo": "BAD1", "pu": "invalid"},
+        {"codigo_ativo": "", "pu": 100},
+        {"pu": 100},
+        "invalid",
+    ]
+
+    assert parse_anbima_feed_prices(payload) == {
+        "ALAR13": Decimal("901.25"),
+        "CBAN32": Decimal("1421.07939094"),
+    }
+    assert parse_anbima_feed_prices({"items": payload}) == {}
+
+
+@pytest.mark.asyncio
+async def test_feed_provider_authenticates_once_and_reuses_token() -> None:
+    token_calls = 0
+    price_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls, price_calls
+        if request.url.path == "/oauth/access-token":
+            token_calls += 1
+            await asyncio.sleep(0.01)
+            assert request.headers["authorization"] == "Basic Y2xpZW50OnNlY3JldA=="
+            assert request.read() == b'{"grant_type":"client_credentials"}'
+            return httpx.Response(200, json={"access_token": "official-token", "expires_in": 3600})
+        price_calls += 1
+        assert request.url.path.endswith("/debentures/mercado-secundario")
+        assert request.url.params["data"] == "2024-01-31"
+        assert request.headers["client_id"] == "client"
+        assert request.headers["access_token"] == "official-token"
+        return httpx.Response(200, json=[{"codigo_ativo": "CRMG15", "pu": 1045.8}])
+
+    provider = AnbimaFeedProvider(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        httpx.MockTransport(handler),
+    )
+    try:
+        first, second = await asyncio.gather(
+            provider.prices(date(2024, 1, 31)),
+            provider.prices(date(2024, 1, 31)),
+        )
+    finally:
+        await provider.close()
+
+    assert first == second == {"CRMG15": Decimal("1045.8")}
+    assert token_calls == 1
+    assert price_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_feed_provider_refreshes_rejected_and_expired_tokens() -> None:
+    now = 100.0
+    tokens = iter(("rejected-token", "short-token", "fresh-token"))
+    token_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls
+        if request.url.path == "/oauth/access-token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={"access_token": next(tokens), "expires_in": 20 if token_calls == 2 else 3600},
+            )
+        if request.headers["access_token"] == "rejected-token":
+            return httpx.Response(401)
+        return httpx.Response(200, json=[])
+
+    provider = AnbimaFeedProvider(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        httpx.MockTransport(handler),
+        clock=lambda: now,
+    )
+    try:
+        assert await provider.prices(date(2024, 1, 31)) == {}
+        now += 2
+        assert await provider.prices(date(2024, 2, 1)) == {}
+    finally:
+        await provider.close()
+
+    assert token_calls == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [[], {}, {"access_token": "token"}, {"access_token": "", "expires_in": 3600}],
+)
+async def test_feed_provider_rejects_invalid_token_payloads(payload: object) -> None:
+    provider = AnbimaFeedProvider(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload)),
+    )
+    try:
+        with pytest.raises(ValueError, match="invalid"):
+            await provider.prices(date(2024, 1, 31))
+    finally:
+        await provider.close()
+
+
+def test_feed_provider_requires_complete_non_empty_credentials() -> None:
+    with pytest.raises(ValueError, match="required"):
+        AnbimaFeedProvider(Settings())
+    with pytest.raises(ValueError, match="cannot be empty"):
+        AnbimaFeedProvider(Settings(anbima_feed_client_id="", anbima_feed_client_secret="secret"))
+    assert Settings().anbima_feed_configured is False
+    assert (
+        Settings(
+            anbima_feed_client_id="client",
+            anbima_feed_client_secret="secret",
+        ).anbima_feed_configured
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -182,6 +309,201 @@ def test_b3_parser_prefers_reference_price_and_uses_safe_fallbacks() -> None:
     }
 
 
+def test_snd_parser_maps_average_traded_prices_without_using_contractual_pu() -> None:
+    payload = (
+        "Mercado Secundário de Debêntures - Gerado em 29/08/2026 22:23:30\r\n\r\n"
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "7/6/2024\tCONCESSIONARIA\tCRMG15\tBRRDVIDBS061\t29\t3\t"
+        "1.057,963329\t1.071,479196\t1.080,971579\t113,21\r\n"
+        "6/6/2024\tORIGEM\torig21\tBR0HJ5DBS018\t6063\t92\t"
+        "1.036,533823\t1.092,947826\t1.140,442294\t103,21\r\n"
+        "invalid\tEMISSOR\tBAD1\t--\t1\t1\t1\t100\t100\t100\r\n"
+        "6/6/2024\tEMISSOR\tZERO1\t--\t1\t1\t0\t0\t0\t100\r\n"
+    ).encode("latin-1")
+
+    assert parse_snd_debenture_trade_prices(payload) == {
+        "CRMG15": {date(2024, 6, 7): Decimal("1071.479196")},
+        "ORIG21": {date(2024, 6, 6): Decimal("1092.947826")},
+    }
+    assert parse_snd_debenture_trade_prices(b"unexpected") == {}
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_downloads_one_public_year_per_identifier() -> None:
+    calls = 0
+    payload = (
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "14/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t100\t101,25\t102\t100\r\n"
+        "13/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t99\t100,50\t101\t100\r\n"
+    ).encode("latin-1")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        assert request.url.path.endswith("/precosdenegociacao_e.asp")
+        assert request.url.params["ativo"] == "CRMG15"
+        assert request.url.params["dt_ini"] == "20240101"
+        assert request.url.params["dt_fim"] == "20241231"
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(Settings(), httpx.MockTransport(handler))
+    first, second = await asyncio.gather(
+        provider.prices_for(date(2024, 8, 14), {" crmg15 "}),
+        provider.prices_for(date(2024, 8, 13), {"CRMG15"}),
+    )
+
+    assert first == {"CRMG15": Decimal("101.25")}
+    assert second == {"CRMG15": Decimal("100.50")}
+    assert await provider.prices_for(date(2024, 8, 14), {"CRMG15"}) == first
+    assert await provider.prices(date(2024, 8, 14)) == {}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_shields_shared_download_from_cancelled_waiter() -> None:
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    payload = (
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "14/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t100\t101,25\t102\t100\r\n"
+    ).encode("latin-1")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(Settings(), httpx.MockTransport(handler))
+    reference = date(2024, 8, 14)
+    first = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+    await started.wait()
+    second = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    release.set()
+    assert await second == {"CRMG15": Decimal("101.25")}
+    assert await provider.prices_for(reference, {"CRMG15"}) == {"CRMG15": Decimal("101.25")}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_cleans_failed_shared_download_for_later_retry() -> None:
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    payload = (
+        "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+        "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+        "14/8/2024\tEMISSOR\tCRMG15\tISIN\t1\t1\t100\t101,25\t102\t100\r\n"
+    ).encode("latin-1")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("provider failed")
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(Settings(), httpx.MockTransport(handler))
+    reference = date(2024, 8, 14)
+    key = ("CRMG15", reference.year)
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+
+    def capture_loop_error(
+        _loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_errors.append(context)
+
+    loop.set_exception_handler(capture_loop_error)
+    try:
+        first = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+        await started.wait()
+        second = asyncio.create_task(provider.prices_for(reference, {"CRMG15"}))
+        await asyncio.sleep(0)
+        shared = provider._inflight[key]
+
+        first.cancel()
+        second.cancel()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if shared.done() and key not in provider._inflight:
+                break
+        assert shared.done()
+        assert key not in provider._inflight
+
+        assert await provider.prices_for(reference, {"CRMG15"}) == {"CRMG15": Decimal("101.25")}
+        assert calls == 2
+        assert loop_errors == []
+    finally:
+        release.set()
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_keeps_missing_and_unsafe_downloads_unavailable() -> None:
+    responses = iter(
+        (
+            httpx.Response(404),
+            httpx.Response(200, content=b"x" * 65),
+        )
+    )
+    provider = SndDebentureTradeProvider(
+        Settings(income_document_max_bytes=64),
+        httpx.MockTransport(lambda _request: next(responses)),
+    )
+
+    assert await provider.prices_for(date(2024, 1, 1), {"MISS11"}) == {}
+    assert await provider.prices_for(date(2024, 1, 1), {"LARGE1"}) == {}
+    assert await provider.prices_for(date(date.today().year + 1, 1, 1), {"FUTURE1"}) == {}
+    assert await provider.prices_for(date(2024, 1, 1), set()) == {}
+
+
+@pytest.mark.asyncio
+async def test_snd_provider_bounds_the_annual_series_cache() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        identifier = request.url.params["ativo"]
+        calls.append(identifier)
+        payload = (
+            "Data\tEmissor\tCódigo do Ativo\tISIN\tQuantidade\tNúmero de Negócios\t"
+            "PU Mínimo\tPU Médio\tPU Máximo\t% PU da Curva\r\n"
+            f"2/1/2024\tEMISSOR\t{identifier}\tISIN\t1\t1\t99\t100,50\t101\t100\r\n"
+        ).encode("latin-1")
+        return httpx.Response(200, content=payload)
+
+    provider = SndDebentureTradeProvider(
+        Settings(fixed_income_series_cache_max_entries=1),
+        httpx.MockTransport(handler),
+    )
+    reference = date(2024, 1, 2)
+
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100.50")}
+    assert await provider.prices_for(reference, {"BBB1"}) == {"BBB1": Decimal("100.50")}
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100.50")}
+    assert calls == ["AAA1", "BBB1", "AAA1"]
+
+
 @pytest.mark.asyncio
 async def test_b3_provider_resolves_exact_identifier_and_caches_result() -> None:
     calls = 0
@@ -224,6 +546,54 @@ async def test_b3_provider_resolves_exact_identifier_and_caches_result() -> None
 
 
 @pytest.mark.asyncio
+async def test_b3_provider_uses_bounded_lru_cache() -> None:
+    calls: list[str] = []
+    reference = date(2026, 7, 31)
+    payload = {
+        "table": {
+            "values": [
+                [
+                    None,
+                    None,
+                    identifier,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "100",
+                ]
+                for identifier in ("AAA1", "BBB1", "CCC1")
+            ]
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        encoded = request.url.params["filter"]
+        calls.append(base64.b64decode(encoded).decode("ascii"))
+        return httpx.Response(200, json=payload)
+
+    provider = B3FixedIncomeProvider(
+        Settings(memory_cache_max_entries=2),
+        httpx.MockTransport(handler),
+    )
+
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100")}
+    assert await provider.prices_for(reference, {"BBB1"}) == {"BBB1": Decimal("100")}
+    # A hit promotes AAA1, so CCC1 evicts BBB1 as the least recently used item.
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100")}
+    assert await provider.prices_for(reference, {"CCC1"}) == {"CCC1": Decimal("100")}
+    assert await provider.prices_for(reference, {"AAA1"}) == {"AAA1": Decimal("100")}
+    assert await provider.prices_for(reference, {"BBB1"}) == {"BBB1": Decimal("100")}
+
+    assert calls == ["AAA1", "BBB1", "CCC1", "BBB1"]
+
+
+@pytest.mark.asyncio
 async def test_service_marks_secondary_source_and_preserves_unavailable_ids() -> None:
     class FallbackProvider:
         source = "anbima_cri_cra"
@@ -248,6 +618,50 @@ async def test_service_marks_secondary_source_and_preserves_unavailable_ids() ->
     assert valuation.source == "anbima_cri_cra"
     assert valuation.unit_price == Decimal("1000.50")
     assert result.unavailable == ["LCI-MISSING"]
+
+
+@pytest.mark.asyncio
+async def test_service_uses_scoped_b3_before_the_credit_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PrimaryProvider:
+        identifier_scoped = False
+
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def prices(self, _reference: date) -> dict[str, Decimal]:
+            return {}
+
+    class B3Provider:
+        source = "b3_bdi_consolidated"
+        identifier_scoped = True
+
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def prices_for(self, _reference: date, identifiers: set[str]) -> dict[str, Decimal]:
+            return {identifier: Decimal("100") for identifier in identifiers}
+
+    class CreditProvider:
+        source = "anbima_cri_cra"
+
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def prices(self, _reference: date) -> dict[str, Decimal]:
+            raise AssertionError("the broader credit table should not be called")
+
+    monkeypatch.setattr("app.services.fixed_income.AnbimaDebentureProvider", PrimaryProvider)
+    monkeypatch.setattr("app.services.fixed_income.B3FixedIncomeProvider", B3Provider)
+    monkeypatch.setattr("app.services.fixed_income.AnbimaCreditProvider", CreditProvider)
+    service = FixedIncomeValuationService(Settings(), _cache(), provider=None)
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["PEJA13"], dates=[date(2026, 7, 31)])
+    )
+
+    assert result.valuations["PEJA13"][0].source == "b3_bdi_consolidated"
 
 
 @pytest.mark.asyncio
@@ -308,7 +722,119 @@ async def test_service_uses_previous_business_day_and_caches_files() -> None:
     assert first.valuations["CDB925623O7"] == []
     assert first.unavailable == ["CDB925623O7"]
     assert second == first
-    assert provider.calls == [sunday, date(2026, 7, 18), friday]
+    assert provider.calls == [friday]
+
+
+@pytest.mark.asyncio
+async def test_service_skips_dates_outside_the_public_history_window() -> None:
+    class Provider:
+        async def prices(self, _reference: date) -> dict[str, Decimal]:
+            raise AssertionError("an unavailable archive date must not reach a provider")
+
+    settings = Settings(fixed_income_public_history_months=18)
+    service = FixedIncomeValuationService(settings, _cache(), Provider())  # type: ignore[arg-type]
+    reference = date.today()
+    old_date = date(reference.year - 2, reference.month, 1)
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["AALM12"], dates=[old_date])
+    )
+
+    assert result.valuations == {"AALM12": []}
+    assert result.unavailable == ["AALM12"]
+
+
+@pytest.mark.asyncio
+async def test_service_uses_only_authenticated_history_for_retained_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HistoryProvider:
+        source = "anbima_feed"
+        full_history = True
+        closed = False
+
+        def __init__(self, _settings: Settings) -> None:
+            self.calls: list[date] = []
+            instances.append(self)
+
+        async def prices(self, reference: date) -> dict[str, Decimal]:
+            self.calls.append(reference)
+            return {"CRMG15": Decimal("1045.80")}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    instances: list[HistoryProvider] = []
+    monkeypatch.setattr("app.services.fixed_income.AnbimaFeedProvider", HistoryProvider)
+    service = FixedIncomeValuationService(
+        Settings(anbima_feed_client_id="client", anbima_feed_client_secret="secret"),
+        _cache(),
+    )
+    old_reference = date.today() - timedelta(days=730)
+    old_reference -= timedelta(days=max(old_reference.weekday() - 4, 0))
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["CRMG15"], dates=[old_reference])
+    )
+    await service.close()
+
+    provider = instances[0]
+    assert provider.calls == [old_reference]
+    assert provider.closed is True
+    valuation = result.valuations["CRMG15"][0]
+    assert valuation.reference_date == old_reference
+    assert valuation.unit_price == Decimal("1045.80")
+    assert valuation.source == "anbima_feed"
+
+
+@pytest.mark.asyncio
+async def test_service_uses_public_snd_history_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_reference = date(2024, 8, 14)
+    previous_trade = old_reference - timedelta(days=1)
+
+    class PublicHistoryProvider:
+        source = "snd_secondary_market"
+        identifier_scoped = True
+        full_history = True
+
+        def __init__(self, _settings: Settings) -> None:
+            self.calls: list[date] = []
+            instances.append(self)
+
+        async def prices_for(
+            self,
+            reference: date,
+            identifiers: set[str],
+        ) -> dict[str, Decimal]:
+            self.calls.append(reference)
+            if reference == previous_trade and "CRMG15" in identifiers:
+                return {"CRMG15": Decimal("1058.771747")}
+            return {}
+
+    instances: list[PublicHistoryProvider] = []
+    monkeypatch.setattr(
+        "app.services.fixed_income.SndDebentureTradeProvider", PublicHistoryProvider
+    )
+    service = FixedIncomeValuationService(Settings(), _cache())
+
+    result = await service.resolve(
+        FixedIncomeValuationRequest(identifiers=["CRMG15"], dates=[old_reference])
+    )
+
+    valuation = result.valuations["CRMG15"][0]
+    assert instances[0].calls == [old_reference, previous_trade]
+    assert valuation.reference_date == previous_trade
+    assert valuation.unit_price == Decimal("1058.771747")
+    assert valuation.source == "snd_secondary_market"
+
+
+@pytest.mark.asyncio
+async def test_service_close_is_safe_without_authenticated_history() -> None:
+    service = FixedIncomeValuationService(Settings(), _cache(), provider=_Provider({}))  # type: ignore[arg-type]
+
+    await service.close()
 
 
 class _FailingProvider:
@@ -352,7 +878,7 @@ async def test_service_preserves_sparse_identifier_gaps() -> None:
         FixedIncomeValuationRequest(identifiers=["PEJA11"], dates=[friday, saturday])
     )
 
-    assert [item.requested_date for item in result.valuations["PEJA11"]] == [friday]
+    assert [item.requested_date for item in result.valuations["PEJA11"]] == [friday, saturday]
     assert result.unavailable == []
 
 
@@ -433,7 +959,17 @@ def test_request_rejects_unsafe_identifiers() -> None:
     with pytest.raises(ValidationError):
         FixedIncomeValuationRequest(
             identifiers=["AAA1"],
-            dates=[date(2020, 1, 1) + timedelta(days=index) for index in range(501)],
+            dates=[
+                date(2020, 1, 1) + timedelta(days=index)
+                for index in range(MAX_FIXED_INCOME_DATES + 1)
+            ],
+        )
+    with pytest.raises(ValidationError, match="lookup budget"):
+        FixedIncomeValuationRequest(
+            identifiers=[f"ID{index}" for index in range(6)],
+            dates=[
+                date(2020, 1, 1) + timedelta(days=index) for index in range(MAX_FIXED_INCOME_DATES)
+            ],
         )
 
 
@@ -474,6 +1010,41 @@ async def test_fixed_income_endpoint_returns_resolved_values() -> None:
     assert response.json()["unavailable_reasons"] == {}
 
 
+@pytest.mark.asyncio
+async def test_fixed_income_endpoint_serializes_identifier_validation_errors() -> None:
+    app = create_app()
+    app.dependency_overrides[get_fixed_income_valuation_service] = object
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/fixed-income/valuations/resolve",
+            json={
+                "identifiers": ["PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"],
+                "dates": ["2026-08-28"],
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Invalid request parameters.",
+            "retryable": False,
+            "details": [
+                {
+                    "type": "value_error",
+                    "loc": ["body", "identifiers"],
+                    "msg": "Value error, invalid fixed-income identifier",
+                    "input": ["PLUGGY:FIXED_INCOME|CDB|CDB925623O7|30.306.294/0001-45|BRL"],
+                    "ctx": {"error": "invalid fixed-income identifier"},
+                }
+            ],
+        }
+    }
+
+
 def test_fixed_income_dependency_reads_application_state() -> None:
     service = object()
     request = SimpleNamespace(
@@ -484,7 +1055,23 @@ def test_fixed_income_dependency_reads_application_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lifespan_registers_fixed_income_service() -> None:
+async def test_lifespan_registers_fixed_income_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoopInstrumentDataService:
+        def __init__(self, _settings: object) -> None:
+            pass
+
+        async def warm_directory(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    # This lifecycle assertion must not start the production directory warm-up
+    # against SEC/brapi; the providers are covered with deterministic transports
+    # in the instrument-directory tests.
+    monkeypatch.setattr("app.main.InstrumentDataService", NoopInstrumentDataService)
     app = create_app()
 
     async with lifespan(app):

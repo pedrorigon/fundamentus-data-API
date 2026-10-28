@@ -36,6 +36,32 @@ Returns normalized fields and all parsed sections from the Fundamentus details p
 
 Returns all parsed dividends after applying the requested period filter.
 
+### `POST /v2/income-events/refresh`
+
+Refreshes a bounded list of instruments from independent public sources and publishes a canonical event revision. This maintenance endpoint requires `X-Cache-Token` outside local/test environments. It is intended for background jobs, not request-time reads.
+
+```json
+{
+  "instruments": [
+    {"ticker": "BBAS3", "isin": "BRBBASACNOR3", "name": "Banco do Brasil"},
+    {"ticker": "HGLG11", "isin": "BRHGLGCTF004", "name": "CSHG Logística"}
+  ],
+  "as_of": "2026-08-27"
+}
+```
+
+### `POST /v2/income-events/backfill`
+
+Queues one durable official backfill for a bounded instrument list (up to 500 tickers) and returns `202` with a job id; poll `GET /v2/income-events/refresh-jobs/{job_id}` for progress. Only the official B3/CVM source is collected, and the CVM open-data index and the parsed documents are shared across the job pages, so a catalog backfill does not scrape the complementary HTML providers per ticker. This maintenance endpoint requires `X-Cache-Token` outside local/test environments.
+
+### `POST /v2/income-events/batch`
+
+Reads canonical events for at most 20 tickers from local SQLite storage. By default, only `corroborated` and `verified` events are returned; tentative and conflicting observations cannot inflate portfolio projections. Optional `from_date` and `to_date` fields filter payment dates. The response includes a cursor and ETag.
+
+### `GET /v2/income-events/changes`
+
+Returns semantic event changes after a monotonic `cursor`, with a bounded `limit` of 1 to 500. Consumers use this endpoint for incremental synchronization without repeatedly transferring the full event catalog.
+
 ### `GET /v1/assets/{ticker}/opportunity`
 
 Returns current price, P/L, P/VP, trailing dividend yield, Graham price,
@@ -139,13 +165,17 @@ bounded list of instrument identifiers and valuation dates. The service uses the
 free sources, in order:
 
 - ANBIMA's official daily debenture publication;
-- the public ANBIMA Data CRI/CRA table (the last five business days);
-- B3's public BDI consolidated fixed-income trades (from the BDI history window).
+- B3's public BDI consolidated fixed-income trades (from the BDI history window);
+- SND's public retained secondary-market trade download, using the average PU
+  actually registered for each debenture and date;
+- the public ANBIMA Data CRI/CRA table (the last five business days).
 
-All observations are cached with their source and reference date. These feeds only provide a
-market PU when the instrument was priced or traded. They do not contain the contractual terms
-needed to accrue an untraded LCI, LCA, CDB or private note. Such instruments remain explicitly
-unavailable instead of receiving a synthetic price.
+The optional authenticated ANBIMA Feed remains the highest-authority retained source when it is
+configured, but it is not required for debentures covered by the public SND trade history. All
+observations are cached with their source and reference date. These feeds only provide a market
+PU when the instrument was priced or traded. They do not contain the contractual terms needed to
+accrue an untraded LCI, LCA, CDB or private note. Such instruments remain explicitly unavailable
+instead of receiving a synthetic price.
 
 ```json
 {

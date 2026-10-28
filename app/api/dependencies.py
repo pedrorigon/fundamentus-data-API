@@ -2,6 +2,7 @@ from typing import cast
 
 from fastapi import Request
 
+from app.income import IncomeEventService
 from app.services import (
     AssetService,
     FixedIncomeValuationService,
@@ -39,3 +40,7 @@ def get_fundamentals_service(request: Request) -> FundamentalsService:
 
 def get_quality_facts_service(request: Request) -> QualityFactsService:
     return cast(QualityFactsService, request.app.state.quality_facts_service)
+
+
+def get_income_event_service(request: Request) -> IncomeEventService:
+    return cast(IncomeEventService, request.app.state.income_event_service)

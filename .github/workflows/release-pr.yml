@@ -1,9 +1,11 @@
 name: Release PR
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to prepare without the v prefix, for example 0.1.4."
+        required: true
 
 permissions:
   contents: write
@@ -19,6 +21,27 @@ jobs:
 
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${INPUT_VERSION#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version must use MAJOR.MINOR.PATCH format." >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists; choose a new version." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release metadata
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python scripts/sync_release_version.py "$VERSION"
+
       - name: Install dependencies
         run: uv sync --python 3.12 --extra dev
 
@@ -30,35 +53,41 @@ jobs:
           uv run pytest
 
       - name: Regenerate changelog
-        run: uvx git-cliff@2.13.1 --output CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: uvx git-cliff@2.13.1 --tag "v$VERSION" --output CHANGELOG.md
 
       - name: Generate release notes preview
-        run: uvx git-cliff@2.13.1 --latest --strip all --output release-notes.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          uvx git-cliff@2.13.1 --unreleased --tag "v$VERSION"
+          --strip all --output release-notes.md
 
       - name: Open release pull request
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if git diff --quiet -- CHANGELOG.md; then
-            echo "Changelog already covers ${GITHUB_REF_NAME}; nothing to propose."
-            echo "If the release was not published, run the Release workflow manually."
+          if git diff --quiet -- CHANGELOG.md pyproject.toml; then
+            echo "Release metadata already covers v$VERSION; nothing to propose."
             exit 0
           fi
-          BRANCH="release/${GITHUB_REF_NAME}"
+          BRANCH="release/v$VERSION"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
-          git add CHANGELOG.md
-          git commit -m "docs(changelog): add ${GITHUB_REF_NAME#v} section"
-          git push -f origin "$BRANCH"
+          git add CHANGELOG.md pyproject.toml
+          git commit -m "chore(release): prepare v$VERSION"
+          git push origin "$BRANCH"
           {
-            echo "Merging this PR moves tag \`${GITHUB_REF_NAME}\` to the merge commit and publishes the GitHub release."
+            echo "Merging this PR creates immutable tag \`v$VERSION\` and publishes the GitHub release."
             echo
             echo "## Release notes preview"
             echo
             cat release-notes.md
           } > pr-body.md
           gh pr create --base main --head "$BRANCH" \
-            --title "chore: release ${GITHUB_REF_NAME}" \
+            --title "chore(release): prepare v$VERSION" \
             --body-file pr-body.md \
             || gh pr edit "$BRANCH" --body-file pr-body.md

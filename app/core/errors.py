@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -71,6 +72,20 @@ class UpstreamUnavailableError(APIError):
     retryable = True
 
 
+class ProviderInvalidResponseError(UpstreamInvalidResponseError):
+    """A configured secondary provider returned an unusable response."""
+
+    code = "PROVIDER_INVALID_RESPONSE"
+    message = "A data provider returned an invalid response."
+
+
+class ProviderUnavailableError(UpstreamUnavailableError):
+    """A configured secondary provider could not be reached."""
+
+    code = "PROVIDER_UNAVAILABLE"
+    message = "A data provider is unavailable."
+
+
 class CircuitBreakerOpenError(APIError):
     status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     code = "UPSTREAM_CIRCUIT_OPEN"
@@ -94,13 +109,16 @@ def register_error_handlers(app: FastAPI) -> None:
         _request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
                     "code": "VALIDATION_ERROR",
                     "message": "Invalid request parameters.",
                     "retryable": False,
-                    "details": exc.errors(),
+                    "details": jsonable_encoder(
+                        exc.errors(),
+                        custom_encoder={Exception: str},
+                    ),
                 }
             },
         )

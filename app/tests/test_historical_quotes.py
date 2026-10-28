@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from app.api.dependencies import get_historical_quote_service
 from app.cache import CacheStore
 from app.config import Settings
+from app.core import archive_safety
 from app.main import create_app, lifespan
 from app.models.historical_quotes import (
     MAX_HISTORICAL_QUOTE_DATES,
@@ -84,6 +85,24 @@ async def test_provider_downloads_public_annual_archive() -> None:
     assert await provider.prices(2020, {"AZUL4"}) == {
         "AZUL4": {date(2020, 5, 29): Decimal("12.34")}
     }
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_an_archive_over_the_download_budget() -> None:
+    provider = B3HistoricalQuoteProvider(
+        Settings(archive_download_max_bytes=1),
+        httpx.MockTransport(lambda _request: httpx.Response(200, content=b"large")),
+    )
+
+    assert await provider.prices(2020, {"AZUL4"}) == {}
+
+
+def test_parser_rejects_an_archive_over_the_expansion_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(archive_safety, "MAX_ARCHIVE_MEMBER_BYTES", 1)
+
+    assert parse_b3_historical_quotes(_archive("large"), {"AZUL4"}) == {}
 
 
 @pytest.mark.asyncio
@@ -207,6 +226,14 @@ def test_request_supports_a_complete_multi_year_daily_history() -> None:
         )
 
 
+def test_request_rejects_unbounded_archive_year_fanout() -> None:
+    with pytest.raises(ValidationError, match="archive-year budget"):
+        HistoricalQuoteRequest(
+            tickers=["BBAS3"],
+            dates=[date(1900 + index, 1, 1) for index in range(26)],
+        )
+
+
 @pytest.mark.asyncio
 async def test_endpoint_returns_resolved_historical_quote() -> None:
     provider = _Provider({2020: {"AZUL4": {date(2020, 5, 29): Decimal("12.34")}}})
@@ -243,7 +270,22 @@ def test_historical_quote_dependency_reads_application_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lifespan_registers_historical_quote_service() -> None:
+async def test_lifespan_registers_historical_quote_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoopInstrumentDataService:
+        def __init__(self, _settings: object) -> None:
+            pass
+
+        async def warm_directory(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    # Keep this lifecycle test hermetic; directory providers have dedicated
+    # tests with deterministic transports and must not contact live services.
+    monkeypatch.setattr("app.main.InstrumentDataService", NoopInstrumentDataService)
     app = create_app()
 
     async with lifespan(app):
