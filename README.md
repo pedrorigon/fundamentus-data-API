@@ -201,6 +201,9 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 | `CACHE_INVALIDATE_TOKEN` | empty | Optional token for cache invalidation. |
 | `INCOME_REFRESH_TTL_SECONDS` | `1800` | Per-source/ticker refresh TTL shared by every caller. |
 | `INCOME_SOURCE_INDEX_TTL_SECONDS` | `1800` | TTL for CVM and Fundos.NET indexes and parsed Fundos.NET documents. |
+| `CVM_INCOME_DOCUMENT_CACHE_MAX_BYTES` | `134217728` | Retained decoded CVM report-text budget (128 MiB), counted with `sys.getsizeof(str)`; raw PDF responses use `INCOME_DOCUMENT_MAX_BYTES`. |
+| `INCOME_SOURCE_TOTAL_TIMEOUT_SECONDS` | `150` | Absolute budget for one official B3/CVM collection; keep it below the worker page timeout so partial progress returns before the outer deadline. |
+| `INCOME_JOB_PAGE_TIMEOUT_SECONDS` | `180` | Outer worker page deadline; timed-out source work is retried without publishing an incomplete snapshot. |
 | `INCOME_SNAPSHOT_OVERLAP_DAYS` | `365` | Mutable overlap replaced by complete source snapshots; older history remains immutable. |
 | `FUNDOS_NET_SCAN_LIMIT` | `300` | Maximum recent Fundos.NET documents considered per index refresh. |
 | `FUNDOS_NET_FALLBACK_DOCUMENTS` | `30` | Bounded fallback scan when fund names do not identify a document. |
@@ -209,6 +212,8 @@ Every setting uses the `FUNDAMENTUS_API_` prefix. Start from [.env.example](.env
 Fundamentus serves market data and fundamentals in the same details page. The API uses the lower value between `MARKET_DATA_TTL_SECONDS` and `FUNDAMENTALS_TTL_SECONDS` for that full document.
 
 Canonical income resolution is independent from the legacy dividend route. A maintenance worker refreshes bounded instrument batches through `/v2/income-events/refresh`; production calls require `X-Cache-Token`. Official B3/CVM and Fundos.NET observations outrank complementary HTML sources. Fund tickers are resolved to a CNPJ and queried through fund-specific Fundos.NET pages; the bounded global index is only a non-destructive fallback. Complete snapshots replace the mutable overlap while older paid history remains available for reconciliation. `POST /v2/income-events/backfill` queues the official B3/CVM collection for up to 500 tickers as one durable job, sharing the CVM open-data index and parsed documents across its pages and never scraping the complementary HTML sources. Conflicting official observations are retained with a non-projectable `conflicted` status instead of being guessed. `/v2/income-events/batch` and `/v2/income-events/changes` read only the local canonical store (SQLite by default, or the shared PostgreSQL store when `INCOME_STORE_URL` is configured), so user requests never depend on upstream latency.
+
+The official B3/CVM source propagates one absolute source budget through B3, CVM index and document waits. Validated observations completed before the budget are returned with explicit partial coverage, while successful document text is reused by later attempts. The decoded-text cache measures retained Python `str` allocations with `sys.getsizeof`; raw PDF bytes remain bounded separately. Network and semaphore waits are cancellable, but synchronous JSON, ZIP and PDF parsing cannot be preempted once started.
 
 The instrument endpoint uses the B3 public instrument files for classification, [brapi](https://brapi.dev/docs) for Brazilian market data and [Alpha Vantage](https://www.alphavantage.co/documentation/) for international ETF profiles and company fundamentals. SEC-covered issuers are resolved from the official [EDGAR CompanyFacts API](https://www.sec.gov/edgar/sec-api-documentation), then the existing public HTML statements are tried as a bounded fallback. Keep provider keys on the server and review their terms before production use.
 

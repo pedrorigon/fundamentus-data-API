@@ -83,6 +83,13 @@ class Settings(BaseSettings):
     cvm_request_timeout_seconds: float = 120.0
     archive_download_max_bytes: int = 268435456
     income_document_max_bytes: int = 10 * 1024 * 1024
+    # Decoded CVM report text is retained separately from the bounded raw
+    # document response.  ``sys.getsizeof(str)`` accounts for the Python
+    # Unicode allocation that remains live after PDF decoding.
+    cvm_income_document_cache_max_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    # Official income collection has its own source budget so a worker page
+    # can retain validated progress before the outer page timeout fires.
+    income_source_total_timeout_seconds: float = Field(default=150.0, ge=0.1, le=3600.0)
     income_refresh_ttl_seconds: int = 1800
     income_source_index_ttl_seconds: int = 1800
     income_snapshot_overlap_days: int = 365
