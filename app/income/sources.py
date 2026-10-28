@@ -600,11 +600,7 @@ class OfficialCompanyIncomeSource:
         try:
             done, _pending = await asyncio.wait(
                 tasks,
-                timeout=(
-                    max(deadline - time.monotonic(), 0)
-                    if deadline is not None
-                    else None
-                ),
+                timeout=(max(deadline - time.monotonic(), 0) if deadline is not None else None),
             )
             timed_out = len(done) < len(tasks)
         finally:

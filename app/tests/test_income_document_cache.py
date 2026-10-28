@@ -23,10 +23,7 @@ async def test_cvm_document_cache_evicts_oldest_by_retained_text_memory(
         "https://cvm.test/two.pdf",
         "https://cvm.test/three.pdf",
     ]
-    texts = {
-        link: token * 128
-        for link, token in zip(links, ("a", "b", "c"), strict=True)
-    }
+    texts = {link: token * 128 for link, token in zip(links, ("a", "b", "c"), strict=True)}
     calls: dict[str, int] = {link: 0 for link in links}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -296,10 +293,7 @@ async def test_cvm_document_deadline_cancels_semaphore_queue_without_leaking(
 
     async with source._client() as client:
         results = await asyncio.gather(
-            *(
-                source._cvm_document_text(client, link, deadline=deadline)
-                for link in links
-            ),
+            *(source._cvm_document_text(client, link, deadline=deadline) for link in links),
             return_exceptions=True,
         )
 
@@ -384,9 +378,7 @@ async def test_shared_document_producer_keeps_long_waiter_after_short_waiter_tim
     async with source._client() as client:
         long_deadline = time.monotonic() + 1
         short_deadline = time.monotonic() + 0.05
-        first = asyncio.create_task(
-            source._cvm_document_text(client, link, deadline=long_deadline)
-        )
+        first = asyncio.create_task(source._cvm_document_text(client, link, deadline=long_deadline))
         await started.wait()
         second = asyncio.create_task(
             source._cvm_document_text(client, link, deadline=short_deadline)
